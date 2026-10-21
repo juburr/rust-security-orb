@@ -11,7 +11,6 @@ parameters:
     description: Directory to run in; binaries are relative to it.
   binaries:
     type: string
-    default: ""
     description: >
       The binaries to check, separated by spaces or commas; shell patterns are expanded. Name
       the final artifacts, after stripping and packaging, which can remove the data.

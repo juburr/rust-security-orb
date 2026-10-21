@@ -1,0 +1,38 @@
+description: >
+  Run cargo-deny once per shipped feature set and target, since each
+  resolves its own dependency graph. Each configuration has its own
+  deny.toml, so the bans check states what that build must never link,
+  such as the other TLS backend.
+
+usage:
+  version: 2.1
+  orbs:
+    rust-security: juburr/rust-security-orb@0.1.0
+  jobs:
+    deny:
+      parameters:
+        tls:
+          type: string
+        target:
+          type: string
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - rust-security/install:
+            tools: cargo-deny
+        - rust-security/deny:
+            config_path: deny-<< parameters.tls >>.toml
+            no_default_features: true
+            features: << parameters.tls >>
+            target: << parameters.target >>
+            report_name: deny-<< parameters.tls >>-<< parameters.target >>
+            junit: true
+  workflows:
+    security:
+      jobs:
+        - deny:
+            matrix:
+              parameters:
+                tls: ["tls-rustls", "tls-openssl"]
+                target: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

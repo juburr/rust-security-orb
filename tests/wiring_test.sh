@@ -11,7 +11,7 @@
 #     only when junit is true;
 #   - the install command offers every tool there is an install_<tool>
 #     command for, with that command's default version;
-#   - the README documents every command.
+#   - the README documents every command, and names each install_<tool>.
 #
 # Run from a checkout:
 #   bash tests/wiring_test.sh
@@ -24,6 +24,18 @@ FAILURES=0
 fail() {
     printf 'FAIL: %s\n' "$*"
     FAILURES=$((FAILURES + 1))
+}
+
+# param_vars SCRIPT: the PARAM_ variables SCRIPT reads. The install helpers
+# are the same in every tool's script, so only the ones a tool calls count:
+# download_base_url is read by the four that download GitHub releases.
+param_vars() {
+    local body
+    body=$(sed '/^# >>> rust-security-orb install helpers >>>$/,/^# <<< rust-security-orb install helpers <<<$/d' "$1")
+    grep -oE '\$\{PARAM_[A-Z0-9_]+' <<< "${body}" | sed 's/^\${//'
+    if grep -qE '^ +rs_install_(prebuilt|tar_xz)\b' <<< "${body}"; then
+        echo PARAM_DOWNLOAD_BASE_URL
+    fi
 }
 
 # params FILE: the parameters a command declares.
@@ -48,16 +60,7 @@ for yml in src/commands/*.yml; do
         fi
     done <<< "${passed}"
     for script in ${scripts[@]+"${scripts[@]}"}; do
-        # The install helpers are the same in every tool's script, so only the
-        # ones a tool calls count: download_base_url is read by the two that
-        # download GitHub releases.
-        body=$(sed '/^# >>> rust-security-orb install helpers >>>$/,/^# <<< rust-security-orb install helpers <<<$/d' "src/${script}")
-        mapfile -t read_vars < <({
-            grep -oE '\$\{PARAM_[A-Z0-9_]+' <<< "${body}" | sed 's/^\${//'
-            if grep -qE '^ +rs_install_(prebuilt|tar_xz)\b' <<< "${body}"; then
-                echo PARAM_DOWNLOAD_BASE_URL
-            fi
-        } | sort -u)
+        mapfile -t read_vars < <(param_vars "src/${script}" | sort -u)
         for var in ${read_vars[@]+"${read_vars[@]}"}; do
             if ! grep -qE "^ +${var}: << parameters\.[a-z0-9_]+ >>$" "${yml}"; then
                 fail "${command}: src/${script} reads ${var}, which ${command}.yml doesn't set"
@@ -92,7 +95,11 @@ for yml in src/commands/*.yml; do
     if grep -q 'store_test_results' "${yml}" && ! grep -q 'condition: << parameters.junit >>' "${yml}"; then
         fail "${command}: stores test results whatever junit says"
     fi
-    if [[ "${command}" != install_* && "${command}" != install ]] && ! grep -q "### \`rust-security/${command}\`" README.md 2> /dev/null; then
+    if [[ "${command}" == install_* ]]; then
+        if ! grep -q "\`${command}\`" README.md 2> /dev/null; then
+            fail "${command}: the README doesn't name it"
+        fi
+    elif ! grep -q "### \`rust-security/${command}\`" README.md 2> /dev/null; then
         fail "${command}: the README has no section for it"
     fi
 done

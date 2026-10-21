@@ -1,0 +1,52 @@
+description: >
+  Fetch the RustSec advisory database once per workflow and check every
+  job against that same copy. The second job imports it from the workspace
+  and checks with no network access of its own: audit without fetching or
+  checking for yanked crates, deny and licenses against saved cargo
+  metadata. A copy whose newest commit is 90 days old or more fails both
+  tools.
+
+usage:
+  version: 2.1
+  orbs:
+    rust-security: juburr/rust-security-orb@0.1.0
+  jobs:
+    fetch-advisories:
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - rust-security/fetch_advisory_db:
+            archive: /tmp/workspace/advisory-db.tar.gz
+        - run:
+            name: Save cargo metadata
+            command: cargo metadata --format-version 1 --locked > /tmp/workspace/metadata.json
+        - persist_to_workspace:
+            root: /tmp/workspace
+            paths: [advisory-db.tar.gz, metadata.json]
+    check-offline:
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - attach_workspace:
+            at: /tmp/workspace
+        - rust-security/install:
+            tools: cargo-audit cargo-deny
+        - rust-security/fetch_advisory_db:
+            import: /tmp/workspace/advisory-db.tar.gz
+        - rust-security/audit:
+            no_fetch: true
+            no_yanked: true
+        - rust-security/deny:
+            offline: true
+            metadata_path: /tmp/workspace/metadata.json
+        - rust-security/licenses:
+            offline: true
+            metadata_path: /tmp/workspace/metadata.json
+  workflows:
+    security:
+      jobs:
+        - fetch-advisories
+        - check-offline:
+            requires: [fetch-advisories]

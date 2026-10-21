@@ -14,7 +14,6 @@ parameters:
       .cargo/audit.toml from here, or else from CARGO_HOME.
   binaries:
     type: string
-    default: ""
     description: >
       The binaries to audit, separated by spaces or commas; shell patterns such as
       target/release/* are expanded. Name the files you ship, after any stripping or

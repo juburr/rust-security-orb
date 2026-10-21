@@ -320,6 +320,12 @@ exec "${REAL_GIT}" "$@"
 EOF
 } > "${STUBS}/git"
 chmod +x "${STUBS}"/*
+# Install records like the ones the install command writes, so the commands
+# take the stand-ins for verified tools.
+for stub in "${STUBS}"/*; do
+    printf '{"tool":"%s","version":"0","arch":"amd64","method":"prebuilt","asset":"a","asset_sha512":"","verify_checksums":"false","binary_sha512":"%s"}\n' \
+        "${stub##*/}" "$(sha512sum "${stub}" | awk '{ print $1 }')" > "${STUBS}/.${stub##*/}.install.json"
+done
 
 SCRIPT_RUST_SECURITY_LIB=$(cat "${SCRIPTS}/lib/rust_security.sh")
 export SCRIPT_RUST_SECURITY_LIB
@@ -654,6 +660,11 @@ check "records cargo's version" json_is "${RECORD}" .toolchain.cargo "cargo 1.99
 echo "changed" >> "${CASE}/bin/cargo-audit"
 run audit.sh "PATH=${CASE}/bin:${STUBS}:${PATH}" PARAM_RUN_RECORD=1
 check "leaves out an install record that doesn't match the binary" json_is "${RECORD}" .tool.install null
+check "and warns that the binary is not one the install command verified" \
+    said "WARN: ${CASE}/bin/cargo-audit is not a cargo-audit this orb's install command verified against its checksum table."
+audit_case
+run audit.sh
+check "a verified binary gets no such warning" not_said "install command verified"
 
 # --- audit_bin
 DEFAULTS=(PARAM_BINARIES="app" PARAM_REQUIRE_AUDITABLE=0 PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false

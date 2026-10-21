@@ -28,19 +28,20 @@ if [[ ! -f "${YML}" ]]; then
 fi
 SCRIPT=$(grep -oE '<< include\(scripts/[a-z_]+\.sh\) >>' "${YML}" | grep -v 'scripts/lib/' | sed -E 's/<< include\((.*)\) >>/\1/' | head -n 1)
 
-# Every parameter's default, as NAME<TAB>VALUE, without the quotes YAML allows.
+# Every parameter, as NAME<TAB>DEFAULT, without the quotes YAML allows; a
+# parameter without a default has the value "<required>" until it is given.
 declare -A VALUES=()
 while IFS=$'\t' read -r name value; do
     VALUES[${name}]=${value}
 done < <(awk '
+    function flush() { if (name != "") { printf "%s\t%s\n", name, value } }
     /^parameters:/ { p = 1; next }
-    /^[^ ]/ { p = 0 }
-    p && /^  [a-z_0-9]+:$/ { name = $1; sub(/:$/, "", name) }
+    /^[^ ]/ { if (p) { flush() } p = 0; name = "" }
+    p && /^  [a-z_0-9]+:$/ { flush(); name = $1; sub(/:$/, "", name); value = "<required>" }
     p && /^    default:/ {
         value = $0
         sub(/^    default: */, "", value)
         if (value ~ /^".*"$/) { value = substr(value, 2, length(value) - 2) }
-        printf "%s\t%s\n", name, value
     }' "${YML}")
 for setting in "$@"; do
     name=${setting%%=*}
@@ -49,6 +50,12 @@ for setting in "$@"; do
         exit 2
     fi
     VALUES[${name}]=${setting#*=}
+done
+for name in "${!VALUES[@]}"; do
+    if [[ "${VALUES[${name}]}" == "<required>" ]]; then
+        echo "ERROR: ${COMMAND} needs ${name}=VALUE." >&2
+        exit 2
+    fi
 done
 
 ENVIRONMENT=()

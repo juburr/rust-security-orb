@@ -168,13 +168,23 @@ rs_export() {
 }
 
 # rs_tool BINARY: sets RS_TOOL to BINARY's path on the PATH, or stops the step
-# saying how to install it.
+# saying how to install it. Warns when that binary is not one the install
+# command verified, such as a copy installed with the image that comes first
+# on the PATH: the install command leaves a record beside each binary it
+# installs, naming the binary's SHA-512.
 rs_tool() {
+    local record sha
     # shellcheck disable=SC2034 # read by the script that evals this file
     if ! RS_TOOL=$(command -v "$1"); then
         echo "ERROR: $1 is not on the PATH. Install it in an earlier step with this orb's install command" >&2
         echo "  (tools: $1), or with install_${1//-/_}." >&2
         exit 1
+    fi
+    record="$(dirname "${RS_TOOL}")/.$1.install.json"
+    sha=$(sha512sum "${RS_TOOL}" 2> /dev/null | awk '{ print $1 }') || sha=""
+    if [[ -z "${sha}" || ! -f "${record}" ]] || ! grep -qF "\"binary_sha512\":\"${sha}\"" "${record}"; then
+        echo "WARN: ${RS_TOOL} is not a $1 this orb's install command verified against its checksum table." >&2
+        echo "WARN: Install $1 with the install command, and put its install_path first on the PATH, to run a verified one." >&2
     fi
 }
 
