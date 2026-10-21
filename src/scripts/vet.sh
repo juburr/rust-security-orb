@@ -109,7 +109,8 @@ rm -f "${JSON}"
 RC=0
 CARGO=${CARGO} "${RS_TOOL}" "${RS_ARGS[@]}" --output-format json --output-file "${JSON}" > "${RS_BASE}.log" 2>&1 || RC=$?
 # A success must come with exit code 0; failed vetting exits 255.
-if ! jq -e --argjson code "${RC}" 'type == "object" and has("conclusion") and (.conclusion != "success" or $code == 0)' "${JSON}" > /dev/null 2>&1; then
+# shellcheck disable=SC2016 # jq program, not shell
+if ! rs_json_is "${JSON}" 'type == "object" and has("conclusion") and (.conclusion != "success" or $code == 0)' --argjson code "${RC}"; then
     echo "ERROR: cargo vet did not complete (exit code ${RC}), so there is no report." >&2
     jq -r '.error | "  \(.message)", (.causes[]? | "  caused by: \(.)")' "${JSON}" >&2 2> /dev/null \
         || sed 's/^/  /' "${RS_BASE}.log" | tail -n 40 >&2

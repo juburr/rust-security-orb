@@ -207,7 +207,7 @@ if [[ "${SARIF}" == true ]]; then
         SARIF_ARGS+=(--offline)
     fi
     "${RS_TOOL}" "${SARIF_ARGS[@]}" "${CHECK_ARGS[@]}" > "${RS_BASE}.sarif" 2> "${RS_BASE}.sarif.log" || true
-    if ! jq -e '.version == "2.1.0" and (.runs | type == "array")' "${RS_BASE}.sarif" > /dev/null 2>&1; then
+    if ! rs_json_is "${RS_BASE}.sarif" '.version == "2.1.0" and (.runs | type == "array")'; then
         echo "ERROR: cargo deny did not write a SARIF report. Its output:" >&2
         sed 's/^/  /' "${RS_BASE}.sarif.log" | tail -n 20 >&2
         exit 1

@@ -167,6 +167,18 @@ rs_export() {
     printf 'export %s=%q\n' "$1" "$2" >> "${BASH_ENV}"
 }
 
+# rs_json_is FILE FILTER [JQ_OPTION...]: whether FILE holds one JSON value for
+# which FILTER is true. It compares jq's output instead of using -e, since jq
+# 1.6 (as on Ubuntu 22.04 and some cimg images) exits 0 with -e when the file
+# is empty, as a tool that failed before writing its report leaves it.
+rs_json_is() {
+    local file=$1 filter=$2 options=()
+    if [[ $# -gt 2 ]]; then
+        options=("${@:3}")
+    fi
+    [[ "$(jq -c ${options[@]+"${options[@]}"} "(${filter}) | if . then true else false end" "${file}" 2> /dev/null)" == true ]]
+}
+
 # rs_tool BINARY: sets RS_TOOL to BINARY's path on the PATH, or stops the step
 # saying how to install it. Warns when that binary is not one the install
 # command verified, such as a copy installed with the image that comes first
@@ -349,7 +361,8 @@ rs_run_record() {
         tool_sha=$(sha512sum "${RS_TOOL}" | awk '{ print $1 }')
         entry="$(dirname "${RS_TOOL}")/.${RS_TOOL##*/}.install.json"
         # The install record counts only if it describes this very binary.
-        if [[ -f "${entry}" ]] && jq -e --arg sha "${tool_sha}" '.binary_sha512 == $sha' "${entry}" > /dev/null 2>&1; then
+        # shellcheck disable=SC2016 # jq program, not shell
+        if [[ -f "${entry}" ]] && rs_json_is "${entry}" '.binary_sha512 == $sha' --arg sha "${tool_sha}"; then
             install=$(jq -c 'del(.binary_sha512)' "${entry}")
         fi
     fi
@@ -370,7 +383,9 @@ rs_run_record() {
     # option parsing.
     args="[]"
     if [[ -n "${RS_ARGS[*]+set}" ]]; then
-        args=$(printf '%s\0' "${RS_ARGS[@]}" | jq -Rsc 'split("\u0000") | .[:-1]')
+        # Ended by a word rather than a NUL, which jq 1.6 drops from the
+        # end of raw input.
+        args=$({ printf '%s\0' "${RS_ARGS[@]}"; printf 'end'; } | jq -Rsc 'split("\u0000") | .[:-1]')
     fi
     toolchain=$(jq -cn --arg cargo "$(cargo --version 2> /dev/null || true)" --arg rustc "$(rustc --version 2> /dev/null || true)" \
         '{cargo: (if $cargo == "" then null else $cargo end), rustc: (if $rustc == "" then null else $rustc end)}')
@@ -502,7 +517,7 @@ RS_AUDIT_DENIED_JQ='
 # the yanked check failed and nothing denies yanked crates.
 rs_audit_check() {
     local denied
-    if [[ "$3" -ne 0 ]] && jq -e '.vulnerabilities.count == 0 and ([.warnings[] | length] | add // 0) == 0' "$2" > /dev/null; then
+    if [[ "$3" -ne 0 ]] && rs_json_is "$2" '.vulnerabilities.count == 0 and ([.warnings[] | length] | add // 0) == 0'; then
         echo "ERROR: cargo audit exited with ${3} but reported no vulnerability or warning. Its output:" >&2
         sed 's/^/  /' "$1" | tail -n 20 >&2
         return 1

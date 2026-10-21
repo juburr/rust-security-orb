@@ -110,7 +110,7 @@ for binary in "${BINARIES[@]}"; do
     rc=0
     "${RS_TOOL}" audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${OPTS[@]+"${OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} \
         --json bin "${binary}" > "${base}.json" 2> "${base}.log" || rc=$?
-    if ! jq -e 'type == "object" and (.vulnerabilities | type == "object")' "${base}.json" > /dev/null 2>&1; then
+    if ! rs_json_is "${base}.json" 'type == "object" and (.vulnerabilities | type == "object")'; then
         echo "ERROR: cargo audit bin could not audit ${binary} (exit code ${rc}). Its output:" >&2
         sed 's/^/  /' "${base}.log" | tail -n 20 >&2
         if grep -q "No dependency information found" "${base}.log"; then
@@ -146,7 +146,7 @@ for binary in "${BINARIES[@]}"; do
         fi
         "${RS_TOOL}" audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${OPTS[@]+"${OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} \
             --format sarif bin "${binary}" > "${base}.sarif" 2> "${base}.sarif.log" || true
-        if ! jq -e '.version == "2.1.0"' "${base}.sarif" > /dev/null 2>&1; then
+        if ! rs_json_is "${base}.sarif" '.version == "2.1.0"'; then
             echo "ERROR: cargo audit bin did not write a SARIF report for ${binary}. Its output:" >&2
             sed 's/^/  /' "${base}.sarif.log" | tail -n 20 >&2
             exit 1

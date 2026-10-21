@@ -56,7 +56,7 @@ LOG="${RS_BASE}.log"
 echo "Auditing ${LOCKFILE} with ${RS_TOOL_VERSION:-cargo-audit}..."
 RC=0
 "${RS_TOOL}" "${RS_ARGS[@]}" --json > "${JSON}" 2> "${LOG}" || RC=$?
-if ! jq -e 'type == "object" and (.vulnerabilities | type == "object")' "${JSON}" > /dev/null 2>&1; then
+if ! rs_json_is "${JSON}" 'type == "object" and (.vulnerabilities | type == "object")'; then
     echo "ERROR: cargo audit did not complete (exit code ${RC}), so there is no report. Its output:" >&2
     sed 's/^/  /' "${LOG}" | tail -n 40 >&2
     if [[ "${RUN_RECORD}" == true ]]; then
@@ -94,7 +94,7 @@ if [[ "${SARIF}" == true ]]; then
         SARIF_ARGS+=(--no-fetch)
     fi
     "${RS_TOOL}" "${SARIF_ARGS[@]}" --format sarif > "${RS_BASE}.sarif" 2>> "${LOG}" || true
-    if ! jq -e '.version == "2.1.0" and (.runs | type == "array")' "${RS_BASE}.sarif" > /dev/null 2>&1; then
+    if ! rs_json_is "${RS_BASE}.sarif" '.version == "2.1.0" and (.runs | type == "array")'; then
         echo "ERROR: cargo audit did not write a SARIF report. Its output:" >&2
         sed 's/^/  /' "${LOG}" | tail -n 20 >&2
         exit 1

@@ -80,7 +80,7 @@ for binary in "${BINARIES[@]}"; do
     USED_NAMES[${name}]=1
     base="${RS_BASE}-${name}"
     if ! "${RS_TOOL}" "${binary}" > "${base}.audit.json" 2> "${base}.log" \
-        || ! jq -e '.packages | type == "array" and length > 0' "${base}.audit.json" > /dev/null 2>&1; then
+        || ! rs_json_is "${base}.audit.json" '.packages | type == "array" and length > 0'; then
         echo "  ${binary}: FAILED: $(head -n 1 "${base}.log")"
         MISSING+=("${binary}")
         rm -f "${base}.audit.json" "${base}.log"
@@ -99,7 +99,7 @@ for binary in "${BINARIES[@]}"; do
         --argjson packages "${packages}" '{binary: $binary, sha256: $sha, auditable: true, packages: $packages, report: $report}')
     if [[ "${CYCLONEDX}" == true ]]; then
         if ! "${CDX}" "${binary}" > "${base}.cdx.json" 2> "${base}.log" \
-            || ! jq -e '.bomFormat == "CycloneDX"' "${base}.cdx.json" > /dev/null 2>&1; then
+            || ! rs_json_is "${base}.cdx.json" '.bomFormat == "CycloneDX"'; then
             echo "ERROR: auditable2cdx could not turn ${binary}'s dependency list into a CycloneDX SBOM. Its output:" >&2
             sed 's/^/  /' "${base}.log" | tail -n 20 >&2
             exit 1

@@ -236,7 +236,7 @@ jobs:
             jq -e '[.runs[].results[].ruleId] | index("RUSTSEC-2021-0003")' cargo-audit.sarif
             grep -q 'name="RUSTSEC-2021-0003 smallvec 1.6.0"><failure' junit/cargo-audit.xml
             jq -e '.outcome == "findings-reported" and .counts.vulnerabilities == 1' cargo-audit.run-record.json
-            jq -e 'select(.type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
+            jq -s -e 'any(.[]; .type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
             jq -e '[.runs[].results[].partialFingerprints["cargo-deny/advisory-id"]] | index("RUSTSEC-2021-0003")' cargo-deny.sarif
             grep -q 'name="RUSTSEC-2021-0003 smallvec 1.6.0"><failure' junit/cargo-deny.xml
             jq -e '.outcome == "findings-reported" and .counts.advisories.errors == 1 and .advisory_db.commit != null' cargo-deny.run-record.json
@@ -471,7 +471,7 @@ jobs:
           command: |
             cd /tmp/workspace/reports/offline
             jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' cargo-audit.json
-            jq -e 'select(.type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
+            jq -s -e 'any(.[]; .type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
             jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' cargo-audit-bin-rso-fixture-vulnerable.json
             jq -e 'keys | map(startswith("smallvec 1.6.0")) | any' licenses.json
       - run:

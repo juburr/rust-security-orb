@@ -156,7 +156,7 @@ for dir in "${MEMBER_DIRS[@]}"; do
         mv -f "${file}" "${DEST}/${relative}"
         file="${DEST}/${relative}"
         if [[ "${FORMAT}" == json ]]; then
-            if ! jq -e '.bomFormat == "CycloneDX"' "${file}" > /dev/null 2>&1; then
+            if ! rs_json_is "${file}" '.bomFormat == "CycloneDX"'; then
                 echo "ERROR: ${relative} is not a CycloneDX JSON document." >&2
                 exit 1
             fi
