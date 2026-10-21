@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # auditable2cdx has no version option: run without arguments, it panics
 # saying no input file was given, which its smoke test looks for.
 fixture_binary() {

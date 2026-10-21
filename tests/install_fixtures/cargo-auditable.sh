@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # cargo-auditable has no version option: run on its own, it says how it must
 # be invoked and exits 1, which its smoke test looks for.
 fixture_binary() {

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # The release is a .tar.xz archive, which the shared install logic doesn't
 # unpack: the checksum table covers the archive as a whole, and the tool
 # definition unpacks it after verifying it.

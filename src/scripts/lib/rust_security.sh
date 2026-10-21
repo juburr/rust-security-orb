@@ -348,7 +348,8 @@ rs_run_record() {
             --arg url "$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)" \
             --arg commit "$(git -C "${RS_DB}" log -1 --format=%H 2> /dev/null || true)" \
             --arg time "$(git -C "${RS_DB}" log -1 --format=%cI 2> /dev/null || true)" \
-            '{path: $path, url: ($url | select(. != "")), commit: ($commit | select(. != "")), commit_time: ($time | select(. != ""))}')
+            '{path: $path, url: (if $url == "" then null else $url end), commit: (if $commit == "" then null else $commit end),
+                commit_time: (if $time == "" then null else $time end)}')
     fi
     # NUL-separated, so arguments that start with "-" never reach jq's own
     # option parsing.
@@ -454,7 +455,7 @@ rs_audit_counts() {
     jq -c --argjson denied "$(rs_denied_json)" '{
         vulnerabilities: .vulnerabilities.count,
         warnings: (.warnings | map_values(length)),
-        denied_warnings: ([.warnings | to_entries[] | select(($denied | index("warnings")) or ($denied | index(.key))) | .value | length] | add // 0)
+        denied_warnings: ([.warnings | to_entries[] | .key as $k | select(($denied | index("warnings")) or ($denied | index($k))) | .value | length] | add // 0)
     }' "$1"
 }
 

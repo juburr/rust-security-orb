@@ -91,7 +91,11 @@ if [[ "${FAILURES}" -eq 0 ]]; then
     echo "ok: every tool has its install.sh, install_hash.sh and command, and their shared parts are identical"
 fi
 
-SELECTED=("$@")
+SELECTED=()
+# Bash 4.0 calls an empty "$@" unbound under set -u.
+if [[ $# -gt 0 ]]; then
+    SELECTED=("$@")
+fi
 for entry in "${TOOLS[@]}"; do
     tool=${entry%%:*}
     kind=${entry#*:}
