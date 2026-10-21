@@ -63,8 +63,10 @@ if [[ -n "${CONFIG_PATH}" ]]; then
         exit 1
     fi
     ROOT_ARGS+=(--config "${CONFIG_PATH}")
-    RS_INPUTS+=("config:${CONFIG_PATH}")
 fi
+# The config (licence clarifications can change the inventory) and lockfile,
+# for the run record.
+rs_deny_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}"
 if [[ -n "${METADATA_PATH}" ]]; then
     if [[ ! -f "${METADATA_PATH}" ]]; then
         echo "ERROR: metadata_path ${METADATA_PATH} does not exist (in $(pwd))." >&2
@@ -91,9 +93,6 @@ if [[ "${OFFLINE}" == true ]]; then
 fi
 if [[ "${LOCKED}" == true ]]; then
     ROOT_ARGS+=(--locked)
-fi
-if [[ -f "$(dirname "${MANIFEST_PATH:-./Cargo.toml}")/Cargo.lock" ]]; then
-    RS_INPUTS+=("lockfile:$(dirname "${MANIFEST_PATH:-./Cargo.toml}")/Cargo.lock")
 fi
 RS_ARGS=(${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"} list --layout "${LAYOUT}")
 RS_REPORTS=()

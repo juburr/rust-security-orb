@@ -73,6 +73,9 @@ RS_TOOL_VERSION=$("${RS_TOOL}" --version 2> /dev/null || true)
 # shellcheck disable=SC2034 # read by rs_run_record
 RS_ARGS=(audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} bin)
 RS_INPUTS=()
+if [[ -n "${RS_AUDIT_CONFIG}" ]]; then
+    RS_INPUTS+=("config:${RS_AUDIT_CONFIG}")
+fi
 RS_REPORTS=()
 INDEX="[]"
 CASES="[]"

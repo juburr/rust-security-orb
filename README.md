@@ -323,7 +323,7 @@ Installs the tools named in `tools`, each verified against the orb's checksum ta
 | `install_path` | `$HOME/bin` | Absolute path of the directory to install into, writable without root. Created if needed, and added to `PATH` for later steps when it isn't already on it. |
 | `verify_checksums` | `strict` | `strict`, `known_versions` or `false`, for every tool. See [Checksum Verification](#-checksum-verification). |
 | `caching` | `true` | Cache each tool's verified download between jobs, keyed by tool, version, CPU architecture and home directory. A cached file is verified again before it is used. For the tools built from source, the archive is cached and built in each job. |
-| `download_base_url` | *(empty)* | An `https://` mirror of GitHub releases to download the prebuilt tools from, in place of `https://github.com`, serving the same paths. What it serves is still verified. |
+| `download_base_url` | *(empty)* | An `https://` mirror of GitHub releases to download the prebuilt tools from, in place of `https://github.com`, serving the same paths. What it serves is still verified. Credentials in the URL (`user:password@`) are refused, since they would show in the log. |
 
 ### `rust-security/install_<tool>`
 
@@ -337,7 +337,7 @@ Fetches the RustSec advisory database (a shallow git clone), or imports a copy s
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `url` | `https://github.com/RustSec/advisory-db` | The database's git repository, or an internal mirror of it. Use the URL `deny.toml`'s `db-urls` names, if it names one: cargo-deny's directory is named after it. |
+| `url` | `https://github.com/RustSec/advisory-db` | The database's git repository, or an internal mirror of it, over `https`. Use the URL `deny.toml`'s `db-urls` names, if it names one: cargo-deny's directory is named after it. A database whose newest commit is dated in the future fails the step, since neither tool could tell it is stale. |
 | `import` | *(empty)* | Import instead of fetching: a directory holding the database's git checkout, or a `.tar.gz` that `archive` wrote. Needs no network access. |
 | `db_dir` | `$CARGO_HOME/advisory-dbs` | Where to put the database, under its URL-derived name. cargo-deny reads another directory only if `deny.toml`'s `db-path` names it. |
 | `archive` | *(empty)* | Also write the database, git history included, to this `.tar.gz`, to persist to the workspace or store. |

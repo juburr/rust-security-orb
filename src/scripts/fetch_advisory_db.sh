@@ -95,15 +95,17 @@ rs_xxh64() {
 # crate does for the URLs a database is served from (the default port
 # dropped, an empty path written as "/").
 CANONICAL=${URL,,}
-if [[ ! "${CANONICAL}" =~ ^(https?)://([a-z0-9.-]+)(:[0-9]+)?(/[^[:space:]?#]*)?$ ]]; then
-    echo "ERROR: url must be an http(s) URL with a host and a path, and no user, query or fragment, not '${URL}'." >&2
+# Only https: over plain http, anyone on the network path could serve a
+# database with advisories left out, and see the Authorization header.
+if [[ ! "${CANONICAL}" =~ ^(https)://([a-z0-9.-]+)(:[0-9]+)?(/[^[:space:]?#]*)?$ ]]; then
+    echo "ERROR: url must be an https URL with a host and a path, and no user, query or fragment." >&2
     exit 1
 fi
 SCHEME=${BASH_REMATCH[1]}
 HOST=${BASH_REMATCH[2]}
 PORT=${BASH_REMATCH[3]}
 URL_PATH=${BASH_REMATCH[4]:-/}
-if [[ "${SCHEME}:${PORT}" == "https::443" || "${SCHEME}:${PORT}" == "http::80" ]]; then
+if [[ "${SCHEME}:${PORT}" == "https::443" ]]; then
     PORT=""
 fi
 CANONICAL="${SCHEME}://${HOST}${PORT}${URL_PATH}"
@@ -184,6 +186,13 @@ if [[ ! -e "${STAGED}/.git" ]] || ! COMMIT=$(git -C "${STAGED}" log -1 --format=
     exit 1
 fi
 COMMITTED=$(git -C "${STAGED}" log -1 --format=%ct)
+# A commit dated in the future would never look stale to either tool. A day
+# covers clock skew.
+if ((COMMITTED - $(date +%s) > 86400)); then
+    echo "ERROR: The advisory database's newest commit is dated in the future ($(git -C "${STAGED}" log -1 --format=%cI))," >&2
+    echo "  so cargo-audit and cargo-deny could never tell it is stale. Check the clock of whatever made the copy." >&2
+    exit 1
+fi
 rm -f "${STAGED}/.git/FETCH_HEAD"
 touch -d "@${COMMITTED}" "${STAGED}/.git/HEAD"
 

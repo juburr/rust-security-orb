@@ -163,10 +163,16 @@ for dir in "${MEMBER_DIRS[@]}"; do
             SUMMARY=$(jq -c --arg file "${relative}" --argjson components "$(jq '.components | length' "${file}")" \
                 '. + [{file: $file, components: $components}]' <<< "${SUMMARY}")
         else
+            if ! grep -q '<bom[[:space:]/>]' "${file}"; then
+                echo "ERROR: ${relative} is not a CycloneDX XML document." >&2
+                exit 1
+            fi
             SUMMARY=$(jq -c --arg file "${relative}" '. + [{file: $file}]' <<< "${SUMMARY}")
         fi
         RS_REPORTS+=("${file}")
-    done < <(find "${dir}" -maxdepth 1 -type f -newer "${MARKER}" -name "*.${FORMAT}" -print0)
+    # cargo cyclonedx names every SBOM <name>.cdx.<format>, so a project file
+    # written meanwhile, such as a package.json, is never taken for one.
+    done < <(find "${dir}" -maxdepth 1 -type f -newer "${MARKER}" -name "*.cdx.${FORMAT}" -print0)
 done
 rm -f "${MARKER}" "${RS_BASE}.log"
 if [[ ${#RS_REPORTS[@]} -eq 0 ]]; then

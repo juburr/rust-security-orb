@@ -42,12 +42,8 @@ rs_audit_options
 RS_ARGS=(audit --file "${LOCKFILE}" ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"})
 RS_TOOL_VERSION=$("${RS_TOOL}" --version 2> /dev/null || true)
 RS_INPUTS=("lockfile:${LOCKFILE}")
-# cargo audit reads .cargo/audit.toml in the working directory, or else the
-# one in CARGO_HOME.
-if [[ -f .cargo/audit.toml ]]; then
-    RS_INPUTS+=("config:.cargo/audit.toml")
-elif [[ -f "${CARGO_HOME:-${HOME:-}/.cargo}/audit.toml" ]]; then
-    RS_INPUTS+=("config:${CARGO_HOME:-${HOME:-}/.cargo}/audit.toml")
+if [[ -n "${RS_AUDIT_CONFIG}" ]]; then
+    RS_INPUTS+=("config:${RS_AUDIT_CONFIG}")
 fi
 RS_REPORTS=()
 JSON="${RS_BASE}.json"

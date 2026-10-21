@@ -271,6 +271,17 @@ rs_db_fresh() {
     fi
     now=$(date +%s)
     age_days=$(((now - committed) / 86400))
+    # A commit dated in the future would never look stale. A day covers clock
+    # skew between the machine that committed and this one.
+    if ((committed - now > 86400)); then
+        if [[ "$2" == true ]]; then
+            echo "WARN: The advisory database's newest commit is dated $(((committed - now) / 86400)) days in the future; allow_stale is true, so it is used anyway." >&2
+            return 0
+        fi
+        echo "ERROR: The advisory database's newest commit is dated $(((committed - now) / 86400)) days in the future, so its age can't be told." >&2
+        echo "  Check the clock of whatever made the copy, or set allow_stale to true to use it whatever its age." >&2
+        exit 1
+    fi
     if ((now - committed >= 90 * 86400)); then
         if [[ "$2" == true ]]; then
             echo "WARN: The advisory database's newest commit is ${age_days} days old; allow_stale is true, so it is used anyway." >&2
@@ -409,6 +420,80 @@ rs_run_record() {
     echo "Run record: ${file}"
 }
 
+# rs_deny_inputs MANIFEST_PATH CONFIG_PATH: adds the files cargo-deny reads to
+# RS_INPUTS, found the way it finds them: the config from CONFIG_PATH, or else
+# the first deny.toml, .deny.toml or .cargo/deny.toml in the manifest's
+# directory or above it, and the nearest Cargo.lock. Sets RS_DENY_CONFIG to
+# the config, or empty when there is none.
+rs_deny_inputs() {
+    local dir name lockfile=""
+    RS_DENY_CONFIG=$2
+    if [[ -n "${RS_DENY_CONFIG}" ]]; then
+        RS_INPUTS+=("config:${RS_DENY_CONFIG}")
+    fi
+    dir=$(cd "$(dirname "${1:-./Cargo.toml}")" 2> /dev/null && pwd) || dir=""
+    while [[ -n "${dir}" && ( -z "${RS_DENY_CONFIG}" || -z "${lockfile}" ) ]]; do
+        for name in deny.toml .deny.toml .cargo/deny.toml; do
+            if [[ -z "${RS_DENY_CONFIG}" && -f "${dir}/${name}" ]]; then
+                RS_DENY_CONFIG="${dir}/${name}"
+                RS_INPUTS+=("config:${RS_DENY_CONFIG}")
+            fi
+        done
+        if [[ -z "${lockfile}" && -f "${dir}/Cargo.lock" ]]; then
+            lockfile="${dir}/Cargo.lock"
+            RS_INPUTS+=("lockfile:${lockfile}")
+        fi
+        if [[ "${dir}" == / ]]; then
+            break
+        fi
+        dir=$(dirname "${dir}")
+    done
+}
+
+# rs_deny_db: sets RS_DB, for the run record, to the advisory database
+# cargo-deny reads: in the [advisories] db-path of RS_DENY_CONFIG, or else
+# $CARGO_HOME/advisory-dbs, the copy fetch_advisory_db exported
+# (RUSTSEC_ADVISORY_DB) if it is there, or else the RustSec default's
+# directory when the config names no db-urls. Empty when it can't tell, such
+# as for a relative db-path.
+rs_deny_db() {
+    local settings db_path="" has_urls=false
+    RS_DB=""
+    if [[ -n "${RS_DENY_CONFIG:-}" && -f "${RS_DENY_CONFIG}" ]]; then
+        settings=$(awk -v q="'" '
+            /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
+            section != "[advisories]" { next }
+            /^[[:space:]]*db-urls[[:space:]]*=/ { print "urls" }
+            /^[[:space:]]*db-path[[:space:]]*=/ {
+                value = $0
+                sub(/^[^=]*=[[:space:]]*/, "", value)
+                quote = substr(value, 1, 1)
+                if (quote == "\"" || quote == q) {
+                    rest = substr(value, 2)
+                    print "path=" substr(rest, 1, index(rest, quote) - 1)
+                }
+            }' "${RS_DENY_CONFIG}")
+        if grep -qx urls <<< "${settings}"; then
+            has_urls=true
+        fi
+        db_path=$(sed -n 's/^path=//p' <<< "${settings}" | head -n 1)
+    fi
+    # shellcheck disable=SC2016,SC2088 # matches a literal $CARGO_HOME or ~/, which cargo-deny expands
+    case "${db_path}" in
+        "") db_path="${CARGO_HOME:-${HOME:-}/.cargo}/advisory-dbs" ;;
+        "~/"*) db_path="${HOME:-}/${db_path#"~/"}" ;;
+        '$CARGO_HOME/'* | '${CARGO_HOME}/'*) db_path="${CARGO_HOME:-${HOME:-}/.cargo}/${db_path#*/}" ;;
+        /*) ;;
+        *) return 0 ;;
+    esac
+    db_path=${db_path%/}
+    if [[ -n "${RUSTSEC_ADVISORY_DB:-}" && "${RUSTSEC_ADVISORY_DB}" == "${db_path}"/* ]]; then
+        RS_DB=${RUSTSEC_ADVISORY_DB}
+    elif [[ "${has_urls}" == false && -d "${db_path}/advisory-db-3157b0e258782691" ]]; then
+        RS_DB="${db_path}/advisory-db-3157b0e258782691"
+    fi
+}
+
 # rs_audit_options: reads the cargo audit parameters the audit and audit_bin
 # commands share (db_path, no_fetch, allow_stale, deny, target_arch,
 # target_os, no_yanked) and sets:
@@ -429,6 +514,7 @@ rs_audit_options() {
     RS_NO_YANKED=$(rs_bool no_yanked "${PARAM_NO_YANKED}")
     RS_AUDIT_OPTS=()
     RS_DENIED=()
+    rs_audit_config
     if [[ -n "${db}" ]]; then
         RS_AUDIT_OPTS+=(--db "${db}")
     fi
@@ -487,7 +573,7 @@ rs_audit_extra_args() {
 # counted as denied_warnings (see RS_AUDIT_DENIED_JQ).
 rs_audit_counts() {
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -c --argjson denied "$(rs_denied_json)" --argjson code "$2" "${RS_AUDIT_DENIED_JQ}"'
+    jq -c --argjson denied "$(rs_denied_json)" --argjson config "$(rs_config_denied_json)" --argjson code "$2" "${RS_AUDIT_DENIED_JQ}"'
         rs_denied_kinds as $kinds | {
             vulnerabilities: .vulnerabilities.count,
             warnings: (.warnings | map_values(length)),
@@ -498,23 +584,28 @@ rs_audit_counts() {
 
 # rs_denied_json: prints RS_DENIED as a JSON array.
 # The warning kinds that fail the step, as jq functions for a cargo audit JSON
-# report, given $denied (the deny parameter) and $code (cargo audit's exit
-# code). cargo audit also denies the kinds .cargo/audit.toml's [output] deny
-# lists: when it exits non-zero with no vulnerabilities and no kind the
-# parameter denies, every warning it reported counts as denied.
+# report, given $denied (the deny parameter), $config (the [output] deny list
+# of the audit.toml cargo audit reads) and $code (cargo audit's exit code).
+# cargo audit's report doesn't say what it denied, and a config this can't
+# read could deny more: when cargo audit exits non-zero with no
+# vulnerabilities and no denied kind it reported, every warning counts as
+# denied.
 # shellcheck disable=SC2016 # jq program, not shell
 RS_AUDIT_DENIED_JQ='
-    def rs_param_kinds: [.warnings | keys[] | . as $k | select(($denied | index("warnings")) or ($denied | index($k)))];
-    def rs_denied_by_config: rs_param_kinds as $kinds | $code != 0 and .vulnerabilities.count == 0
+    def rs_kinds_in($list): [.warnings | keys[] | . as $k | select(($list | index("warnings")) or ($list | index($k)))];
+    def rs_listed_kinds: rs_kinds_in($denied + $config);
+    def rs_unexplained: rs_listed_kinds as $kinds | $code != 0 and .vulnerabilities.count == 0
         and ([.warnings | to_entries[] | select(.key as $k | $kinds | index($k)) | .value | length] | add // 0) == 0;
-    def rs_denied_kinds: if rs_denied_by_config then [.warnings | keys[]] else rs_param_kinds end;
+    def rs_denied_kinds: if rs_unexplained then [.warnings | keys[]] else rs_listed_kinds end;
+    def rs_denied_by_config: rs_unexplained or (rs_kinds_in($config) | length > 0);
 '
 
 # rs_audit_check LOG JSON CODE: returns 1, saying why, when cargo audit's run
 # can't be trusted although it wrote a report: it exited non-zero without
 # reporting anything, or it couldn't check for yanked crates (the crates.io
-# index was unreachable) when deny makes yanked crates fail. Only warns when
-# the yanked check failed and nothing denies yanked crates.
+# index was unreachable) when deny, or the audit.toml cargo audit reads, makes
+# yanked crates fail. Only warns when the yanked check failed and nothing
+# denies yanked crates.
 rs_audit_check() {
     local denied
     if [[ "$3" -ne 0 ]] && rs_json_is "$2" '.vulnerabilities.count == 0 and ([.warnings[] | length] | add // 0) == 0'; then
@@ -523,7 +614,7 @@ rs_audit_check() {
         return 1
     fi
     if [[ "${RS_NO_YANKED}" != true ]] && grep -q "couldn't check if the package is yanked" "$1"; then
-        denied=" $(rs_denied_json | jq -r 'join(" ")') "
+        denied=" $(rs_denied_json | jq -r 'join(" ")') ${RS_CONFIG_DENIED[*]-} "
         if [[ "${denied}" == *" yanked "* || "${denied}" == *" warnings "* ]]; then
             echo "ERROR: cargo audit could not check for yanked crates, which deny makes fail the step:" >&2
             grep "couldn't check if the package is yanked" "$1" | sort -u | sed 's/^/  /' >&2
@@ -537,6 +628,46 @@ rs_audit_check() {
 
 rs_denied_json() {
     printf '%s\n' ${RS_DENIED[@]+"${RS_DENIED[@]}"} | jq -Rsc 'split("\n") | map(select(. != ""))'
+}
+rs_config_denied_json() {
+    printf '%s\n' ${RS_CONFIG_DENIED[@]+"${RS_CONFIG_DENIED[@]}"} | jq -Rsc 'split("\n") | map(select(. != ""))'
+}
+
+# rs_audit_config: sets RS_AUDIT_CONFIG to the audit.toml cargo audit reads
+# (.cargo/audit.toml in the working directory, or else $CARGO_HOME's), or
+# empty, and RS_CONFIG_DENIED to the warning kinds its [output] deny lists.
+rs_audit_config() {
+    RS_AUDIT_CONFIG=""
+    RS_CONFIG_DENIED=()
+    if [[ -f .cargo/audit.toml ]]; then
+        RS_AUDIT_CONFIG=.cargo/audit.toml
+    elif [[ -f "${CARGO_HOME:-${HOME:-}/.cargo}/audit.toml" ]]; then
+        RS_AUDIT_CONFIG="${CARGO_HOME:-${HOME:-}/.cargo}/audit.toml"
+    else
+        return 0
+    fi
+    # The deny array, which can span lines; its kinds are plain words.
+    mapfile -t RS_CONFIG_DENIED < <(awk -v q="'" '
+        function take(line) {
+            sub(/#.*/, "", line)
+            buf = buf " " line
+            if (buf ~ /\]/) { collecting = 0; done = 1 }
+        }
+        collecting { take($0); next }
+        /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
+        section == "[output]" && !done && /^[[:space:]]*deny[[:space:]]*=/ {
+            line = $0
+            sub(/^[^=]*=/, "", line)
+            collecting = 1
+            take(line)
+        }
+        END {
+            gsub(q, "\"", buf)
+            while (match(buf, /"[a-z]+"/)) {
+                print substr(buf, RSTART + 1, RLENGTH - 2)
+                buf = substr(buf, RSTART + RLENGTH)
+            }
+        }' "${RS_AUDIT_CONFIG}")
 }
 
 # rs_audit_summary JSON PREFIX: prints a cargo audit JSON report's findings,
@@ -554,7 +685,8 @@ rs_audit_summary() {
 # other warnings are skipped.
 rs_audit_cases() {
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -c --argjson denied "$(rs_denied_json)" --arg class "$2" --argjson code "$3" "${RS_AUDIT_DENIED_JQ}"'
+    jq -c --argjson denied "$(rs_denied_json)" --argjson config "$(rs_config_denied_json)" --arg class "$2" --argjson code "$3" \
+        "${RS_AUDIT_DENIED_JQ}"'
         rs_denied_kinds as $kinds
         | [(.vulnerabilities.list[] | {
             classname: "\($class).vulnerability",

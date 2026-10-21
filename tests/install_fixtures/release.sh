@@ -42,6 +42,12 @@ fixture_checks() {
         check "saying it must be an https URL" said "download_base_url must be an https:// URL"
         check "before downloading anything" no_downloads
     done
+    new_case
+    run_install "PARAM_DOWNLOAD_BASE_URL=http://user:s3cret@mirror.example/github"
+    check "refuses credentials in the URL" failed
+    check "saying they would show in the log" said "download_base_url must not hold credentials"
+    check "without printing them" not_said "s3cret"
+    check "before downloading anything" no_downloads
     begin "${TOOL_NAME}: install record"
     new_case
     run_install

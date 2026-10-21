@@ -117,8 +117,9 @@ EOF
 # cargo-audit: STUB_AUDIT is clean, vuln, warn (an unmaintained crate; exits 1
 # when --deny names it), warn-config (the same, denied by .cargo/audit.toml),
 # crash, nodata (bin: no dependency information), empty (a lockfile with no
-# packages), exit1 (exits 1, reporting nothing) or yanked-unchecked (the
-# crates.io index was unreachable).
+# packages), exit1 (exits 1, reporting nothing), yanked-unchecked (the
+# crates.io index was unreachable) or vuln-warn (a vulnerability and an
+# unmaintained crate).
 {
     echo '#!/usr/bin/env bash'
     record
@@ -133,6 +134,10 @@ fi
 vulns='{"found":false,"count":0,"list":[]}'
 warnings='{}'
 rc=0
+if [[ "${mode}" == vuln-warn ]]; then
+    warnings='{"unmaintained":[{"kind":"unmaintained","package":{"name":"ansi_term","version":"0.12.1"},"advisory":{"id":"RUSTSEC-2021-0139","title":"ansi_term is unmaintained"}}]}'
+    mode=vuln
+fi
 if [[ "${mode}" == vuln ]]; then
     vulns='{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2021-0003","package":"smallvec","title":"Buffer overflow <in> SmallVec & co","url":"https://example.test/252"},"versions":{"patched":[">=1.6.1"]},"package":{"name":"smallvec","version":"1.6.0"}}]}'
     rc=1
@@ -234,7 +239,8 @@ EOF
 } > "${STUBS}/cargo-vet"
 
 # cargo-cyclonedx writes an SBOM beside every member's Cargo.toml (members
-# from STUB_MEMBERS, relative to the working directory); STUB_CDX=crash fails.
+# from STUB_MEMBERS, relative to the working directory); STUB_CDX=crash fails,
+# and STUB_CDX=busy also writes other JSON and XML files meanwhile.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -246,6 +252,8 @@ prev=""
 for a in "$@"; do [[ "${prev}" == --format ]] && format=${a}; prev=${a}; done
 for member in ${STUB_MEMBERS:-.}; do
     name=$(basename "$(cd "${member}" && pwd)")
+    # STUB_CDX=busy: another process writes project files meanwhile.
+    if [[ "${STUB_CDX:-}" == busy ]]; then echo '{"name":"web"}' > "${member}/package.json"; echo '<x/>' > "${member}/pom.xml"; fi
     if [[ "${format}" == json ]]; then
         printf '{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"dep"}],"target":"%s","offline":"%s"}\n' \
             "${CARGO_BUILD_TARGET:-unset}" "${CARGO_NET_OFFLINE:-unset}" > "${member}/${name}.cdx.json"
@@ -455,7 +463,8 @@ new_case
 run fetch_advisory_db.sh FAKE_CLONE_FAIL=1
 check "a failed clone fails" failed
 check "saying so" said "ERROR: Could not clone https://github.com/RustSec/advisory-db"
-for url in "git@github.com:rustsec/advisory-db" "https://github.com/rustsec/advisory-db?x=1" "https://user@github.com/rustsec/advisory-db" "ftp://example.test/db"; do
+for url in "git@github.com:rustsec/advisory-db" "https://github.com/rustsec/advisory-db?x=1" "https://user@github.com/rustsec/advisory-db" \
+    "ftp://example.test/db" "http://mirror.example.test/advisory-db"; do
     new_case
     run fetch_advisory_db.sh "PARAM_URL=${url}"
     check "refuses the url ${url}" failed
@@ -503,6 +512,10 @@ run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/plain"
 check "refuses a copy without git history, whose age can't be told" failed
 check "saying so" said "is not a git checkout"
 check "leaving nothing behind" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+make_db "${CASE}/future" -30
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/future"
+check "refuses a database dated in the future, which would never look stale" failed
+check "saying so" said "newest commit is dated in the future"
 make_db "${CASE}/repo" 1
 run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/plain" "PARAM_DB_DIR=${CASE}/repo/dbs"
 check "even into a db_dir inside another repository" failed
@@ -596,6 +609,18 @@ check "saying cargo audit's config denied them" said "the deny list in .cargo/au
 check "as failed JUnit cases" file_has "${CASE}/out/junit/cargo-audit.xml" 'failures="1"'
 check "and in the run record" json_is "${CASE}/out/cargo-audit.run-record.json" .counts.denied_warnings 1
 
+audit_case
+mkdir -p "${CASE}/work/.cargo"
+printf '[output]\ndeny = [\n  "unmaintained", # reviewed: these fail\n]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh STUB_AUDIT=vuln-warn PARAM_JUNIT=1 PARAM_RUN_RECORD=1
+check "with a vulnerability too, warnings .cargo/audit.toml denies still count as denied" said "1 vulnerabilities and 1 denied warnings"
+check "and fail in JUnit" file_has "${CASE}/out/junit/cargo-audit.xml" 'failures="2"'
+check "the run record names the config" json_is "${CASE}/out/cargo-audit.run-record.json" '.inputs[] | select(.role == "config") | .path' "${CASE}/work/.cargo/audit.toml"
+audit_case
+run audit.sh STUB_AUDIT=vuln-warn PARAM_JUNIT=1
+check "without a config denying them, they are only reported" said "1 vulnerabilities and 0 denied warnings"
+check "as skipped JUnit cases" file_has "${CASE}/out/junit/cargo-audit.xml" 'skipped="1"'
+
 begin "audit: a cargo audit that doesn't complete"
 audit_case
 run audit.sh STUB_AUDIT=crash PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
@@ -621,6 +646,11 @@ audit_case
 run audit.sh STUB_AUDIT=yanked-unchecked PARAM_DENY=yanked PARAM_REPORT_ONLY=1
 check "but fails, even with report_only, when deny covers yanked crates" failed
 check "saying why" said "ERROR: cargo audit could not check for yanked crates, which deny makes fail the step:"
+audit_case
+mkdir -p "${CASE}/work/.cargo"
+printf '[output]\ndeny = ["yanked"]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh STUB_AUDIT=yanked-unchecked
+check "and when .cargo/audit.toml denies yanked crates" failed
 audit_case
 run audit.sh STUB_AUDIT=yanked-unchecked PARAM_NO_YANKED=1
 check "no_yanked skips the check, and the warning" not_said "could not check for yanked crates"
@@ -671,6 +701,13 @@ check "before running cargo audit" call_count cargo-audit 0
 run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1 PARAM_ALLOW_STALE=1
 check "unless allow_stale is true" succeeded
 check "with a warning" said "allow_stale is true, so it is used anyway"
+audit_case
+make_db "${CASE}/db" -30
+run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1
+check "no_fetch with a database dated in the future fails, since it would never look stale" failed
+check "saying so" said "days in the future, so its age can't be told"
+run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1 PARAM_ALLOW_STALE=1
+check "unless allow_stale is true" succeeded
 audit_case
 mkdir -p "${CASE}/db/crates"
 run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1
@@ -925,6 +962,23 @@ check "records the database cargo deny reads" json_is "${RECORD}" .advisory_db.c
 check "records every report" json_is "${RECORD}" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-deny.jsonl cargo-deny.sarif"
 check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "--manifest-path app/Cargo.toml check"
 deny_case
+mkdir -p "${CASE}/home/dbs"
+make_db "${CASE}/home/dbs/advisory-db-3157b0e258782691" 2
+printf '[advisories]\ndb-path = "~/dbs"\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/dbs/advisory-db-3157b0e258782691"
+check "records a database in deny.toml's db-path" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path' "${CASE}/home/dbs/advisory-db-3157b0e258782691"
+check "with its commit" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.commit | length' 40
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+printf '[advisories]\ndb-path = "dbs"\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true
+check "leaves the database out for a relative db-path, rather than name the wrong one" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true
+check "and the RustSec default's copy when deny.toml names other db-urls" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+deny_case
 mkdir -p "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
 run deny.sh PARAM_RUN_RECORD=true
 check "a database without git history leaves its commit null" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db | "\(.path | split("/")[-1]) \(.commit)"' "${DB_NAME} null"
@@ -944,6 +998,8 @@ check "writes the JSON inventory" json_is "${CASE}/out/licenses.json" 'keys | le
 check "writes the TSV inventory" file_has "${CASE}/out/licenses.tsv" $'smallvec@1.6.0\tX\tX'
 check "prints each crate's licences" said "smallvec 1.6.0: MIT, Apache-2.0"
 check "counts them in the run record" json_is "${CASE}/out/licenses.run-record.json" '.counts | "\(.crates) \(.licenses)"' "2 2"
+check "records the deny.toml cargo deny finds, which can clarify licences" \
+    json_is "${CASE}/out/licenses.run-record.json" '.inputs[] | select(.role == "config") | .path' "${CASE}/work/deny.toml"
 deny_case
 run licenses.sh PARAM_LAYOUT=license PARAM_FORMATS=json PARAM_MANIFEST_PATH=app/Cargo.toml "PARAM_FEATURES=a b" PARAM_OFFLINE=true \
     PARAM_TARGET=aarch64-unknown-linux-gnu
@@ -1081,6 +1137,14 @@ check "says how many components each has" said "crates/a/a.cdx.json: 1 component
 check "says how many it wrote" said "Wrote 2 SBOMs to ${CASE}/out/sbom."
 check "records them in the run record" json_is "${CASE}/out/sbom.run-record.json" '.reports | length' 2
 check "leaves CARGO_BUILD_TARGET alone without target" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
+sbom_case
+run sbom.sh STUB_CDX=busy
+check "leaves other JSON files written meanwhile in the workspace" exists "${CASE}/work/crates/a/package.json"
+check "and out of output_dir" absent "${CASE}/out/sbom/crates/a/package.json"
+sbom_case
+run sbom.sh STUB_CDX=busy PARAM_FORMAT=xml
+check "and other XML files" exists "${CASE}/work/crates/a/pom.xml"
+check "moving only the SBOMs" said "Wrote 2 SBOMs"
 sbom_case
 run sbom.sh STUB_LOCK=stale
 check "an out-of-date Cargo.lock fails" failed

@@ -71,10 +71,17 @@ tool_version() {
 # same asset comes from an internal mirror such as Artifactory, Nexus or S3.
 # The checksum table, not the mirror, decides what is installed.
 rs_download_base_url() {
+    local authority
     RS_DOWNLOAD_BASE_URL=$(orb_subst "${PARAM_DOWNLOAD_BASE_URL:-}")
     RS_DOWNLOAD_BASE_URL=${RS_DOWNLOAD_BASE_URL%/}
     if [[ -z "${RS_DOWNLOAD_BASE_URL}" ]]; then
         return 0
+    fi
+    # Credentials in the URL would show in the log and on curl's command
+    # line, so they are refused before the URL is printed anywhere.
+    authority=${RS_DOWNLOAD_BASE_URL#*://}
+    if [[ "${authority%%/*}" == *@* ]]; then
+        orb_die "download_base_url must not hold credentials (user:password@ before the host): they would show in the log and on curl's command line."
     fi
     if [[ ! "${RS_DOWNLOAD_BASE_URL}" =~ ^https://[^[:space:]\"\'\<\>\\]+$ ]]; then
         orb_die "download_base_url must be an https:// URL, not '${RS_DOWNLOAD_BASE_URL}'."

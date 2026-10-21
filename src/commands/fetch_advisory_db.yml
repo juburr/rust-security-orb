@@ -10,9 +10,11 @@ parameters:
     type: string
     default: "https://github.com/RustSec/advisory-db"
     description: >
-      The advisory database's git repository: RustSec's, or an internal mirror of it. Use the
-      URL your deny.toml's db-urls names, if it names one, since the directory cargo deny
-      reads is named after the URL. Environment variables are expanded.
+      The advisory database's git repository: RustSec's, or an internal mirror of it, over
+      https. Use the URL your deny.toml's db-urls names, if it names one, since the directory
+      cargo deny reads is named after the URL. A database whose newest commit is dated in
+      the future fails the step, since neither tool could tell it is stale. Environment
+      variables are expanded.
   import:
     type: string
     default: ""

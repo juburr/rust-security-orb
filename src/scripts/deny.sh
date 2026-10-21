@@ -135,47 +135,13 @@ fi
 CHECK_ARGS+=(${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"})
 RS_ARGS=(${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"} "${CHECK_ARGS[@]}")
 
-# The inputs, found the way cargo-deny finds them: the config from
-# config_path, or else the first deny.toml, .deny.toml or .cargo/deny.toml in
-# the manifest's directory or above it, and the lockfile beside the nearest
-# Cargo.lock.
+# The inputs and the advisory database, for the run record.
 RS_INPUTS=()
-MANIFEST_DIR=$(dirname "${MANIFEST_PATH:-./Cargo.toml}")
-if [[ -n "${CONFIG_PATH}" ]]; then
-    RS_INPUTS+=("config:${CONFIG_PATH}")
-fi
-FOUND_CONFIG=${CONFIG_PATH}
-FOUND_LOCKFILE=""
-dir=$(cd "${MANIFEST_DIR}" 2> /dev/null && pwd) || dir=""
-while [[ -n "${dir}" && ( -z "${FOUND_CONFIG}" || -z "${FOUND_LOCKFILE}" ) ]]; do
-    for name in deny.toml .deny.toml .cargo/deny.toml; do
-        if [[ -z "${FOUND_CONFIG}" && -f "${dir}/${name}" ]]; then
-            FOUND_CONFIG="${dir}/${name}"
-            RS_INPUTS+=("config:${FOUND_CONFIG}")
-        fi
-    done
-    if [[ -z "${FOUND_LOCKFILE}" && -f "${dir}/Cargo.lock" ]]; then
-        FOUND_LOCKFILE="${dir}/Cargo.lock"
-        RS_INPUTS+=("lockfile:${FOUND_LOCKFILE}")
-    fi
-    if [[ "${dir}" == / ]]; then
-        break
-    fi
-    dir=$(dirname "${dir}")
-done
+rs_deny_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}"
 if [[ -n "${METADATA_PATH}" ]]; then
     RS_INPUTS+=("metadata:${METADATA_PATH}")
 fi
-# The database for the run record: the one fetch_advisory_db put where
-# cargo-deny looks, or else cargo-deny's copy of the default database.
-DB_DIR="${CARGO_HOME:-${HOME:-}/.cargo}/advisory-dbs"
-RS_DB=""
-# shellcheck disable=SC2034 # read by rs_run_record
-if [[ -n "${RUSTSEC_ADVISORY_DB:-}" && "${RUSTSEC_ADVISORY_DB}" == "${DB_DIR}"/* ]]; then
-    RS_DB=${RUSTSEC_ADVISORY_DB}
-elif [[ -d "${DB_DIR}/advisory-db-3157b0e258782691" ]]; then
-    RS_DB="${DB_DIR}/advisory-db-3157b0e258782691"
-fi
+rs_deny_db
 RS_REPORTS=()
 JSONL="${RS_BASE}.jsonl"
 
