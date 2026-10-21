@@ -96,15 +96,23 @@ rs_xxh64() {
 # dropped, an empty path written as "/").
 CANONICAL=${URL,,}
 # Only https: over plain http, anyone on the network path could serve a
-# database with advisories left out, and see the Authorization header.
-if [[ ! "${CANONICAL}" =~ ^(https)://([a-z0-9.-]+)(:[0-9]+)?(/[^[:space:]?#]*)?$ ]]; then
-    echo "ERROR: url must be an https URL with a host and a path, and no user, query or fragment." >&2
+# database with advisories left out, and see the Authorization header. The
+# path is limited to characters the url crate leaves as they are, without .
+# or .. segments, which it would resolve: otherwise its directory name would
+# not be the one cargo-deny looks for.
+URL_RE='^(https)://([a-z0-9.-]+)(:[0-9]+)?(/[a-z0-9._~%/+:@!$&()*,;=-]*)?$'
+if [[ ! "${CANONICAL}" =~ ${URL_RE} ]]; then
+    echo "ERROR: url must be an https URL with a host and a path of plain ASCII, and no user, query or fragment." >&2
     exit 1
 fi
 SCHEME=${BASH_REMATCH[1]}
 HOST=${BASH_REMATCH[2]}
 PORT=${BASH_REMATCH[3]}
 URL_PATH=${BASH_REMATCH[4]:-/}
+if [[ "${URL_PATH}/" =~ /(\.|\.\.|%2e|%2e%2e|\.%2e|%2e\.)/ ]]; then
+    echo "ERROR: url's path must not have . or .. segments." >&2
+    exit 1
+fi
 if [[ "${SCHEME}:${PORT}" == "https::443" ]]; then
     PORT=""
 fi

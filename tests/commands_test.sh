@@ -88,6 +88,7 @@ not_called_with() {
 }
 call_count() { [[ "$(find "${CALLS}" -name "$1.*" | wc -l)" -eq "$2" ]]; }
 file_has() { grep -qF -- "$2" "$1"; }
+not_file_has() { ! grep -qF -- "$2" "$1"; }
 json_is() { [[ "$(jq -r "$2" "$1" 2> /dev/null)" == "$3" ]] || { OUTPUT+=$'\n'"$1: $2 is $(jq -c "$2" "$1" 2>&1)"; return 1; }; }
 exists() { [[ -e "$1" ]]; }
 absent() { [[ ! -e "$1" ]]; }
@@ -464,7 +465,8 @@ run fetch_advisory_db.sh FAKE_CLONE_FAIL=1
 check "a failed clone fails" failed
 check "saying so" said "ERROR: Could not clone https://github.com/RustSec/advisory-db"
 for url in "git@github.com:rustsec/advisory-db" "https://github.com/rustsec/advisory-db?x=1" "https://user@github.com/rustsec/advisory-db" \
-    "ftp://example.test/db" "http://mirror.example.test/advisory-db"; do
+    "ftp://example.test/db" "http://mirror.example.test/advisory-db" "https://mirror.example.test/café" \
+    "https://mirror.example.test/x/../advisory-db" "https://mirror.example.test/./advisory-db"; do
     new_case
     run fetch_advisory_db.sh "PARAM_URL=${url}"
     check "refuses the url ${url}" failed
@@ -721,6 +723,19 @@ run audit.sh "PARAM_DB_PATH=${CASE}/project/db" PARAM_NO_FETCH=1
 check "no_fetch doesn't date a database by the repository around it" failed
 check "saying it is not a git checkout" said "is not a git checkout"
 audit_case
+make_db "${CASE}/db" 120
+mkdir -p "${CASE}/work/.cargo"
+printf '[database]\npath = "%s" # the staged copy\nfetch = false\n' "${CASE}/db" > "${CASE}/work/.cargo/audit.toml"
+run audit.sh PARAM_RUN_RECORD=1
+check "a stale database fails when .cargo/audit.toml turns fetching off" failed
+check "saying so" said "newest commit is 120 days old"
+check "after saying the config turned fetching off" said "turns fetching off ([database] fetch = false)"
+check "before running cargo audit" call_count cargo-audit 0
+printf '[database]\npath = "%s"\nfetch = false\nstale = true\n' "${CASE}/db" > "${CASE}/work/.cargo/audit.toml"
+run audit.sh PARAM_RUN_RECORD=1
+check "unless it also allows stale databases" succeeded
+check "the run record names the database the config points to" json_is "${CASE}/out/cargo-audit.run-record.json" .advisory_db.path "${CASE}/db"
+audit_case
 make_db "${CASE}/home/.cargo/advisory-db" 1
 run audit.sh PARAM_NO_FETCH=1
 check "no_fetch checks cargo audit's default database" said "(1 days old)"
@@ -967,6 +982,13 @@ check "records the deny.toml cargo deny finds above the manifest" json_is "${REC
 check "and the lockfile" json_is "${RECORD}" '.inputs[] | select(.role == "lockfile") | .sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
 check "records the database cargo deny reads" json_is "${RECORD}" .advisory_db.commit "$(git -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" log -1 --format=%H)"
 check "records every report" json_is "${RECORD}" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-deny.jsonl cargo-deny.sarif"
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+"${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" remote add origin "https://ci:s3cret-token@mirror.example.test/advisory-db"
+run deny.sh PARAM_RUN_RECORD=true
+check "records the database's remote without the credentials in its URL" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.url "https://mirror.example.test/advisory-db"
+check "anywhere in the run record" not_file_has "${CASE}/out/cargo-deny.run-record.json" "s3cret-token"
 check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "--manifest-path app/Cargo.toml check"
 deny_case
 mkdir -p "${CASE}/home/dbs"
@@ -975,6 +997,13 @@ printf '[advisories]\ndb-path = "~/dbs"\n' > "${CASE}/work/deny.toml"
 run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/dbs/advisory-db-3157b0e258782691"
 check "records a database in deny.toml's db-path" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path' "${CASE}/home/dbs/advisory-db-3157b0e258782691"
 check "with its commit" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.commit | length' 40
+deny_case
+mkdir -p "${CASE}/ci/dbs"
+make_db "${CASE}/ci/dbs/advisory-db-3157b0e258782691" 2
+# shellcheck disable=SC2016 # a literal reference, which cargo-deny expands
+printf '[advisories]\ndb-path = "${CI_PROJECT_DIR:-/nowhere}/dbs"\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true "CI_PROJECT_DIR=${CASE}/ci"
+check "expands variables in db-path as cargo-deny does" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path' "${CASE}/ci/dbs/advisory-db-3157b0e258782691"
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
 printf '[advisories]\ndb-path = "dbs"\n' > "${CASE}/work/deny.toml"
@@ -1192,6 +1221,7 @@ DEFAULTS=(PARAM_MANIFEST_PATH= PARAM_STORE_PATH= PARAM_FILTER_GRAPH= PARAM_LOCKE
 vet_case() {
     new_case
     mkdir -p "${CASE}/work/supply-chain"
+    echo "# lockfile" > "${CASE}/work/Cargo.lock"
     echo "[cargo-vet]" > "${CASE}/work/supply-chain/config.toml"
     echo "" > "${CASE}/work/supply-chain/audits.toml"
     set_default "PARAM_OUTPUT_DIR=${CASE}/out"
@@ -1204,8 +1234,10 @@ check "succeeds" succeeded
 check "runs cargo-vet with the job's cargo, writing JSON" called cargo-vet vet check --output-format json --output-file "${CASE}/out/cargo-vet.json"
 check "writes the report" json_is "${CASE}/out/cargo-vet.json" .conclusion success
 check "says it passed" said "Passed: cargo vet: success."
-check "records the store's files" json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[].role] | join(" ")' "store store"
+check "records the store's files" json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "store")] | length' 2
 check "and the counts" json_is "${CASE}/out/cargo-vet.run-record.json" .counts.vetted_with_exemptions 1
+check "and the workspace's Cargo.lock, which cargo vet's graph comes from" \
+    json_is "${CASE}/out/cargo-vet.run-record.json" '.inputs[] | select(.role == "lockfile") | .path' "${CASE}/work/Cargo.lock"
 vet_case
 run vet.sh STUB_VET=fail PARAM_JUNIT=true
 check "unvetted crates fail the step" failed
@@ -1261,6 +1293,14 @@ LIB_TEST "rs_output ${WORK}/o '../x'"
 check "rs_output refuses a report_name that is a path" failed
 LIB_TEST "rs_output ${WORK}/o/ name; echo \"\${RS_BASE}\""
 check "rs_output drops a trailing slash" said "${WORK}/o/name"
+# shellcheck disable=SC2016 # expanded by the helper
+LIB_TEST 'X=/x; unset NOPE; for p in "~/a" "\$X/b" "\${X}c" "\${NOPE:-/d}/e" "\$CARGO_HOME/f" "\${CARGO_HOME}"; do printf "<%s>" "$(HOME=/h; unset CARGO_HOME; rs_expand_path "$p")"; done'
+check "rs_expand_path expands db-path as cargo-deny does" said "</h/a></x/b></xc></d/e></h/.cargo/f></h/.cargo>"
+# shellcheck disable=SC2016 # expanded by the helper
+LIB_TEST 'unset NOPE; rs_expand_path "\$NOPE/x" || echo unset-fails; rs_expand_path "\${bad-name}" || echo malformed-fails; rs_expand_path "\${X" || echo unbalanced-fails'
+check "and fails where cargo-deny fails" said "unset-fails"
+check "on malformed and unbalanced references too" said "malformed-fails"
+check "and unbalanced braces" said "unbalanced-fails"
 LIB_TEST 'rs_bool sarif yes'
 check "rs_bool refuses anything but true and false" said "ERROR: sarif must be true or false, not 'yes'."
 LIB_TEST "rs_words extra_args '--a \"b c\" '\\''d'\\'''; printf '<%s>' \"\${RS_WORDS[@]}\""

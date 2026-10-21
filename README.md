@@ -337,7 +337,7 @@ Fetches the RustSec advisory database (a shallow git clone), or imports a copy s
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `url` | `https://github.com/RustSec/advisory-db` | The database's git repository, or an internal mirror of it, over `https`. Use the URL `deny.toml`'s `db-urls` names, if it names one: cargo-deny's directory is named after it. A database whose newest commit is dated in the future fails the step, since neither tool could tell it is stale. |
+| `url` | `https://github.com/RustSec/advisory-db` | The database's git repository, or an internal mirror of it, over `https`, with a path of plain ASCII and no `.` or `..` segments. Use the URL `deny.toml`'s `db-urls` names, if it names one: cargo-deny's directory is named after it. A database whose newest commit is dated in the future fails the step, since neither tool could tell it is stale. |
 | `import` | *(empty)* | Import instead of fetching: a directory holding the database's git checkout, or a `.tar.gz` that `archive` wrote. Needs no network access. |
 | `db_dir` | `$CARGO_HOME/advisory-dbs` | Where to put the database, under its URL-derived name. cargo-deny reads another directory only if `deny.toml`'s `db-path` names it. |
 | `archive` | *(empty)* | Also write the database, git history included, to this `.tar.gz`, to persist to the workspace or store. |
@@ -352,7 +352,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | `working_dir` | `.` | Directory to run in. |
 | `lockfile` | `Cargo.lock` | The lockfile to audit. It must exist: the step fails rather than let cargo audit generate one. |
 | `db_path` | *(empty)* | The advisory database. Defaults to the one `fetch_advisory_db` exported, or else cargo audit's own, `$CARGO_HOME/advisory-db`. |
-| `no_fetch` | `false` | Use the database without updating it. cargo audit checks a database's age only when it fetches, so `audit` then applies cargo audit's 90-day rule itself. |
+| `no_fetch` | `false` | Use the database without updating it. cargo audit checks a database's age only when it fetches, so `audit` then applies cargo audit's 90-day rule itself, as it does when `.cargo/audit.toml` sets `[database] fetch = false`. |
 | `allow_stale` | `false` | Accept a database whose newest commit is 90 days old or more. |
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |

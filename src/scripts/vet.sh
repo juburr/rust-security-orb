@@ -83,17 +83,19 @@ if [[ -n "${FILTER_GRAPH}" ]]; then
 fi
 RS_ARGS+=(${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"})
 
-# The store: store_path, or else supply-chain beside the workspace root.
-STORE=${STORE_PATH}
-if [[ -z "${STORE}" ]]; then
-    METADATA_ARGS=(metadata --no-deps --format-version 1)
-    if [[ -n "${MANIFEST_PATH}" ]]; then
-        METADATA_ARGS+=(--manifest-path "${MANIFEST_PATH}")
-    fi
-    ROOT=$("${CARGO}" "${METADATA_ARGS[@]}" 2> /dev/null | jq -r '.workspace_root' 2> /dev/null) || ROOT=""
-    STORE="${ROOT:-.}/supply-chain"
+# The workspace root, for the lockfile cargo vet's graph comes from and the
+# default store, supply-chain beside it. --no-deps resolves nothing, so it
+# neither writes Cargo.lock nor uses the network.
+METADATA_ARGS=(metadata --no-deps --format-version 1)
+if [[ -n "${MANIFEST_PATH}" ]]; then
+    METADATA_ARGS+=(--manifest-path "${MANIFEST_PATH}")
 fi
+ROOT=$("${CARGO}" "${METADATA_ARGS[@]}" 2> /dev/null | jq -r '.workspace_root' 2> /dev/null) || ROOT=""
+STORE=${STORE_PATH:-${ROOT:-.}/supply-chain}
 RS_INPUTS=()
+if [[ -n "${ROOT}" && -f "${ROOT}/Cargo.lock" ]]; then
+    RS_INPUTS+=("lockfile:${ROOT}/Cargo.lock")
+fi
 for file in config.toml audits.toml imports.lock; do
     if [[ -f "${STORE}/${file}" ]]; then
         RS_INPUTS+=("store:${STORE}/${file}")

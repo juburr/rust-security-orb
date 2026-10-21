@@ -351,7 +351,7 @@ rs_gate() {
 # or error.
 rs_run_record() {
     local file=$1 entry path role sha tool_json db_json="null" toolchain args inputs="[]" reports="[]" install="null"
-    local tool_sha=""
+    local tool_sha="" url
     for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
         role=${entry%%:*}
         path=${entry#*:}
@@ -385,8 +385,12 @@ rs_run_record() {
     if [[ -n "${RS_DB:-}" && ! -e "${RS_DB}/.git" ]]; then
         db_json=$(jq -cn --arg path "${RS_DB}" '{path: $path, url: null, commit: null, commit_time: null}')
     elif [[ -n "${RS_DB:-}" ]]; then
+        # A remote URL can carry credentials (https://user:token@host/...),
+        # which must not reach a stored artifact.
+        url=$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)
+        url=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#' <<< "${url}")
         db_json=$(jq -cn --arg path "${RS_DB}" \
-            --arg url "$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)" \
+            --arg url "${url}" \
             --arg commit "$(git -C "${RS_DB}" log -1 --format=%H 2> /dev/null || true)" \
             --arg time "$(git -C "${RS_DB}" log -1 --format=%cI 2> /dev/null || true)" \
             '{path: $path, url: (if $url == "" then null else $url end), commit: (if $commit == "" then null else $commit end),
@@ -452,12 +456,54 @@ rs_deny_inputs() {
     done
 }
 
+# rs_expand_path VALUE: expands a path from deny.toml's db-path the way
+# cargo-deny 0.20 does: a leading ~ to HOME, then $NAME, ${NAME} and
+# ${NAME:-default}, with CARGO_HOME defaulting to $HOME/.cargo. Returns 1, as
+# cargo-deny fails, for an unset variable without a default or a malformed
+# reference.
+rs_expand_path() {
+    local in=$1 out="" name value has_default default
+    # shellcheck disable=SC2016 # regular expressions, not shell
+    local braced='^\$\{([A-Za-z0-9_]*)(:-([^}]*))?\}(.*)$' plain='^\$([A-Za-z0-9_]*)(.*)$'
+    if [[ "${in}" == "~"* ]]; then
+        out=${HOME:-}
+        in=${in:1}
+    fi
+    while [[ "${in}" == *'$'* ]]; do
+        out+=${in%%\$*}
+        in="\$${in#*\$}"
+        if [[ "${in}" =~ ${braced} ]]; then
+            name=${BASH_REMATCH[1]}
+            has_default=${BASH_REMATCH[2]:+yes}
+            default=${BASH_REMATCH[3]}
+            in=${BASH_REMATCH[4]}
+        elif [[ "${in}" =~ ${plain} ]]; then
+            name=${BASH_REMATCH[1]}
+            has_default=""
+            in=${BASH_REMATCH[2]}
+        else
+            return 1
+        fi
+        if [[ "${name}" == CARGO_HOME ]]; then
+            value=${CARGO_HOME:-${HOME:-}/.cargo}
+        elif [[ "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -n "${!name+set}" ]]; then
+            value=${!name}
+        elif [[ -n "${has_default}" ]]; then
+            value=${default}
+        else
+            return 1
+        fi
+        out+=${value}
+    done
+    printf '%s\n' "${out}${in}"
+}
+
 # rs_deny_db: sets RS_DB, for the run record, to the advisory database
 # cargo-deny reads: in the [advisories] db-path of RS_DENY_CONFIG, or else
 # $CARGO_HOME/advisory-dbs, the copy fetch_advisory_db exported
 # (RUSTSEC_ADVISORY_DB) if it is there, or else the RustSec default's
 # directory when the config names no db-urls. Empty when it can't tell, such
-# as for a relative db-path.
+# as for a relative db-path or one that cargo-deny couldn't expand either.
 rs_deny_db() {
     local settings db_path="" has_urls=false
     RS_DB=""
@@ -480,14 +526,14 @@ rs_deny_db() {
         fi
         db_path=$(sed -n 's/^path=//p' <<< "${settings}" | head -n 1)
     fi
-    # shellcheck disable=SC2016,SC2088 # matches a literal $CARGO_HOME or ~/, which cargo-deny expands
-    case "${db_path}" in
-        "") db_path="${CARGO_HOME:-${HOME:-}/.cargo}/advisory-dbs" ;;
-        "~/"*) db_path="${HOME:-}/${db_path#"~/"}" ;;
-        '$CARGO_HOME/'* | '${CARGO_HOME}/'*) db_path="${CARGO_HOME:-${HOME:-}/.cargo}/${db_path#*/}" ;;
-        /*) ;;
-        *) return 0 ;;
-    esac
+    if [[ -z "${db_path}" ]]; then
+        db_path="${CARGO_HOME:-${HOME:-}/.cargo}/advisory-dbs"
+    elif ! db_path=$(rs_expand_path "${db_path}"); then
+        return 0
+    fi
+    if [[ "${db_path}" != /* ]]; then
+        return 0
+    fi
     db_path=${db_path%/}
     if [[ -n "${RUSTSEC_ADVISORY_DB:-}" && "${RUSTSEC_ADVISORY_DB}" == "${db_path}"/* ]]; then
         RS_DB=${RUSTSEC_ADVISORY_DB}
@@ -508,7 +554,7 @@ rs_deny_db() {
 # cargo audit doesn't check the database's age, so rs_db_fresh applies its
 # rule here.
 rs_audit_options() {
-    local db allow_stale kind value
+    local db config_db="" allow_stale kind value
     db=$(rs_subst "${PARAM_DB_PATH}")
     db=${db:-${RUSTSEC_ADVISORY_DB:-}}
     RS_NO_FETCH=$(rs_bool no_fetch "${PARAM_NO_FETCH}")
@@ -519,11 +565,26 @@ rs_audit_options() {
     rs_audit_config
     if [[ -n "${db}" ]]; then
         RS_AUDIT_OPTS+=(--db "${db}")
+    elif [[ -n "${RS_CONFIG_DB_PATH}" ]]; then
+        # --db wins over the config's path, which cargo audit reads otherwise.
+        # shellcheck disable=SC2088 # matches a literal ~/, which cargo audit expands
+        case "${RS_CONFIG_DB_PATH}" in
+            "~/"*) config_db="${HOME:-}/${RS_CONFIG_DB_PATH#"~/"}" ;;
+            *) config_db=${RS_CONFIG_DB_PATH} ;;
+        esac
     fi
     # shellcheck disable=SC2034 # read by rs_run_record
-    RS_DB=${db:-${CARGO_HOME:-${HOME:-}/.cargo}/advisory-db}
+    RS_DB=${db:-${config_db:-${CARGO_HOME:-${HOME:-}/.cargo}/advisory-db}}
+    if [[ "${RS_CONFIG_DB_STALE}" == true ]]; then
+        allow_stale=true
+    fi
     if [[ "${RS_NO_FETCH}" == true ]]; then
         RS_AUDIT_OPTS+=(--no-fetch)
+        rs_db_fresh "${RS_DB}" "${allow_stale}"
+    elif [[ "${RS_CONFIG_DB_FETCH}" == false ]]; then
+        # cargo audit then never fetches, and checks no database's age.
+        RS_NO_FETCH=true
+        echo "The audit.toml cargo audit reads (${RS_AUDIT_CONFIG}) turns fetching off ([database] fetch = false)."
         rs_db_fresh "${RS_DB}" "${allow_stale}"
     elif [[ "${allow_stale}" == true ]]; then
         RS_AUDIT_OPTS+=(--stale)
@@ -637,10 +698,16 @@ rs_config_denied_json() {
 
 # rs_audit_config: sets RS_AUDIT_CONFIG to the audit.toml cargo audit reads
 # (.cargo/audit.toml in the working directory, or else $CARGO_HOME's), or
-# empty, and RS_CONFIG_DENIED to the warning kinds its [output] deny lists.
+# empty, RS_CONFIG_DENIED to the warning kinds its [output] deny lists, and
+# RS_CONFIG_DB_PATH, RS_CONFIG_DB_FETCH and RS_CONFIG_DB_STALE to its
+# [database] path, fetch and stale settings (empty when unset).
 rs_audit_config() {
+    local line
     RS_AUDIT_CONFIG=""
     RS_CONFIG_DENIED=()
+    RS_CONFIG_DB_PATH=""
+    RS_CONFIG_DB_FETCH=""
+    RS_CONFIG_DB_STALE=""
     if [[ -f .cargo/audit.toml ]]; then
         RS_AUDIT_CONFIG=.cargo/audit.toml
     elif [[ -f "${CARGO_HOME:-${HOME:-}/.cargo}/audit.toml" ]]; then
@@ -648,12 +715,30 @@ rs_audit_config() {
     else
         return 0
     fi
-    # The deny array, which can span lines; its kinds are plain words.
-    mapfile -t RS_CONFIG_DENIED < <(awk -v q="'" '
+    # Prints "deny <kind>" for each kind in [output] deny, an array that can
+    # span lines, and "<key> <value>" for [database] path, fetch and stale.
+    while IFS= read -r line; do
+        case "${line}" in
+            "deny "*) RS_CONFIG_DENIED+=("${line#deny }") ;;
+            "path "*) RS_CONFIG_DB_PATH=${line#path } ;;
+            "fetch "*) RS_CONFIG_DB_FETCH=${line#fetch } ;;
+            "stale "*) RS_CONFIG_DB_STALE=${line#stale } ;;
+        esac
+    done < <(awk -v q="'" '
         function take(line) {
             sub(/#.*/, "", line)
             buf = buf " " line
             if (buf ~ /\]/) { collecting = 0; done = 1 }
+        }
+        function value(line) {
+            sub(/^[^=]*=[[:space:]]*/, "", line)
+            quote = substr(line, 1, 1)
+            if (quote == "\"" || quote == q) {
+                line = substr(line, 2)
+                return substr(line, 1, index(line, quote) - 1)
+            }
+            sub(/[[:space:]]*(#.*)?$/, "", line)
+            return line
         }
         collecting { take($0); next }
         /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
@@ -663,10 +748,16 @@ rs_audit_config() {
             collecting = 1
             take(line)
         }
+        section == "[database]" && /^[[:space:]]*(path|fetch|stale)[[:space:]]*=/ {
+            key = $0
+            sub(/^[[:space:]]*/, "", key)
+            sub(/[[:space:]]*=.*/, "", key)
+            print key " " value($0)
+        }
         END {
             gsub(q, "\"", buf)
             while (match(buf, /"[a-z]+"/)) {
-                print substr(buf, RSTART + 1, RLENGTH - 2)
+                print "deny " substr(buf, RSTART + 1, RLENGTH - 2)
                 buf = substr(buf, RSTART + RLENGTH)
             }
         }' "${RS_AUDIT_CONFIG}")
