@@ -1,0 +1,10 @@
+# Builds with the backend-b feature must never link backend a, which
+# the bans check enforces for that configuration.
+
+[licenses]
+allow = ["MIT", "Apache-2.0"]
+
+[bans]
+deny = [
+    { crate = "rso-backend-a", reason = "backend b and backend a must never ship in the same binary" },
+]

@@ -1,0 +1,157 @@
+description: >
+  Checks a Cargo.lock against the RustSec advisory database with cargo audit,
+  and writes cargo-audit's JSON report and a SARIF report to output_dir. The
+  step fails when cargo audit finds vulnerabilities, or warnings that deny
+  makes errors, unless report_only is true; it always fails when cargo audit
+  itself fails. Ignores and other policy belong in .cargo/audit.toml in
+  working_dir, which cargo audit reads as usual. Install cargo-audit first
+  (the install command does by default).
+parameters:
+  working_dir:
+    type: string
+    default: "."
+    description: >
+      Directory to run cargo audit in. cargo audit reads .cargo/audit.toml
+      from here, or else from CARGO_HOME, and lockfile is relative to it.
+  lockfile:
+    type: string
+    default: Cargo.lock
+    description: >
+      The Cargo.lock to audit (cargo audit --file). It must exist: the step
+      fails rather than let cargo audit create one with cargo update.
+      Environment variables are expanded.
+  db_path:
+    type: string
+    default: ""
+    description: >
+      The advisory database to use (cargo audit --db). Defaults to the one
+      fetch_advisory_db fetched or imported earlier in the job (it exports
+      RUSTSEC_ADVISORY_DB), or else cargo-audit's default,
+      $CARGO_HOME/advisory-db. Environment variables are expanded.
+  no_fetch:
+    type: boolean
+    default: false
+    description: >
+      Use the database as it is, without updating it (cargo audit
+      --no-fetch), as a job that runs after fetch_advisory_db or without
+      network access should. cargo audit checks a database's age only when it
+      fetches, so with no_fetch this command applies cargo audit's own rule
+      itself: a database whose newest commit is 90 days old or more fails the
+      step, unless allow_stale is true.
+  allow_stale:
+    type: boolean
+    default: false
+    description: >
+      Use an advisory database whose newest commit is 90 days old or more
+      (cargo audit --stale), instead of failing. Refresh an offline database
+      on a schedule rather than leaving this on.
+  deny:
+    type: string
+    default: ""
+    description: >
+      Warning kinds that fail the step like vulnerabilities (cargo audit
+      --deny), separated by commas or spaces: unmaintained, unsound, yanked,
+      or warnings for all three. Environment variables are expanded.
+  target_arch:
+    type: string
+    default: ""
+    description: >
+      Only report vulnerabilities that affect these CPU architectures (cargo
+      audit --target-arch), such as x86_64, separated by commas or spaces.
+  target_os:
+    type: string
+    default: ""
+    description: >
+      Only report vulnerabilities that affect these operating systems (cargo
+      audit --target-os), such as linux, separated by commas or spaces.
+  no_yanked:
+    type: boolean
+    default: false
+    description: >
+      Skip the check for yanked crates (cargo audit --no-yanked, cargo-audit
+      0.22.2 and later), which otherwise queries the crates.io index.
+  extra_args:
+    type: string
+    default: ""
+    description: >
+      More cargo audit arguments, split like shell words. Nothing in them is
+      expanded or run; environment variables are expanded before splitting.
+      --json and --format are refused, since this command writes the reports.
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory to write the reports into. Environment
+      variables are not expanded, since the path is also passed to
+      store_artifacts and store_test_results.
+  report_name:
+    type: string
+    default: cargo-audit
+    description: >
+      The reports' file name, without extension: <report_name>.json, .sarif,
+      .log, .run-record.json and junit/<report_name>.xml. Give each audit in
+      a job its own.
+  sarif:
+    type: boolean
+    default: true
+    description: Also write a SARIF 2.1.0 report, <report_name>.sarif.
+  junit:
+    type: boolean
+    default: false
+    description: >
+      Also write JUnit XML, one test case per finding, and show it in
+      CircleCI's Tests tab: vulnerabilities and denied warnings fail, other
+      warnings are skipped.
+  report_only:
+    type: boolean
+    default: false
+    description: >
+      Report findings without failing the step, to adopt the check gradually.
+      A cargo audit that can't complete still fails it.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and
+      SHA-512 and how it was installed, the cargo and rustc versions, the
+      advisory database's commit and time, the lockfile's and config's
+      SHA-256, the arguments, the counts and every report's SHA-256.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: Store output_dir as job artifacts under rust-security-reports/, including when the step fails.
+steps:
+  - run:
+      name: cargo audit << parameters.lockfile >>
+      working_directory: << parameters.working_dir >>
+      environment:
+        PARAM_ALLOW_STALE: << parameters.allow_stale >>
+        PARAM_DB_PATH: << parameters.db_path >>
+        PARAM_DENY: << parameters.deny >>
+        PARAM_EXTRA_ARGS: << parameters.extra_args >>
+        PARAM_JUNIT: << parameters.junit >>
+        PARAM_LOCKFILE: << parameters.lockfile >>
+        PARAM_NO_FETCH: << parameters.no_fetch >>
+        PARAM_NO_YANKED: << parameters.no_yanked >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_REPORT_ONLY: << parameters.report_only >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        PARAM_SARIF: << parameters.sarif >>
+        PARAM_TARGET_ARCH: << parameters.target_arch >>
+        PARAM_TARGET_OS: << parameters.target_os >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/audit.sh) >>
+  - when:
+      condition: << parameters.junit >>
+      steps:
+        - store_test_results:
+            path: << parameters.output_dir >>/junit
+            when: always
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always
