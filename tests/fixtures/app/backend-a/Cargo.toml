@@ -1,0 +1,7 @@
+[package]
+name = "rso-backend-a"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Test fixture for rust-security-orb: backend a."
