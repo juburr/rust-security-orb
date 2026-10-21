@@ -1291,6 +1291,10 @@ LIB_TEST 'rs_output relative/dir name'
 check "rs_output refuses a relative output_dir" failed
 LIB_TEST "rs_output ${WORK}/o '../x'"
 check "rs_output refuses a report_name that is a path" failed
+LIB_TEST "rs_output ${WORK}/o 'café'"
+check "and one with a letter outside ASCII, in any locale" failed
+LIB_TEST 'rs_env_var_name digest_env_var café'
+check "rs_env_var_name refuses a name with a letter outside ASCII, in any locale" said "ERROR: digest_env_var must name an environment variable"
 LIB_TEST "rs_output ${WORK}/o/ name; echo \"\${RS_BASE}\""
 check "rs_output drops a trailing slash" said "${WORK}/o/name"
 # shellcheck disable=SC2016 # expanded by the helper

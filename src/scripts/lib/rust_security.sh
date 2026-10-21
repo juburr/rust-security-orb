@@ -148,10 +148,18 @@ rs_words() {
     RS_WORDS=(${SHELL_WORDS[@]+"${SHELL_WORDS[@]}"})
 }
 
+# rs_match VALUE REGEX: [[ VALUE =~ REGEX ]] in the C locale, setting
+# BASH_REMATCH. In other locales a range such as [a-z] can match letters such
+# as é (cimg images set LC_ALL=en_US.UTF-8), so checks with ranges use this.
+rs_match() {
+    local LC_ALL=C
+    [[ "$1" =~ $2 ]]
+}
+
 # rs_env_var_name PARAMETER VALUE: stops the step unless VALUE can name an
 # environment variable.
 rs_env_var_name() {
-    if [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    if ! rs_match "$2" '^[A-Za-z_][A-Za-z0-9_]*$'; then
         echo "ERROR: ${1} must name an environment variable, not '${2}'." >&2
         exit 1
     fi
@@ -217,7 +225,7 @@ rs_output() {
         echo "ERROR: output_dir must be an absolute path, not '$1'." >&2
         exit 1
     fi
-    if [[ ! "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    if ! rs_match "$2" '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
         echo "ERROR: report_name must be letters, digits, '.', '_' and '-', not '$2'." >&2
         exit 1
     fi
@@ -472,12 +480,12 @@ rs_expand_path() {
     while [[ "${in}" == *'$'* ]]; do
         out+=${in%%\$*}
         in="\$${in#*\$}"
-        if [[ "${in}" =~ ${braced} ]]; then
+        if rs_match "${in}" "${braced}"; then
             name=${BASH_REMATCH[1]}
             has_default=${BASH_REMATCH[2]:+yes}
             default=${BASH_REMATCH[3]}
             in=${BASH_REMATCH[4]}
-        elif [[ "${in}" =~ ${plain} ]]; then
+        elif rs_match "${in}" "${plain}"; then
             name=${BASH_REMATCH[1]}
             has_default=""
             in=${BASH_REMATCH[2]}
@@ -486,7 +494,7 @@ rs_expand_path() {
         fi
         if [[ "${name}" == CARGO_HOME ]]; then
             value=${CARGO_HOME:-${HOME:-}/.cargo}
-        elif [[ "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && -n "${!name+set}" ]]; then
+        elif rs_match "${name}" '^[A-Za-z_][A-Za-z0-9_]*$' && [[ -n "${!name+set}" ]]; then
             value=${!name}
         elif [[ -n "${has_default}" ]]; then
             value=${default}

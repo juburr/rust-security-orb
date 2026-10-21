@@ -79,6 +79,7 @@ Per script:
 
 - `rs_subst` expands environment variables by piping the value to `circleci env subst` on stdin, and uses the value as is without the CLI. `rs_list` substitutes and splits on commas and spaces; `rs_words` splits `extra_args` with `split_shell_words` (the same parser container-ops-orb, oras-orb, crane-orb and skopeo-orb use), refusing `$(...)`, backticks and shell operators outside quotes.
 - `rs_bool`, `rs_env_var_name`, `rs_export` (`printf 'export %s=%q\n'` to `$BASH_ENV`), `rs_tool`, `rs_require_jq`, `rs_output` (absolute `output_dir`, a `report_name` that is a plain file name), `rs_sha256`.
+- `rs_match VALUE REGEX` is `[[ VALUE =~ REGEX ]]` in the C locale. Bash's `=~` follows the locale, and in `en_US.UTF-8`, which the cimg images set in `LANG` and `LC_ALL`, a range such as `[a-z]` also matches letters such as `é`. So every check of user input with a range uses `rs_match`.
 - `rs_json_is FILE FILTER [JQ_OPTION...]` checks a report. The scripts must work with jq 1.6, which `cimg/python` (the `test-commands` image) and Ubuntu 22.04 ship, and where `jq -e` exits 0 on an empty file and takes its status from the last input (so a `select` over JSONL fails unless the last line matches); raw slurped input also loses a trailing NUL. So never use `jq -e` on a tool's output in the scripts; in `test-deploy.yml`, slurp JSONL (`jq -s -e 'any(.[]; ...)'`).
 - `rs_junit FILE SUITE CASES_JSON` writes JUnit from `{classname, name, status: passed|failed|skipped, message, detail}` cases, escaping with jq's `@html`, with one passing case when there are none.
 - `rs_gate FINDINGS REPORT_ONLY SUMMARY` ends the step.
@@ -118,6 +119,6 @@ Command names say what they check (`audit`, `deny`, `vet`) or make (`sbom`, `lic
 
 Before committing changes, verify work locally if tools are available on the system:
 - Run `shellcheck src/scripts/*.sh src/scripts/lib/*.sh src/install/*/*.sh tests/*.sh` to lint shell scripts
-- Run every `tests/*_test.sh`
+- Run every `tests/*_test.sh`, also under `LC_ALL=en_US.UTF-8` (as CI does) when the system has that locale
 - Run `circleci orb pack src/ > orb.yml && circleci orb validate orb.yml` to validate the orb structure
 - For changes to a command, also run it with the real tools against `tests/fixtures/app` through `tests/run_command.sh`, as `test-deploy.yml` does

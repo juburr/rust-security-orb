@@ -101,7 +101,7 @@ CANONICAL=${URL,,}
 # or .. segments, which it would resolve: otherwise its directory name would
 # not be the one cargo-deny looks for.
 URL_RE='^(https)://([a-z0-9.-]+)(:[0-9]+)?(/[a-z0-9._~%/+:@!$&()*,;=-]*)?$'
-if [[ ! "${CANONICAL}" =~ ${URL_RE} ]]; then
+if ! rs_match "${CANONICAL}" "${URL_RE}"; then
     echo "ERROR: url must be an https URL with a host and a path of plain ASCII, and no user, query or fragment." >&2
     exit 1
 fi
