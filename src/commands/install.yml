@@ -1,0 +1,169 @@
+description: >
+  Installs the cargo security tools named in tools, each verified against this
+  orb's checksum table, through the install command for that tool
+  (install_cargo_audit, install_cargo_deny, ...), which can also be used on
+  its own. Tools with prebuilt Linux binaries (cargo-audit, cargo-deny,
+  cargo-auditable, cargo-cyclonedx) are downloaded for amd64 or arm64, picked
+  from the machine's CPU architecture. The others (cargo-vet, rust-audit-info,
+  auditable2cdx) publish no binaries for current releases, so their verified
+  source archives are built with cargo install --locked, which needs cargo.
+  Run this before the orb's other commands.
+parameters:
+  tools:
+    type: string
+    default: "cargo-audit,cargo-deny,cargo-auditable"
+    description: >
+      The tools to install, separated by commas or spaces: any of cargo-audit,
+      cargo-deny, cargo-auditable, cargo-cyclonedx, cargo-vet,
+      rust-audit-info and auditable2cdx. An unknown name fails the step.
+  caching:
+    type: boolean
+    default: true
+    description: >
+      Cache each tool's verified release (or, for the tools built from
+      source, its verified source archive) between jobs. Only verified files
+      are cached, and a cached file is verified again before it is used.
+  download_base_url:
+    type: string
+    default: ""
+    description: >
+      Base URL of an internal mirror of GitHub releases, such as an
+      Artifactory or Nexus remote repository, to download the prebuilt tools
+      from instead of https://github.com. It replaces https://github.com in
+      each release URL, so the mirror must serve the same paths. It must be an
+      https:// URL. What is downloaded is still verified against this orb's
+      checksum table. The tools built from source download from crates.io and
+      the registry cargo is configured for.
+  install_path:
+    type: string
+    default: ""
+    description: >
+      Absolute path of the directory to install the tools into. It is
+      created if needed and added to the PATH of later steps when it isn't
+      already on it, and must be writable without root. Environment variables
+      are expanded. Defaults to $HOME/bin.
+  verify_checksums:
+    type: enum
+    enum: ["false", "known_versions", "strict"]
+    default: strict
+    description: >
+      SHA-512 verification against this orb's checksum table, for every tool.
+      "strict" (default) fails before downloading anything when a version has
+      no checksum in the table. "known_versions" verifies listed versions and
+      installs unlisted versions unverified, with a warning. "false" skips
+      verification and is not recommended.
+  cargo_audit_version:
+    type: string
+    default: "0.22.2"
+    description: The cargo-audit version, when tools names it. Environment variables are expanded.
+  cargo_deny_version:
+    type: string
+    default: "0.20.2"
+    description: The cargo-deny version, when tools names it. Environment variables are expanded.
+  cargo_auditable_version:
+    type: string
+    default: "0.7.7"
+    description: The cargo-auditable version, when tools names it. Environment variables are expanded.
+  cargo_cyclonedx_version:
+    type: string
+    default: "0.5.9"
+    description: The cargo-cyclonedx version, when tools names it. Environment variables are expanded.
+  cargo_vet_version:
+    type: string
+    default: "0.10.2"
+    description: The cargo-vet version, when tools names it. Environment variables are expanded.
+  rust_audit_info_version:
+    type: string
+    default: "0.5.4"
+    description: The rust-audit-info version, when tools names it. Environment variables are expanded.
+  auditable2cdx_version:
+    type: string
+    default: "0.1.0"
+    description: The auditable2cdx version, when tools names it. Environment variables are expanded.
+steps:
+  - run:
+      name: Check the tools to install
+      environment:
+        PARAM_TOOLS: << parameters.tools >>
+      command: << include(scripts/install_tools.sh) >>
+  - when:
+      condition:
+        matches:
+          pattern: "^(.*[ ,])?cargo-audit([ ,].*)?$"
+          value: << parameters.tools >>
+      steps:
+        - install_cargo_audit:
+            caching: << parameters.caching >>
+            download_base_url: << parameters.download_base_url >>
+            install_path: << parameters.install_path >>
+            verify_checksums: << parameters.verify_checksums >>
+            version: << parameters.cargo_audit_version >>
+  - when:
+      condition:
+        matches:
+          pattern: "^(.*[ ,])?cargo-deny([ ,].*)?$"
+          value: << parameters.tools >>
+      steps:
+        - install_cargo_deny:
+            caching: << parameters.caching >>
+            download_base_url: << parameters.download_base_url >>
+            install_path: << parameters.install_path >>
+            verify_checksums: << parameters.verify_checksums >>
+            version: << parameters.cargo_deny_version >>
+  - when:
+      condition:
+        matches:
+          pattern: "^(.*[ ,])?cargo-auditable([ ,].*)?$"
+          value: << parameters.tools >>
+      steps:
+        - install_cargo_auditable:
+            caching: << parameters.caching >>
+            download_base_url: << parameters.download_base_url >>
+            install_path: << parameters.install_path >>
+            verify_checksums: << parameters.verify_checksums >>
+            version: << parameters.cargo_auditable_version >>
+  - when:
+      condition:
+        matches:
+          pattern: "^(.*[ ,])?cargo-cyclonedx([ ,].*)?$"
+          value: << parameters.tools >>
+      steps:
+        - install_cargo_cyclonedx:
+            caching: << parameters.caching >>
+            download_base_url: << parameters.download_base_url >>
+            install_path: << parameters.install_path >>
+            verify_checksums: << parameters.verify_checksums >>
+            version: << parameters.cargo_cyclonedx_version >>
+  - when:
+      condition:
+        matches:
+          pattern: "^(.*[ ,])?cargo-vet([ ,].*)?$"
+          value: << parameters.tools >>
+      steps:
+        - install_cargo_vet:
+            caching: << parameters.caching >>
+            install_path: << parameters.install_path >>
+            verify_checksums: << parameters.verify_checksums >>
+            version: << parameters.cargo_vet_version >>
+  - when:
+      condition:
+        matches:
+          pattern: "^(.*[ ,])?rust-audit-info([ ,].*)?$"
+          value: << parameters.tools >>
+      steps:
+        - install_rust_audit_info:
+            caching: << parameters.caching >>
+            install_path: << parameters.install_path >>
+            verify_checksums: << parameters.verify_checksums >>
+            version: << parameters.rust_audit_info_version >>
+  - when:
+      condition:
+        matches:
+          pattern: "^(.*[ ,])?auditable2cdx([ ,].*)?$"
+          value: << parameters.tools >>
+      steps:
+        - install_auditable2cdx:
+            caching: << parameters.caching >>
+            install_path: << parameters.install_path >>
+            verify_checksums: << parameters.verify_checksums >>
+            version: << parameters.auditable2cdx_version >>

@@ -1,0 +1,76 @@
+description: >
+  Builds and installs rust-audit-info, which reads the dependency list
+  cargo-auditable embeds in a binary, for verify_auditable. It publishes no
+  prebuilt binaries, so this verifies the crate's source archive against this
+  orb's checksum table and builds it with cargo install --locked, which needs
+  cargo on the PATH and takes under a minute.
+parameters:
+  caching:
+    type: boolean
+    default: true
+    description: >
+      Cache the verified source archive between jobs, keyed by version and
+      home directory. The binary is built in every job, since a build can't be
+      verified against a checksum. Only verified archives are cached, and a
+      cached archive is verified again before it is built.
+  install_path:
+    type: string
+    default: ""
+    description: >
+      Absolute path of the directory to install rust-audit-info into. It is created
+      if needed and added to the PATH of later steps when it isn't already on
+      it, and must be writable without root. Environment variables are
+      expanded. Defaults to $HOME/bin.
+  verify_checksums:
+    type: enum
+    enum: ["false", "known_versions", "strict"]
+    default: strict
+    description: >
+      SHA-512 verification of the crate's source archive against this orb's
+      checksum table. "strict" (default) fails before downloading anything
+      when the version has no checksum in the table. "known_versions"
+      verifies listed versions and builds unlisted versions from an unverified
+      archive, with a warning. "false" skips verification and is not
+      recommended.
+  version:
+    type: string
+    default: "0.5.4"
+    description: >
+      Version of rust-audit-info to install, such as 0.5.4. A leading "v" is
+      ignored, and environment variables are expanded.
+steps:
+  - when:
+      condition: << parameters.caching >>
+      steps:
+        # The key is computed from a file that names the CPU (uname -m, as
+        # {{ arch }} also encodes the CPU model and would split the cache by
+        # host), HOME (a cache is restored to the absolute path it was saved
+        # from), and the version with environment variables expanded.
+        - run:
+            name: Prepare rust-audit-info cache key
+            environment:
+              ORB_CACHE_KEY_FILE: /tmp/rust-security-orb-rust-audit-info-cache-key
+              PARAM_VERSION: << parameters.version >>
+            command: << include(scripts/cache_key.sh) >>
+        # A saved cache can't be replaced. Bump v1 when an existing checksum
+        # table entry changes, so caches saved for the old bytes stop being
+        # restored.
+        - restore_cache:
+            key: rust-security-orb-rust-audit-info-v1-<< parameters.version >>-{{ checksum "/tmp/rust-security-orb-rust-audit-info-cache-key" }}
+  - run:
+      name: Install rust-audit-info << parameters.version >>
+      # cargo prints nothing for minutes while it compiles some crates.
+      no_output_timeout: 30m
+      environment:
+        PARAM_CACHING: << parameters.caching >>
+        PARAM_INSTALL_PATH: << parameters.install_path >>
+        PARAM_VERIFY_CHECKSUMS: << parameters.verify_checksums >>
+        PARAM_VERSION: << parameters.version >>
+      command: << include(install/rust-audit-info/install.sh) >>
+  - when:
+      condition: << parameters.caching >>
+      steps:
+        - save_cache:
+            key: rust-security-orb-rust-audit-info-v1-<< parameters.version >>-{{ checksum "/tmp/rust-security-orb-rust-audit-info-cache-key" }}
+            paths:
+              - ~/.cache/rust-security-orb-rust-audit-info

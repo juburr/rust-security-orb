@@ -1,0 +1,52 @@
+# shellcheck shell=bash disable=SC2034 # a fragment: the install contract it is spliced into reads these
+# Release binaries downloaded from GitHub (cargo-audit, cargo-deny,
+# cargo-auditable, cargo-cyclonedx). On top of the shared contract, the
+# download_base_url mirror: it replaces https://github.com in the release URL,
+# and what it serves is verified like any download.
+fixture_checks() {
+    local mirror="https://mirror.example/artifactory/github" mirror_url listed_file tampered_file
+    begin "${TOOL_NAME}: download_base_url"
+    # The mirror serves exactly the files served for GitHub (an archive made
+    # again would differ in its timestamps).
+    listed_file=$(served_file "${LISTED}" "${DEFAULT_ARCH}")
+    tampered_file=$(served_file "${TAMPERED}" "${DEFAULT_ARCH}")
+    RS_DOWNLOAD_BASE_URL=${mirror}
+    cp "${listed_file}" "$(served_file "${LISTED}" "${DEFAULT_ARCH}")"
+    cp "${tampered_file}" "$(served_file "${TAMPERED}" "${DEFAULT_ARCH}")"
+    mirror_url=$(url "${LISTED}" "${DEFAULT_ARCH}")
+    unset RS_DOWNLOAD_BASE_URL
+    OUTPUT="mirror URL: ${mirror_url}"
+    check "the mirror URL is the GitHub release URL with the mirror in place of https://github.com" \
+        test "${mirror_url#"${mirror}"}" = "$(url "${LISTED}" "${DEFAULT_ARCH}" | sed 's|^https://github.com||')"
+    new_case
+    run_install "PARAM_DOWNLOAD_BASE_URL=${mirror}/"
+    check "installs from the mirror" installed
+    check "downloads from the mirror alone" downloaded "${mirror_url}"
+    check "once" download_count 1
+    check "says which mirror it uses" said "download mirror:  ${mirror}"
+    new_case
+    # shellcheck disable=SC2016 # expanded by install.sh
+    run_install 'PARAM_DOWNLOAD_BASE_URL=${ORB_TEST_MIRROR}' "ORB_TEST_MIRROR=${mirror}"
+    check "expands environment variables in it" installed
+    for mode in strict known_versions; do
+        new_case
+        run_install "PARAM_DOWNLOAD_BASE_URL=${mirror}" "PARAM_VERSION=${TAMPERED}" "PARAM_VERIFY_CHECKSUMS=${mode}"
+        check "${mode}: refuses a tampered asset from the mirror" failed
+        check "${mode}: reporting the mismatch" said "Checksum verification failed."
+        check "${mode}: and installs nothing" not_installed
+    done
+    for value in "http://mirror.example" "mirror.example" "https://mirror example"; do
+        new_case
+        run_install "PARAM_DOWNLOAD_BASE_URL=${value}"
+        check "refuses '${value}'" failed
+        check "saying it must be an https URL" said "download_base_url must be an https:// URL"
+        check "before downloading anything" no_downloads
+    done
+    begin "${TOOL_NAME}: install record"
+    new_case
+    run_install
+    OUTPUT=$(cat "${CASE}/bin/.${TOOL_BINARY}.install.json" 2>&1)
+    check "records a prebuilt install beside the binary" said '"method":"prebuilt"'
+    check "with the version and the verified checksum" said "\"version\":\"${LISTED}\""
+    check "and the installed binary's SHA-512" said "\"binary_sha512\":\"$(sha512sum "${CASE}/bin/${TOOL_BINARY}" | awk '{ print $1 }')\""
+}
