@@ -16,8 +16,9 @@ parameters:
     type: string
     description: >
       The binaries to audit, separated by spaces or commas; shell patterns such as
-      target/release/* are expanded. Name the files you ship, after any stripping or
-      packaging. Environment variables are expanded.
+      dist/* are expanded, and everything they match must be a binary (target/release/*
+      also matches directories and .d files). Name the files you ship, after any
+      stripping or packaging. Environment variables are expanded.
   require_auditable:
     type: boolean
     default: false
@@ -145,7 +146,7 @@ steps:
       condition: << parameters.junit >>
       steps:
         - store_test_results:
-            path: << parameters.output_dir >>/junit
+            path: << parameters.output_dir >>/junit/<< parameters.report_name >>.xml
             when: always
   - when:
       condition: << parameters.store_artifacts >>

@@ -69,7 +69,7 @@ steps:
       condition: << parameters.junit >>
       steps:
         - store_test_results:
-            path: << parameters.output_dir >>/junit
+            path: << parameters.output_dir >>/junit/<< parameters.report_name >>.xml
             when: always
   - when:
       condition: << parameters.store_artifacts >>

@@ -245,7 +245,10 @@ rs_sha256() {
 # read (not a git checkout), since it could be any age.
 rs_db_fresh() {
     local db=$1 committed now age_days
-    if ! committed=$(git -C "${db}" log -1 --format=%ct 2> /dev/null) || [[ ! "${committed}" =~ ^[0-9]+$ ]]; then
+    # git -C searches parent directories, so a database without its own .git
+    # inside another work tree would be dated by that repository instead.
+    if [[ ! -e "${db}/.git" ]] || ! committed=$(git -C "${db}" log -1 --format=%ct 2> /dev/null) \
+        || [[ ! "${committed}" =~ ^[0-9]+$ ]]; then
         if [[ "$2" == true ]]; then
             echo "WARN: The age of the advisory database in ${db} could not be read (it is not a git checkout); allow_stale is true, so it is used anyway." >&2
             return 0
@@ -353,7 +356,9 @@ rs_run_record() {
     tool_json=$(jq -cn --arg name "${RS_TOOL##*/}" --arg path "${RS_TOOL:-}" --arg version "${RS_TOOL_VERSION:-}" \
         --arg sha "${tool_sha}" --argjson install "${install}" \
         '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end), install: $install}')
-    if [[ -n "${RS_DB:-}" ]]; then
+    if [[ -n "${RS_DB:-}" && ! -e "${RS_DB}/.git" ]]; then
+        db_json=$(jq -cn --arg path "${RS_DB}" '{path: $path, url: null, commit: null, commit_time: null}')
+    elif [[ -n "${RS_DB:-}" ]]; then
         db_json=$(jq -cn --arg path "${RS_DB}" \
             --arg url "$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)" \
             --arg commit "$(git -C "${RS_DB}" log -1 --format=%H 2> /dev/null || true)" \
@@ -363,7 +368,10 @@ rs_run_record() {
     fi
     # NUL-separated, so arguments that start with "-" never reach jq's own
     # option parsing.
-    args=$(printf '%s\0' ${RS_ARGS[@]+"${RS_ARGS[@]}"} | jq -Rsc 'split("\u0000") | .[:-1]')
+    args="[]"
+    if [[ -n "${RS_ARGS[*]+set}" ]]; then
+        args=$(printf '%s\0' "${RS_ARGS[@]}" | jq -Rsc 'split("\u0000") | .[:-1]')
+    fi
     toolchain=$(jq -cn --arg cargo "$(cargo --version 2> /dev/null || true)" --arg rustc "$(rustc --version 2> /dev/null || true)" \
         '{cargo: (if $cargo == "" then null else $cargo end), rustc: (if $rustc == "" then null else $rustc end)}')
     if ! jq -n --arg command "$2" --arg outcome "$3" --argjson code "$4" --arg started "$5" \
@@ -398,12 +406,12 @@ rs_run_record() {
 # cargo audit doesn't check the database's age, so rs_db_fresh applies its
 # rule here.
 rs_audit_options() {
-    local db allow_stale no_yanked kind value
+    local db allow_stale kind value
     db=$(rs_subst "${PARAM_DB_PATH}")
     db=${db:-${RUSTSEC_ADVISORY_DB:-}}
     RS_NO_FETCH=$(rs_bool no_fetch "${PARAM_NO_FETCH}")
     allow_stale=$(rs_bool allow_stale "${PARAM_ALLOW_STALE}")
-    no_yanked=$(rs_bool no_yanked "${PARAM_NO_YANKED}")
+    RS_NO_YANKED=$(rs_bool no_yanked "${PARAM_NO_YANKED}")
     RS_AUDIT_OPTS=()
     RS_DENIED=()
     if [[ -n "${db}" ]]; then
@@ -437,7 +445,7 @@ rs_audit_options() {
     for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
         RS_AUDIT_OPTS+=(--target-os "${value}")
     done
-    if [[ "${no_yanked}" == true ]]; then
+    if [[ "${RS_NO_YANKED}" == true ]]; then
         RS_AUDIT_OPTS+=(--no-yanked)
     fi
 }
@@ -459,17 +467,59 @@ rs_audit_extra_args() {
     done
 }
 
-# rs_audit_counts JSON: prints the counts of a cargo audit JSON report, with
-# the warnings RS_DENIED turns into errors counted as denied_warnings.
+# rs_audit_counts JSON CODE: prints the counts of a cargo audit JSON report
+# from a run that exited with CODE, with the warnings that fail the step
+# counted as denied_warnings (see RS_AUDIT_DENIED_JQ).
 rs_audit_counts() {
-    jq -c --argjson denied "$(rs_denied_json)" '{
-        vulnerabilities: .vulnerabilities.count,
-        warnings: (.warnings | map_values(length)),
-        denied_warnings: ([.warnings | to_entries[] | .key as $k | select(($denied | index("warnings")) or ($denied | index($k))) | .value | length] | add // 0)
-    }' "$1"
+    # shellcheck disable=SC2016 # jq program, not shell
+    jq -c --argjson denied "$(rs_denied_json)" --argjson code "$2" "${RS_AUDIT_DENIED_JQ}"'
+        rs_denied_kinds as $kinds | {
+            vulnerabilities: .vulnerabilities.count,
+            warnings: (.warnings | map_values(length)),
+            denied_warnings: ([.warnings | to_entries[] | select(.key as $k | $kinds | index($k)) | .value | length] | add // 0),
+            denied_by_config: rs_denied_by_config
+        }' "$1"
 }
 
 # rs_denied_json: prints RS_DENIED as a JSON array.
+# The warning kinds that fail the step, as jq functions for a cargo audit JSON
+# report, given $denied (the deny parameter) and $code (cargo audit's exit
+# code). cargo audit also denies the kinds .cargo/audit.toml's [output] deny
+# lists: when it exits non-zero with no vulnerabilities and no kind the
+# parameter denies, every warning it reported counts as denied.
+# shellcheck disable=SC2016 # jq program, not shell
+RS_AUDIT_DENIED_JQ='
+    def rs_param_kinds: [.warnings | keys[] | . as $k | select(($denied | index("warnings")) or ($denied | index($k)))];
+    def rs_denied_by_config: rs_param_kinds as $kinds | $code != 0 and .vulnerabilities.count == 0
+        and ([.warnings | to_entries[] | select(.key as $k | $kinds | index($k)) | .value | length] | add // 0) == 0;
+    def rs_denied_kinds: if rs_denied_by_config then [.warnings | keys[]] else rs_param_kinds end;
+'
+
+# rs_audit_check LOG JSON CODE: returns 1, saying why, when cargo audit's run
+# can't be trusted although it wrote a report: it exited non-zero without
+# reporting anything, or it couldn't check for yanked crates (the crates.io
+# index was unreachable) when deny makes yanked crates fail. Only warns when
+# the yanked check failed and nothing denies yanked crates.
+rs_audit_check() {
+    local denied
+    if [[ "$3" -ne 0 ]] && jq -e '.vulnerabilities.count == 0 and ([.warnings[] | length] | add // 0) == 0' "$2" > /dev/null; then
+        echo "ERROR: cargo audit exited with ${3} but reported no vulnerability or warning. Its output:" >&2
+        sed 's/^/  /' "$1" | tail -n 20 >&2
+        return 1
+    fi
+    if [[ "${RS_NO_YANKED}" != true ]] && grep -q "couldn't check if the package is yanked" "$1"; then
+        denied=" $(rs_denied_json | jq -r 'join(" ")') "
+        if [[ "${denied}" == *" yanked "* || "${denied}" == *" warnings "* ]]; then
+            echo "ERROR: cargo audit could not check for yanked crates, which deny makes fail the step:" >&2
+            grep "couldn't check if the package is yanked" "$1" | sort -u | sed 's/^/  /' >&2
+            echo "  The crates.io index must be reachable, or set no_yanked to true to skip the check." >&2
+            return 1
+        fi
+        echo "WARN: cargo audit could not check for yanked crates (is the crates.io index reachable?); set no_yanked to true to skip the check:" >&2
+        grep "couldn't check if the package is yanked" "$1" | sort -u | sed 's/^/WARN:   /' >&2
+    fi
+}
+
 rs_denied_json() {
     printf '%s\n' ${RS_DENIED[@]+"${RS_DENIED[@]}"} | jq -Rsc 'split("\n") | map(select(. != ""))'
 }
@@ -484,13 +534,14 @@ rs_audit_summary() {
     ' "$1"
 }
 
-# rs_audit_cases JSON CLASSNAME: prints a cargo audit JSON report's findings
+# rs_audit_cases JSON CLASSNAME CODE: prints a cargo audit JSON report's findings
 # as JUnit test cases for rs_junit: vulnerabilities and denied warnings fail,
 # other warnings are skipped.
 rs_audit_cases() {
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -c --argjson denied "$(rs_denied_json)" --arg class "$2" '
-        [(.vulnerabilities.list[] | {
+    jq -c --argjson denied "$(rs_denied_json)" --arg class "$2" --argjson code "$3" "${RS_AUDIT_DENIED_JQ}"'
+        rs_denied_kinds as $kinds
+        | [(.vulnerabilities.list[] | {
             classname: "\($class).vulnerability",
             name: "\(.advisory.id) \(.package.name) \(.package.version)",
             status: "failed",
@@ -500,7 +551,7 @@ rs_audit_cases() {
         (.warnings | to_entries[] | .key as $kind | .value[] | {
             classname: "\($class).\($kind)",
             name: "\(.advisory.id // $kind) \(.package.name) \(.package.version)",
-            status: (if ($denied | index("warnings")) or ($denied | index($kind)) then "failed" else "skipped" end),
+            status: (if $kinds | index($kind) then "failed" else "skipped" end),
             message: (.advisory.title // "\($kind) crate"),
             detail: (.advisory.url // "")
         })]' "$1"

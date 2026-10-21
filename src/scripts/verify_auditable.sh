@@ -69,10 +69,14 @@ for binary in "${BINARIES[@]}"; do
     RS_INPUTS+=("binary:${binary}")
     name=${binary##*/}
     name=${name//[^A-Za-z0-9._-]/_}
-    if [[ -n "${USED_NAMES[${name}]:-}" ]]; then
-        USED_NAMES[${name}]=$((USED_NAMES[${name}] + 1))
-        name="${name}-${USED_NAMES[${name}]}"
-    fi
+    # A second binary with the same name gets the first free <name>-<n>.
+    candidate=${name}
+    n=1
+    while [[ -n "${USED_NAMES[${candidate}]:-}" ]]; do
+        n=$((n + 1))
+        candidate="${name}-${n}"
+    done
+    name=${candidate}
     USED_NAMES[${name}]=1
     base="${RS_BASE}-${name}"
     if ! "${RS_TOOL}" "${binary}" > "${base}.audit.json" 2> "${base}.log" \

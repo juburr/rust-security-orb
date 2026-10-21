@@ -26,7 +26,10 @@ if [[ ! -f "${YML}" ]]; then
     echo "ERROR: There is no command ${COMMAND} (${YML})." >&2
     exit 2
 fi
-SCRIPT=$(grep -oE '<< include\(scripts/[a-z_]+\.sh\) >>' "${YML}" | grep -v 'scripts/lib/' | sed -E 's/<< include\((.*)\) >>/\1/' | head -n 1)
+# The step's script: an install command's install/<tool>/install.sh (its
+# scripts/cache_key.sh only prepares the cache key), or else its one script.
+SCRIPT=$(grep -oE '<< include\((install/[a-z0-9-]+/install|scripts/[a-z_]+)\.sh\) >>' "${YML}" \
+    | grep -v -e 'scripts/lib/' -e 'scripts/cache_key.sh' | sed -E 's/<< include\((.*)\) >>/\1/' | head -n 1)
 
 # Every parameter, as NAME<TAB>DEFAULT, without the quotes YAML allows; a
 # parameter without a default has the value "<required>" until it is given.

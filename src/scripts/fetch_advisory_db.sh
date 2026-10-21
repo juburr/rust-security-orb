@@ -176,7 +176,9 @@ if [[ "${ADVISORIES}" -eq 0 ]]; then
     echo "ERROR: The advisory database has no advisories in crates/." >&2
     exit 1
 fi
-if ! COMMIT=$(git -C "${STAGED}" log -1 --format=%H 2> /dev/null) || [[ -z "${COMMIT}" ]]; then
+# git -C searches parent directories, so a copy without its own .git inside
+# another work tree would be dated by that repository.
+if [[ ! -e "${STAGED}/.git" ]] || ! COMMIT=$(git -C "${STAGED}" log -1 --format=%H 2> /dev/null) || [[ -z "${COMMIT}" ]]; then
     echo "ERROR: The advisory database is not a git checkout, so its age can't be told. Import a copy with its .git directory," >&2
     echo "  such as the archive fetch_advisory_db writes." >&2
     exit 1

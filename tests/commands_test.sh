@@ -115,8 +115,10 @@ printf '%s\n' "${output}${input}"
 EOF
 
 # cargo-audit: STUB_AUDIT is clean, vuln, warn (an unmaintained crate; exits 1
-# when --deny names it), crash, nodata (bin: no dependency information) or
-# empty (a lockfile with no packages).
+# when --deny names it), warn-config (the same, denied by .cargo/audit.toml),
+# crash, nodata (bin: no dependency information), empty (a lockfile with no
+# packages), exit1 (exits 1, reporting nothing) or yanked-unchecked (the
+# crates.io index was unreachable).
 {
     echo '#!/usr/bin/env bash'
     record
@@ -134,9 +136,13 @@ rc=0
 if [[ "${mode}" == vuln ]]; then
     vulns='{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2021-0003","package":"smallvec","title":"Buffer overflow <in> SmallVec & co","url":"https://example.test/252"},"versions":{"patched":[">=1.6.1"]},"package":{"name":"smallvec","version":"1.6.0"}}]}'
     rc=1
-elif [[ "${mode}" == warn ]]; then
+elif [[ "${mode}" == warn || "${mode}" == warn-config ]]; then
     warnings='{"unmaintained":[{"kind":"unmaintained","package":{"name":"ansi_term","version":"0.12.1"},"advisory":{"id":"RUSTSEC-2021-0139","title":"ansi_term is unmaintained"}}]}'
-    if [[ "${args}" == *" --deny unmaintained "* || "${args}" == *" --deny warnings "* ]]; then rc=1; fi
+    if [[ "${mode}" == warn-config || "${args}" == *" --deny unmaintained "* || "${args}" == *" --deny warnings "* ]]; then rc=1; fi
+elif [[ "${mode}" == exit1 ]]; then
+    rc=1
+elif [[ "${mode}" == yanked-unchecked && "${args}" != *" --no-yanked "* ]]; then
+    echo "error: couldn't check if the package is yanked: not found: No such crate in crates.io index: smallvec" >&2
 fi
 if [[ "${args}" == *" --format sarif "* && "${args}" != *" --json "* ]]; then
     echo '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"cargo-audit"}},"results":[]}]}'
@@ -151,7 +157,8 @@ EOF
 } > "${STUBS}/cargo-audit"
 
 # cargo-deny: STUB_DENY is clean, vuln, banned, crash, ignored-bare,
-# ignored-reason or warn. "list" prints an inventory.
+# ignored-reason, warn or nolabel (a warning about no crate or advisory).
+# "list" prints an inventory.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -193,6 +200,9 @@ case "${mode}" in
         adv='{"errors":0,"warnings":1,"notes":0,"helps":0}' ;;
     ignored-bare)
         echo '{"type":"diagnostic","fields":{"severity":"note","code":"advisory-ignored","message":"advisory was not encountered","labels":[{"message":"advisory ignored here","span":"RUSTSEC-2021-0003"}]}}' >&2 ;;
+    nolabel)
+        echo '{"type":"diagnostic","fields":{"severity":"warning","code":"license-not-encountered","message":"license was not encountered","labels":[]}}' >&2
+        ;;
     ignored-reason)
         echo '{"type":"diagnostic","fields":{"severity":"note","code":"advisory-ignored","message":"advisory was not encountered","labels":[{"message":"advisory ignored here","span":"RUSTSEC-2021-0003"},{"message":"ignore reason","span":"never called"}]}}' >&2 ;;
 esac
@@ -202,7 +212,8 @@ exit "${rc}"
 EOF
 } > "${STUBS}/cargo-deny"
 
-# cargo-vet: STUB_VET is success, fail or error. It needs CARGO, as the real
+# cargo-vet: STUB_VET is success, fail, error or badarg (exits 2 before it
+# writes a report). It needs CARGO, as the real
 # one does when run outside cargo.
 {
     echo '#!/usr/bin/env bash'
@@ -216,6 +227,7 @@ for a in "$@"; do [[ "${prev}" == --output-file ]] && out=${a}; prev=${a}; done
 case "${STUB_VET:-success}" in
     success) echo '{"conclusion":"success","vetted_fully":[],"vetted_partially":[],"vetted_with_exemptions":[{"name":"smallvec","version":"1.6.0"}]}' > "${out}"; exit 0 ;;
     fail) echo '{"conclusion":"fail (vetting)","failures":[{"name":"smallvec","version":"1.6.0","missing_criteria":["safe-to-deploy"]}],"suggest":null}' > "${out}"; exit 255 ;;
+    badarg) echo "error: unexpected argument '--bogus' found" >&2; exit 2 ;;
     error) echo '{"error":{"message":"You must run '"'"'cargo vet init'"'"' (store not found at supply-chain)","severity":"error","causes":[]}}' > "${out}"; exit 255 ;;
 esac
 EOF
@@ -491,6 +503,10 @@ run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/plain"
 check "refuses a copy without git history, whose age can't be told" failed
 check "saying so" said "is not a git checkout"
 check "leaving nothing behind" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+make_db "${CASE}/repo" 1
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/plain" "PARAM_DB_DIR=${CASE}/repo/dbs"
+check "even into a db_dir inside another repository" failed
+check "saying so" said "is not a git checkout"
 new_case
 mkdir -p "${CASE}/empty"
 "${REAL_GIT}" -C "${CASE}/empty" init -q
@@ -572,6 +588,14 @@ check "deny refuses a kind cargo audit can't deny" failed
 check "saying which it takes" said "deny takes warnings, unmaintained, unsound and yanked"
 check "before running cargo audit" call_count cargo-audit 0
 
+audit_case
+run audit.sh STUB_AUDIT=warn-config PARAM_JUNIT=1 PARAM_RUN_RECORD=1
+check "warnings .cargo/audit.toml denies fail" failed
+check "counted as denied" said "ERROR: cargo audit found 0 vulnerabilities and 1 denied warnings in Cargo.lock."
+check "saying cargo audit's config denied them" said "the deny list in .cargo/audit.toml"
+check "as failed JUnit cases" file_has "${CASE}/out/junit/cargo-audit.xml" 'failures="1"'
+check "and in the run record" json_is "${CASE}/out/cargo-audit.run-record.json" .counts.denied_warnings 1
+
 begin "audit: a cargo audit that doesn't complete"
 audit_case
 run audit.sh STUB_AUDIT=crash PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
@@ -584,6 +608,22 @@ run audit.sh STUB_AUDIT=empty PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
 check "a lockfile with no packages fails even with report_only" failed
 check "saying it is not a Cargo.lock" said "ERROR: cargo audit found no packages in Cargo.lock, so it is not a Cargo.lock"
 check "the run record says error" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
+audit_case
+run audit.sh STUB_AUDIT=exit1 PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
+check "a non-zero exit with nothing reported fails even with report_only" failed
+check "saying so" said "ERROR: cargo audit exited with 1 but reported no vulnerability or warning."
+check "the run record says error" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
+audit_case
+run audit.sh STUB_AUDIT=yanked-unchecked
+check "a yanked check that couldn't run passes" succeeded
+check "with a warning naming the crate" said "WARN:   error: couldn't check if the package is yanked: not found: No such crate in crates.io index: smallvec"
+audit_case
+run audit.sh STUB_AUDIT=yanked-unchecked PARAM_DENY=yanked PARAM_REPORT_ONLY=1
+check "but fails, even with report_only, when deny covers yanked crates" failed
+check "saying why" said "ERROR: cargo audit could not check for yanked crates, which deny makes fail the step:"
+audit_case
+run audit.sh STUB_AUDIT=yanked-unchecked PARAM_NO_YANKED=1
+check "no_yanked skips the check, and the warning" not_said "could not check for yanked crates"
 audit_case
 rm "${CASE}/work/Cargo.lock"
 run audit.sh
@@ -637,6 +677,13 @@ run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1
 check "no_fetch with a database whose age can't be read fails" failed
 check "saying why" said "is not a git checkout"
 audit_case
+make_db "${CASE}/project" 1
+mkdir -p "${CASE}/project/db/crates/x"
+echo "# RUSTSEC-0000-0000" > "${CASE}/project/db/crates/x/RUSTSEC-0000-0000.md"
+run audit.sh "PARAM_DB_PATH=${CASE}/project/db" PARAM_NO_FETCH=1
+check "no_fetch doesn't date a database by the repository around it" failed
+check "saying it is not a git checkout" said "is not a git checkout"
+audit_case
 make_db "${CASE}/home/.cargo/advisory-db" 1
 run audit.sh PARAM_NO_FETCH=1
 check "no_fetch checks cargo audit's default database" said "(1 days old)"
@@ -682,6 +729,13 @@ bin_case() {
 
 begin "audit_bin"
 bin_case
+mkdir -p "${CASE}/work/x" "${CASE}/work/a" "${CASE}/work/b"
+for f in x/app-2 a/app b/app; do echo AUDITABLE > "${CASE}/work/${f}"; done
+run audit_bin.sh "PARAM_BINARIES=x/app-2 a/app b/app"
+check "names each binary's reports apart, even when <name>-2 is taken" \
+    json_is "${CASE}/out/cargo-audit-bin.json" '[.binaries[].report | split("/")[-1]] | join(" ")' \
+    "cargo-audit-bin-app-2.json cargo-audit-bin-app.json cargo-audit-bin-app-3.json"
+bin_case
 run audit_bin.sh "PARAM_BINARIES=app target/release/*" PARAM_RUN_RECORD=1
 check "succeeds" succeeded
 check "audits each binary on its own" call_count cargo-audit 7
@@ -707,6 +761,13 @@ run audit_bin.sh STUB_AUDIT=nodata PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
 check "a binary with no dependency information fails even with report_only" failed
 check "the run record says error" json_is "${CASE}/out/cargo-audit-bin.run-record.json" .outcome error
 check "saying to build it with cargo auditable" said "build it with cargo auditable"
+bin_case
+run audit_bin.sh STUB_AUDIT=warn-config
+check "warnings .cargo/audit.toml denies fail" failed
+check "saying cargo audit's config denied them" said "the deny list in .cargo/audit.toml"
+bin_case
+run audit_bin.sh STUB_AUDIT=exit1 PARAM_REPORT_ONLY=1
+check "a non-zero exit with nothing reported fails even with report_only" failed
 bin_case
 run audit_bin.sh "PARAM_BINARIES=app dist/plain" PARAM_REQUIRE_AUDITABLE=1 PARAM_JUNIT=1
 check "require_auditable fails on a binary without cargo-auditable data" failed
@@ -782,6 +843,11 @@ run deny.sh STUB_DENY=warn PARAM_JUNIT=true
 check "warnings pass" succeeded
 check "listed" said "warning[unmaintained] RUSTSEC-2021-0139 ansi_term 0.12.1"
 check "as skipped JUnit cases" file_has "${CASE}/out/junit/cargo-deny.xml" 'skipped="1"'
+
+deny_case
+run deny.sh STUB_DENY=nolabel PARAM_JUNIT=true
+check "a diagnostic about no crate or advisory" succeeded
+check "is a JUnit case named by its code" file_has "${CASE}/out/junit/cargo-deny.xml" 'classname="cargo-deny.license-not-encountered" name="license-not-encountered"><skipped'
 
 begin "deny: a cargo deny that doesn't complete"
 deny_case
@@ -948,6 +1014,15 @@ check "and an index" json_is "${CASE}/out/auditable.json" '[.binaries[] | select
 check "JUnit has a passing case per binary" file_has "${CASE}/out/junit/auditable.xml" 'tests="3" failures="0"'
 check "says it passed" said "Passed: every binary carries cargo-auditable data that decodes."
 bin_case
+mkdir -p "${CASE}/work/x" "${CASE}/work/a" "${CASE}/work/b"
+for f in x/app-2 a/app b/app; do echo AUDITABLE > "${CASE}/work/${f}"; done
+echo plain > "${CASE}/work/b/app"
+run verify_auditable.sh "PARAM_BINARIES=x/app-2 a/app b/app" PARAM_RUN_RECORD=true
+check "names each binary's reports apart, even when <name>-2 is taken" exists "${CASE}/out/auditable-app-2.audit.json"
+check "so a failing binary leaves the others' reports alone" json_is "${CASE}/out/auditable.json" '[.binaries[].report // empty | split("/")[-1]] | join(" ")' \
+    "auditable-app-2.audit.json auditable-app.audit.json"
+check "the run record has no arguments" json_is "${CASE}/out/auditable.run-record.json" '.arguments | length' 0
+bin_case
 run verify_auditable.sh PARAM_CYCLONEDX=true
 check "cyclonedx turns it into a CycloneDX SBOM" json_is "${CASE}/out/auditable-app.cdx.json" .specVersion 1.3
 check "with auditable2cdx" called auditable2cdx app
@@ -1073,6 +1148,12 @@ run vet.sh STUB_VET=error PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
 check "a cargo vet that can't run fails even with report_only" failed
 check "with its error" said "You must run 'cargo vet init'"
 check "the run record says error" json_is "${CASE}/out/cargo-vet.run-record.json" .outcome error
+vet_case
+run vet.sh
+run vet.sh STUB_VET=badarg
+check "a cargo vet that stops before writing a report fails" failed
+check "rather than read the last run's report" said "ERROR: cargo vet did not complete (exit code 2)"
+check "with its error" said "unexpected argument"
 vet_case
 run vet.sh PARAM_FROZEN=true PARAM_MANIFEST_PATH=Cargo.toml PARAM_STORE_PATH=supply-chain "PARAM_FEATURES=a,b" \
     PARAM_NO_DEFAULT_FEATURES=true PARAM_NO_ALL_FEATURES=true PARAM_FILTER_GRAPH='include(name(app))'

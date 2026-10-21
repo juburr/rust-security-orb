@@ -103,9 +103,13 @@ JSON="${RS_BASE}.json"
 RS_REPORTS=()
 
 echo "Running cargo vet with ${RS_TOOL_VERSION:-cargo-vet}..."
+# cargo vet opens the report only once it runs, so a report left by an
+# earlier run must not be read as this one's.
+rm -f "${JSON}"
 RC=0
 CARGO=${CARGO} "${RS_TOOL}" "${RS_ARGS[@]}" --output-format json --output-file "${JSON}" > "${RS_BASE}.log" 2>&1 || RC=$?
-if ! jq -e 'type == "object" and has("conclusion")' "${JSON}" > /dev/null 2>&1; then
+# A success must come with exit code 0; failed vetting exits 255.
+if ! jq -e --argjson code "${RC}" 'type == "object" and has("conclusion") and (.conclusion != "success" or $code == 0)' "${JSON}" > /dev/null 2>&1; then
     echo "ERROR: cargo vet did not complete (exit code ${RC}), so there is no report." >&2
     jq -r '.error | "  \(.message)", (.causes[]? | "  caused by: \(.)")' "${JSON}" >&2 2> /dev/null \
         || sed 's/^/  /' "${RS_BASE}.log" | tail -n 40 >&2

@@ -345,7 +345,7 @@ Fetches the RustSec advisory database (a shallow git clone), or imports a copy s
 
 ### `rust-security/audit`
 
-Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the warning kinds `deny` names, unless `report_only` is true; always fails when cargo audit can't complete, or when the lockfile lists no packages (cargo audit takes any TOML file without a package list for an empty lockfile, and passes it). cargo audit reads its policy, such as ignores, from `.cargo/audit.toml` in `working_dir` or `$CARGO_HOME/audit.toml`.
+Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the warning kinds `deny` (or the `[output] deny` list in `.cargo/audit.toml`) denies, unless `report_only` is true. Always fails when cargo audit can't complete, exits non-zero without reporting anything, or can't check for yanked crates while `deny` covers them (it only warns otherwise), and when the lockfile lists no packages (cargo audit takes any TOML file without a package list for an empty lockfile, and passes it). cargo audit reads its policy, such as ignores, from `.cargo/audit.toml` in `working_dir` or `$CARGO_HOME/audit.toml`.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
@@ -366,7 +366,7 @@ Checks built binaries with `cargo audit bin`, which reads the dependency list ca
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `binaries` | *required* | The binaries to audit, separated by spaces or commas. Shell patterns such as `dist/*` are expanded; one that matches nothing fails the step. Name the files you ship, after stripping and packaging. |
+| `binaries` | *required* | The binaries to audit, separated by spaces or commas. Shell patterns such as `dist/*` are expanded, and everything they match must be a binary (`target/release/*` also matches directories and `.d` files); a pattern that matches nothing fails the step. Name the files you ship, after stripping and packaging. |
 | `require_auditable` | `false` | Count a binary without cargo-auditable data as a finding: without it, cargo audit can only guess a binary's dependencies from its panic messages. Needs rust-audit-info. |
 | `working_dir`, `db_path`, `no_fetch`, `allow_stale`, `deny`, `target_arch`, `target_os`, `no_yanked`, `extra_args` | | As for `audit`. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit-bin`. |
@@ -455,7 +455,7 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 | `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. |
 | `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-vet`. |
 
-String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except `output_dir`, which `store_artifacts` also reads. In `extra_args` and the lists, that happens before the value is split, so quote a variable that may hold spaces.
+String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except `output_dir`, `report_name` and `install`'s `tools`, which CircleCI reads when it compiles the config, before the job's environment exists. In `extra_args` and the lists, that happens before the value is split, so quote a variable that may hold spaces.
 
 ## 📄 Reports and Evidence
 

@@ -86,10 +86,14 @@ for binary in "${BINARIES[@]}"; do
     RS_INPUTS+=("binary:${binary}")
     name=${binary##*/}
     name=${name//[^A-Za-z0-9._-]/_}
-    if [[ -n "${USED_NAMES[${name}]:-}" ]]; then
-        USED_NAMES[${name}]=$((USED_NAMES[${name}] + 1))
-        name="${name}-${USED_NAMES[${name}]}"
-    fi
+    # A second binary with the same name gets the first free <name>-<n>.
+    candidate=${name}
+    n=1
+    while [[ -n "${USED_NAMES[${candidate}]:-}" ]]; do
+        n=$((n + 1))
+        candidate="${name}-${n}"
+    done
+    name=${candidate}
     USED_NAMES[${name}]=1
     base="${RS_BASE}-${name}"
     if [[ "${REQUIRE_AUDITABLE}" == true ]] && ! "${AUDIT_INFO}" "${binary}" > /dev/null 2> "${base}.audit-info.log"; then
@@ -119,6 +123,14 @@ for binary in "${BINARIES[@]}"; do
         exit 1
     fi
     RS_REPORTS+=("${base}.json")
+    if ! rs_audit_check "${base}.log" "${base}.json" "${rc}"; then
+        echo "ERROR: The audit of ${binary} can't be trusted, so the step stops." >&2
+        if [[ "${RUN_RECORD}" == true ]]; then
+            RS_REPORTS+=("${base}.log")
+            rs_run_record "${RS_BASE}.run-record.json" audit_bin error "${rc}" "${STARTED}"
+        fi
+        exit 1
+    fi
     if [[ -s "${base}.log" ]]; then
         RS_REPORTS+=("${base}.log")
     else
@@ -142,13 +154,13 @@ for binary in "${BINARIES[@]}"; do
         rm -f "${base}.sarif.log"
         RS_REPORTS+=("${base}.sarif")
     fi
-    counts=$(rs_audit_counts "${base}.json")
+    counts=$(rs_audit_counts "${base}.json" "${rc}")
     INDEX=$(jq -c --arg binary "${binary}" --arg sha "$(rs_sha256 "${binary}")" --arg report "${base}.json" --argjson counts "${counts}" \
         '. + [{binary: $binary, sha256: $sha, report: $report} + $counts]' <<< "${INDEX}")
     echo "  ${binary}: $(jq -r '"\(.vulnerabilities) vulnerabilities, \(.denied_warnings) denied warnings"' <<< "${counts}")"
     rs_audit_summary "${base}.json" "    "
     if [[ "${JUNIT}" == true ]]; then
-        CASES=$(jq -c --argjson more "$(rs_audit_cases "${base}.json" "cargo-audit-bin.${name}")" '. + $more' <<< "${CASES}")
+        CASES=$(jq -c --argjson more "$(rs_audit_cases "${base}.json" "cargo-audit-bin.${name}" "${rc}")" '. + $more' <<< "${CASES}")
     fi
 done
 
@@ -157,7 +169,8 @@ jq --argjson missing "$(printf '%s\n' ${MISSING[@]+"${MISSING[@]}"} | jq -Rsc 's
 RS_REPORTS+=("${RS_BASE}.json")
 # shellcheck disable=SC2034 # read by rs_run_record
 RS_COUNTS=$(jq -c '{binaries: (.binaries | length), vulnerabilities: ([.binaries[].vulnerabilities] | add),
-    denied_warnings: ([.binaries[].denied_warnings] | add), without_auditable_data: (.without_auditable_data | length)}' "${RS_BASE}.json")
+    denied_warnings: ([.binaries[].denied_warnings] | add), denied_by_config: ([.binaries[].denied_by_config] | any),
+    without_auditable_data: (.without_auditable_data | length)}' "${RS_BASE}.json")
 
 if [[ "${JUNIT}" == true ]]; then
     if [[ "${REQUIRE_AUDITABLE}" == true ]]; then
@@ -174,6 +187,9 @@ FINDINGS=false
 MESSAGE="cargo audit bin found $(jq '.vulnerabilities' <<< "${RS_COUNTS}") vulnerabilities and $(jq '.denied_warnings' <<< "${RS_COUNTS}") denied warnings in ${#BINARIES[@]} binaries."
 if [[ "${FAILED_CODE}" -ne 0 ]]; then
     FINDINGS=true
+fi
+if [[ "$(jq '.denied_by_config' <<< "${RS_COUNTS}")" == true ]]; then
+    MESSAGE="${MESSAGE} cargo audit's own config (the deny list in .cargo/audit.toml) denied warnings."
 fi
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     FINDINGS=true

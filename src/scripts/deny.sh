@@ -235,9 +235,9 @@ fi
 
 if [[ "${JUNIT}" == true ]]; then
     # shellcheck disable=SC2016 # jq program, not shell
-    CASES=$(jq -c 'select(.type? == "diagnostic" and (.fields.severity == "error" or .fields.severity == "warning")) | .fields | {
+    CASES=$(jq -c 'select(.type? == "diagnostic" and (.fields.severity == "error" or .fields.severity == "warning")) | .fields | .code as $code | {
             classname: "cargo-deny.\(.code)",
-            name: ([.advisory.id, (.graphs[0].Krate | if . then "\(.name) \(.version)" else null end)] | map(select(. != null)) | join(" ") | if . == "" then .code else . end),
+            name: ([.advisory.id, (.graphs[0].Krate | if . then "\(.name) \(.version)" else null end)] | map(select(. != null)) | join(" ") | if . == "" then $code else . end),
             status: (if .severity == "error" then "failed" else "skipped" end),
             message: .message,
             detail: ((.notes // []) | join("\n"))

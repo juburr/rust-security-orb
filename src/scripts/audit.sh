@@ -79,6 +79,12 @@ RS_REPORTS+=("${JSON}")
 if [[ -s "${LOG}" ]]; then
     RS_REPORTS+=("${LOG}")
 fi
+if ! rs_audit_check "${LOG}" "${JSON}" "${RC}"; then
+    if [[ "${RUN_RECORD}" == true ]]; then
+        rs_run_record "${RS_BASE}.run-record.json" audit error "${RC}" "${STARTED}"
+    fi
+    exit 1
+fi
 
 if [[ "${SARIF}" == true ]]; then
     # The JSON pass fetched the database if it was going to, so this pass
@@ -97,12 +103,12 @@ if [[ "${SARIF}" == true ]]; then
 fi
 
 # shellcheck disable=SC2034 # read by rs_run_record
-RS_COUNTS=$(rs_audit_counts "${JSON}")
+RS_COUNTS=$(rs_audit_counts "${JSON}" "${RC}")
 echo "cargo audit checked $(jq '.lockfile."dependency-count"' "${JSON}") crates against $(jq '.database."advisory-count"' "${JSON}") advisories."
 rs_audit_summary "${JSON}" "  "
 
 if [[ "${JUNIT}" == true ]]; then
-    rs_junit "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${PARAM_REPORT_NAME}" "$(rs_audit_cases "${JSON}" cargo-audit)"
+    rs_junit "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${PARAM_REPORT_NAME}" "$(rs_audit_cases "${JSON}" cargo-audit "${RC}")"
     RS_REPORTS+=("${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml")
 fi
 
@@ -118,5 +124,8 @@ fi
 if [[ "${RUN_RECORD}" == true ]]; then
     rs_run_record "${RS_BASE}.run-record.json" audit "${OUTCOME}" "${RC}" "${STARTED}"
 fi
-rs_gate "${FINDINGS}" "${REPORT_ONLY}" \
-    "cargo audit found $(jq '.vulnerabilities' <<< "${RS_COUNTS}") vulnerabilities and $(jq '.denied_warnings' <<< "${RS_COUNTS}") denied warnings in ${LOCKFILE}."
+MESSAGE="cargo audit found $(jq '.vulnerabilities' <<< "${RS_COUNTS}") vulnerabilities and $(jq '.denied_warnings' <<< "${RS_COUNTS}") denied warnings in ${LOCKFILE}."
+if [[ "$(jq '.denied_by_config' <<< "${RS_COUNTS}")" == true ]]; then
+    MESSAGE="${MESSAGE} cargo audit's own config (the deny list in .cargo/audit.toml) denied them."
+fi
+rs_gate "${FINDINGS}" "${REPORT_ONLY}" "${MESSAGE}"
