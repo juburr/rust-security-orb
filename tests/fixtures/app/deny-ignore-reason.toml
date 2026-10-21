@@ -1,0 +1,11 @@
+# Ignores RUSTSEC-2021-0003 with a reason, which require_ignore_reasons
+# accepts.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+ignore = [{ id = "RUSTSEC-2021-0003", reason = "the fixture never calls SmallVec::insert_many" }]
+
+[licenses]
+allow = ["MIT", "Apache-2.0"]

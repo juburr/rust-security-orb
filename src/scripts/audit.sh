@@ -65,6 +65,16 @@ if ! jq -e 'type == "object" and (.vulnerabilities | type == "object")' "${JSON}
     fi
     exit 1
 fi
+# cargo audit reads any TOML file without a package list as a lockfile with
+# no packages, and passes it. A Cargo.lock lists at least the project itself.
+if [[ "$(jq '.lockfile["dependency-count"] // 0' "${JSON}")" -eq 0 ]]; then
+    echo "ERROR: cargo audit found no packages in ${LOCKFILE}, so it is not a Cargo.lock and nothing was audited." >&2
+    if [[ "${RUN_RECORD}" == true ]]; then
+        RS_REPORTS=("${JSON}")
+        rs_run_record "${RS_BASE}.run-record.json" audit error "${RC}" "${STARTED}"
+    fi
+    exit 1
+fi
 RS_REPORTS+=("${JSON}")
 if [[ -s "${LOG}" ]]; then
     RS_REPORTS+=("${LOG}")

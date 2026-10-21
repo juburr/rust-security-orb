@@ -63,7 +63,10 @@
               "properties": {
                 "tool": { "type": "string" },
                 "version": { "type": "string" },
-                "arch": { "enum": ["amd64", "arm64"] },
+                "arch": {
+                  "description": "The checksum table entry's architecture: amd64 or arm64 for a release binary, noarch for a crate's source archive, which is built for the machine it is installed on.",
+                  "enum": ["amd64", "arm64", "noarch"]
+                },
                 "method": {
                   "description": "prebuilt: a release binary. source-built: built with cargo install --locked from a crate source archive.",
                   "enum": ["prebuilt", "source-built"]

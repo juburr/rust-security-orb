@@ -115,7 +115,8 @@ printf '%s\n' "${output}${input}"
 EOF
 
 # cargo-audit: STUB_AUDIT is clean, vuln, warn (an unmaintained crate; exits 1
-# when --deny names it), crash or nodata (bin: no dependency information).
+# when --deny names it), crash, nodata (bin: no dependency information) or
+# empty (a lockfile with no packages).
 {
     echo '#!/usr/bin/env bash'
     record
@@ -141,7 +142,10 @@ if [[ "${args}" == *" --format sarif "* && "${args}" != *" --json "* ]]; then
     echo '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"cargo-audit"}},"results":[]}]}'
     exit "${rc}"
 fi
-printf '{"database":{"advisory-count":3,"last-commit":null,"last-updated":null},"lockfile":{"dependency-count":4},"vulnerabilities":%s,"warnings":%s}\n' "${vulns}" "${warnings}"
+count=4
+[[ "${mode}" == empty ]] && count=0
+printf '{"database":{"advisory-count":3,"last-commit":null,"last-updated":null},"lockfile":{"dependency-count":%s},"vulnerabilities":%s,"warnings":%s}\n' \
+    "${count}" "${vulns}" "${warnings}"
 exit "${rc}"
 EOF
 } > "${STUBS}/cargo-audit"
@@ -568,6 +572,11 @@ run audit.sh STUB_AUDIT=crash PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
 check "fails the step even with report_only" failed
 check "saying it didn't complete" said "ERROR: cargo audit did not complete (exit code 1)"
 check "with cargo audit's own error" said "couldn't load the advisory database"
+check "the run record says error" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
+audit_case
+run audit.sh STUB_AUDIT=empty PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
+check "a lockfile with no packages fails even with report_only" failed
+check "saying it is not a Cargo.lock" said "ERROR: cargo audit found no packages in Cargo.lock, so it is not a Cargo.lock"
 check "the run record says error" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
 audit_case
 rm "${CASE}/work/Cargo.lock"

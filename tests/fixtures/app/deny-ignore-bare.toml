@@ -1,0 +1,11 @@
+# Ignores RUSTSEC-2021-0003 without a reason, so the advisories check passes
+# but require_ignore_reasons fails.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+ignore = ["RUSTSEC-2021-0003"]
+
+[licenses]
+allow = ["MIT", "Apache-2.0"]
