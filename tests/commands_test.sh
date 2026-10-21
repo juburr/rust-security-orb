@@ -662,7 +662,7 @@ bin_case() {
 
 begin "audit_bin"
 bin_case
-run audit_bin.sh "PARAM_BINARIES=app target/release/*"
+run audit_bin.sh "PARAM_BINARIES=app target/release/*" PARAM_RUN_RECORD=1
 check "succeeds" succeeded
 check "audits each binary on its own" call_count cargo-audit 7
 check "the first may fetch the database" called cargo-audit audit --json bin app
@@ -672,6 +672,8 @@ check "writes a report per binary" exists "${CASE}/out/cargo-audit-bin-tool.json
 check "and an index of them" json_is "${CASE}/out/cargo-audit-bin.json" '[.binaries[].binary] | join(" ")' "app target/release/app target/release/tool"
 check "naming a second binary called app apart" exists "${CASE}/out/cargo-audit-bin-app-2.json"
 check "with each binary's SHA-256" json_is "${CASE}/out/cargo-audit-bin.json" '.binaries[0].sha256' "$(sha256sum "${CASE}/work/app" | awk '{ print $1 }')"
+check "the run record lists each binary as an input" json_is "${CASE}/out/cargo-audit-bin.run-record.json" '[.inputs[] | select(.role == "binary")] | length' 3
+check "and the arguments without them" json_is "${CASE}/out/cargo-audit-bin.run-record.json" '.arguments | join(" ")' "audit bin"
 bin_case
 run audit_bin.sh STUB_AUDIT=vuln PARAM_JUNIT=1
 check "vulnerabilities fail the step" failed
@@ -681,8 +683,9 @@ bin_case
 run audit_bin.sh STUB_AUDIT=vuln PARAM_REPORT_ONLY=1
 check "report_only passes" succeeded
 bin_case
-run audit_bin.sh STUB_AUDIT=nodata PARAM_REPORT_ONLY=1
+run audit_bin.sh STUB_AUDIT=nodata PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
 check "a binary with no dependency information fails even with report_only" failed
+check "the run record says error" json_is "${CASE}/out/cargo-audit-bin.run-record.json" .outcome error
 check "saying to build it with cargo auditable" said "build it with cargo auditable"
 bin_case
 run audit_bin.sh "PARAM_BINARIES=app dist/plain" PARAM_REQUIRE_AUDITABLE=1 PARAM_JUNIT=1
@@ -834,6 +837,7 @@ check "records the deny.toml cargo deny finds above the manifest" json_is "${REC
 check "and the lockfile" json_is "${RECORD}" '.inputs[] | select(.role == "lockfile") | .sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
 check "records the database cargo deny reads" json_is "${RECORD}" .advisory_db.commit "$(git -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" log -1 --format=%H)"
 check "records every report" json_is "${RECORD}" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-deny.jsonl cargo-deny.sarif"
+check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "--manifest-path app/Cargo.toml check"
 deny_case
 mkdir -p "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
 run deny.sh PARAM_RUN_RECORD=true
@@ -1096,6 +1100,30 @@ check "rs_junit writes a passing case when there are no findings" file_has "${WO
 check "a well-formed one" python3 -c 'import sys, xml.dom.minidom; xml.dom.minidom.parse(sys.argv[1])' "${WORK}/j/empty.xml"
 LIB_TEST "rs_junit ${WORK}/j/odd.xml 'a\"b' '[{\"classname\":\"c\",\"name\":\"<&>\\\"'\\''\",\"status\":\"failed\",\"message\":\"m\",\"detail\":\"x]]>y\"}]'"
 check "and escapes what XML needs escaped" python3 -c 'import sys, xml.dom.minidom; d = xml.dom.minidom.parse(sys.argv[1]); assert d.getElementsByTagName("testcase")[0].getAttribute("name") == "<&>\"'"'"'"' "${WORK}/j/odd.xml"
+
+begin "run records follow schemas/run-record.v1.json"
+mapfile -t RECORDS < <(find "${WORK}" -name '*.run-record.json' | sort)
+check "the tests wrote run records for every command" test "$(for f in "${RECORDS[@]}"; do jq -r .command "${f}"; done | sort -u | tr '\n' ' ')" \
+    = "audit audit_bin deny licenses sbom verify_auditable vet "
+OUTPUT=$(python3 -I - "${ROOT}/schemas/run-record.v1.json" "${RECORDS[@]}" 2>&1 << 'PY'
+import json, sys
+try:
+    import jsonschema
+except ImportError:
+    sys.exit("jsonschema is not installed: pip install jsonschema")
+schema = json.load(open(sys.argv[1]))
+jsonschema.Draft202012Validator.check_schema(schema)
+validator = jsonschema.Draft202012Validator(schema)
+bad = 0
+for path in sys.argv[2:]:
+    for error in validator.iter_errors(json.load(open(path))):
+        bad += 1
+        print(f"{path}: {'/'.join(map(str, error.absolute_path))}: {error.message}")
+sys.exit(1 if bad else 0)
+PY
+)
+RC=$?
+check "all ${#RECORDS[@]} of them" succeeded
 
 echo
 if [[ "${FAILURES}" -gt 0 ]]; then

@@ -9,8 +9,8 @@ parameters:
     type: boolean
     default: true
     description: >
-      Cache the verified source archive between jobs, keyed by version and
-      home directory. The binary is built in every job, since a build can't be
+      Cache the verified source archive between jobs, keyed by version, CPU
+      architecture and home directory. The binary is built in every job, since a build can't be
       verified against a checksum. Only verified archives are cached, and a
       cached archive is verified again before it is built.
   install_path:

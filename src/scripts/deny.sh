@@ -133,7 +133,7 @@ if [[ "${AUDIT_COMPATIBLE}" == true ]]; then
     CHECK_ARGS+=(--audit-compatible-output)
 fi
 CHECK_ARGS+=(${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"})
-RS_ARGS=(--format json --log-level info ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"} "${CHECK_ARGS[@]}")
+RS_ARGS=(${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"} "${CHECK_ARGS[@]}")
 
 # The inputs, found the way cargo-deny finds them: the config from
 # config_path, or else the first deny.toml, .deny.toml or .cargo/deny.toml in
@@ -181,7 +181,7 @@ JSONL="${RS_BASE}.jsonl"
 
 echo "Running cargo deny ${CHECK_ARGS[*]} with ${RS_TOOL_VERSION:-cargo-deny}..."
 RC=0
-"${RS_TOOL}" "${RS_ARGS[@]}" 2> "${JSONL}" > "${RS_BASE}.audit.json" || RC=$?
+"${RS_TOOL}" --format json --log-level info "${RS_ARGS[@]}" 2> "${JSONL}" > "${RS_BASE}.audit.json" || RC=$?
 if [[ "${AUDIT_COMPATIBLE}" == true && -s "${RS_BASE}.audit.json" ]]; then
     RS_REPORTS+=("${RS_BASE}.audit.json")
 else
