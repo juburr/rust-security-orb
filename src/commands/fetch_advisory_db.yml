@@ -1,0 +1,55 @@
+description: >
+  Fetches the RustSec advisory database (a shallow git clone of url), or imports a copy staged
+  earlier, into the directory cargo deny reads by default, and exports RUSTSEC_ADVISORY_DB, which
+  the audit and audit_bin commands read. Both tools then check against the very same copy: fetch
+  it once per workflow, persist it with archive, and import it in later jobs that run with
+  no_fetch (audit) or offline (deny). Whether fetched or imported, the copy's age is its newest
+  commit's, so both tools tell a stale copy the same way. Needs git.
+parameters:
+  url:
+    type: string
+    default: "https://github.com/RustSec/advisory-db"
+    description: >
+      The advisory database's git repository: RustSec's, or an internal mirror of it. Use the
+      URL your deny.toml's db-urls names, if it names one, since the directory cargo deny
+      reads is named after the URL. Environment variables are expanded.
+  import:
+    type: string
+    default: ""
+    description: >
+      Import a copy staged earlier instead of fetching: a directory holding the database's git
+      checkout, or a .tar.gz such as archive writes, for example from the workspace. Nothing
+      is fetched then, so it works without network access. Environment variables are expanded.
+  db_dir:
+    type: string
+    default: ""
+    description: >
+      The directory to put the database in, under its URL-derived name. Defaults to
+      $CARGO_HOME/advisory-dbs ($HOME/.cargo/advisory-dbs), where cargo deny looks without
+      configuration; cargo deny reads any other directory only if deny.toml's db-path names
+      it. Environment variables and a leading ~/ are expanded.
+  archive:
+    type: string
+    default: ""
+    description: >
+      Also write the database, git history included, to this .tar.gz, to persist to the
+      workspace or store, so later jobs import this very copy. Environment variables are
+      expanded.
+  auth_header_env_var:
+    type: string
+    default: ""
+    description: >
+      The environment variable holding an Authorization header value, such as "Bearer <token>"
+      or "Basic <base64>", for a private mirror. It reaches git through its environment, never
+      its command line, and is never printed.
+steps:
+  - run:
+      name: Fetch the RustSec advisory database
+      environment:
+        PARAM_ARCHIVE: << parameters.archive >>
+        PARAM_AUTH_HEADER_ENV_VAR: << parameters.auth_header_env_var >>
+        PARAM_DB_DIR: << parameters.db_dir >>
+        PARAM_IMPORT: << parameters.import >>
+        PARAM_URL: << parameters.url >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/fetch_advisory_db.sh) >>

@@ -1,0 +1,125 @@
+description: >
+  Writes a licence inventory of every crate in the dependency graph with cargo deny list, as JSON
+  and TSV: an artifact for legal review, apart from the pass/fail licences check deny runs. It
+  reports and never gates. Check the feature set and target you ship, since they decide the graph.
+parameters:
+  working_dir:
+    type: string
+    default: .
+    description: Directory to run cargo deny list in. Relative paths are relative to it.
+  formats:
+    type: string
+    default: json,tsv
+    description: >
+      The inventory's formats, separated by commas or spaces: json, tsv, or both.
+  layout:
+    type: enum
+    enum: ["crate", "license"]
+    default: crate
+    description: List licences per crate, or crates per licence.
+  manifest_path:
+    type: string
+    default: ""
+    description: >
+      The Cargo.toml to check (cargo deny --manifest-path), relative to working_dir. Defaults
+      to the one in working_dir. Environment variables are expanded.
+  config_path:
+    type: string
+    default: ""
+    description: >
+      The cargo-deny config to use (--config). Defaults to the first deny.toml, .deny.toml or
+      .cargo/deny.toml cargo deny finds in the manifest's directory or above. A path that
+      doesn't exist fails the step, rather than fall back to cargo-deny's default config.
+      Environment variables are expanded.
+  metadata_path:
+    type: string
+    default: ""
+    description: >
+      Check against this pre-generated cargo metadata output (--metadata-path) instead of
+      running cargo metadata, for a reproducible graph with no network. Environment variables
+      are expanded.
+  features:
+    type: string
+    default: ""
+    description: >
+      Features to enable (--features), separated by commas or spaces. Check the feature set
+      you ship: it decides the dependency graph.
+  all_features:
+    type: boolean
+    default: false
+    description: Enable every feature (--all-features).
+  no_default_features:
+    type: boolean
+    default: false
+    description: Disable the default features (--no-default-features).
+  target:
+    type: string
+    default: ""
+    description: >
+      Check only the dependencies of this target triple (--target), such as
+      x86_64-unknown-linux-gnu. deny.toml's [graph] targets lists several. Environment
+      variables are expanded.
+  offline:
+    type: boolean
+    default: false
+    description: >
+      Run without network access (--offline): cargo deny doesn't fetch the advisory database
+      (fetch_advisory_db provides it) and cargo metadata uses only cargo's cache, so warm it
+      or use metadata_path. The database's age is checked against deny.toml's
+      maximum-db-staleness (90 days by default).
+  locked:
+    type: boolean
+    default: false
+    description: Fail when Cargo.lock is out of date, instead of updating it (--locked).
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory to write the reports into. Environment variables are not
+      expanded, since the path is also passed to store_artifacts.
+  report_name:
+    type: string
+    default: licenses
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Also write <report_name>.run-record.json: cargo-deny's version and SHA-512 and how it
+      was installed, the inputs' SHA-256, the arguments and every report's SHA-256.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir as job artifacts under rust-security-reports/, including when the step
+      fails.
+steps:
+  - run:
+      name: cargo deny list
+      working_directory: << parameters.working_dir >>
+      environment:
+        PARAM_ALL_FEATURES: << parameters.all_features >>
+        PARAM_CONFIG_PATH: << parameters.config_path >>
+        PARAM_FEATURES: << parameters.features >>
+        PARAM_FORMATS: << parameters.formats >>
+        PARAM_LAYOUT: << parameters.layout >>
+        PARAM_LOCKED: << parameters.locked >>
+        PARAM_MANIFEST_PATH: << parameters.manifest_path >>
+        PARAM_METADATA_PATH: << parameters.metadata_path >>
+        PARAM_NO_DEFAULT_FEATURES: << parameters.no_default_features >>
+        PARAM_OFFLINE: << parameters.offline >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        PARAM_TARGET: << parameters.target >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/licenses.sh) >>
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always

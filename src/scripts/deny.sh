@@ -79,14 +79,14 @@ fi
 if [[ "${WORKSPACE}" == true ]]; then
     ROOT_ARGS+=(--workspace)
 fi
-rs_list exclude "$(rs_subst "${PARAM_EXCLUDE}")"
+rs_list exclude "${PARAM_EXCLUDE}"
 for crate in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
     ROOT_ARGS+=(--exclude "${crate}")
 done
 if [[ "${EXCLUDE_DEV}" == true ]]; then
     ROOT_ARGS+=(--exclude-dev)
 fi
-rs_list features "$(rs_subst "${PARAM_FEATURES}")"
+rs_list features "${PARAM_FEATURES}"
 if [[ ${#RS_LIST[@]} -gt 0 ]]; then
     FEATURE_LIST=$(IFS=,; printf '%s' "${RS_LIST[*]}")
     ROOT_ARGS+=(--features "${FEATURE_LIST}")
@@ -112,7 +112,7 @@ else
 fi
 
 CHECK_ARGS=(check)
-rs_list checks "$(rs_subst "${PARAM_CHECKS}")"
+rs_list checks "${PARAM_CHECKS}"
 for check in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
     case "${check}" in
         advisories | bans | licenses | sources | all) CHECK_ARGS+=("${check}") ;;
@@ -124,7 +124,7 @@ for check in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
 done
 for level in allow warn deny; do
     var="PARAM_${level^^}"
-    rs_list "${level}" "$(rs_subst "${!var}")"
+    rs_list "${level}" "${!var}"
     for code in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
         CHECK_ARGS+=("--${level}" "${code}")
     done

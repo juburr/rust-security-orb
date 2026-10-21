@@ -20,18 +20,12 @@ eval "${SCRIPT_RUST_SECURITY_LIB}"
 
 STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 LOCKFILE=$(rs_subst "${PARAM_LOCKFILE}")
-DB_PATH=$(rs_subst "${PARAM_DB_PATH}")
-NO_FETCH=$(rs_bool no_fetch "${PARAM_NO_FETCH}")
-ALLOW_STALE=$(rs_bool allow_stale "${PARAM_ALLOW_STALE}")
-NO_YANKED=$(rs_bool no_yanked "${PARAM_NO_YANKED}")
 SARIF=$(rs_bool sarif "${PARAM_SARIF}")
 JUNIT=$(rs_bool junit "${PARAM_JUNIT}")
 REPORT_ONLY=$(rs_bool report_only "${PARAM_REPORT_ONLY}")
 RUN_RECORD=$(rs_bool run_record "${PARAM_RUN_RECORD}")
-EXTRA_ARGS=$(rs_subst "${PARAM_EXTRA_ARGS}")
-rs_words extra_args "${EXTRA_ARGS}"
-EXTRA_ARG_LIST=(${RS_WORDS[@]+"${RS_WORDS[@]}"})
 rs_output "${PARAM_OUTPUT_DIR}" "${PARAM_REPORT_NAME}"
+rs_audit_extra_args
 rs_require_jq
 rs_tool cargo-audit
 
@@ -44,57 +38,11 @@ if [[ ! -f "${LOCKFILE}" ]]; then
     echo "  in an earlier step, so the audit covers the dependency versions the build uses." >&2
     exit 1
 fi
-for word in ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}; do
-    case "${word}" in
-        --json | --format | --format=*)
-            echo "ERROR: extra_args can't set ${word}: audit writes the JSON and SARIF reports itself." >&2
-            exit 1
-            ;;
-    esac
-done
-
-# The database: db_path, else the one fetch_advisory_db exported, else
-# cargo-audit's own default.
-DB=${DB_PATH:-${RUSTSEC_ADVISORY_DB:-}}
-RS_ARGS=(audit --file "${LOCKFILE}")
-if [[ -n "${DB}" ]]; then
-    RS_ARGS+=(--db "${DB}")
-fi
-RS_DB=${DB:-${CARGO_HOME:-${HOME:-}/.cargo}/advisory-db}
-if [[ "${NO_FETCH}" == true ]]; then
-    RS_ARGS+=(--no-fetch)
-    rs_db_fresh "${RS_DB}" "${ALLOW_STALE}"
-elif [[ "${ALLOW_STALE}" == true ]]; then
-    RS_ARGS+=(--stale)
-fi
-DENIED=()
-rs_list deny "$(rs_subst "${PARAM_DENY}")"
-for kind in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
-    case "${kind}" in
-        warnings | unmaintained | unsound | yanked) ;;
-        *)
-            echo "ERROR: deny takes warnings, unmaintained, unsound and yanked, not '${kind}'." >&2
-            exit 1
-            ;;
-    esac
-    DENIED+=("${kind}")
-    RS_ARGS+=(--deny "${kind}")
-done
-rs_list target_arch "$(rs_subst "${PARAM_TARGET_ARCH}")"
-for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
-    RS_ARGS+=(--target-arch "${value}")
-done
-rs_list target_os "$(rs_subst "${PARAM_TARGET_OS}")"
-for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
-    RS_ARGS+=(--target-os "${value}")
-done
-if [[ "${NO_YANKED}" == true ]]; then
-    RS_ARGS+=(--no-yanked)
-fi
-RS_ARGS+=(${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"})
+rs_audit_options
+RS_ARGS=(audit --file "${LOCKFILE}" ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"})
 RS_TOOL_VERSION=$("${RS_TOOL}" --version 2> /dev/null || true)
 RS_INPUTS=("lockfile:${LOCKFILE}")
-# cargo-audit reads .cargo/audit.toml in the working directory, or else the
+# cargo audit reads .cargo/audit.toml in the working directory, or else the
 # one in CARGO_HOME.
 if [[ -f .cargo/audit.toml ]]; then
     RS_INPUTS+=("config:.cargo/audit.toml")
@@ -123,10 +71,10 @@ if [[ -s "${LOG}" ]]; then
 fi
 
 if [[ "${SARIF}" == true ]]; then
-    # The JSON pass fetched the database if it was going to, so this one
-    # reads the same copy.
+    # The JSON pass fetched the database if it was going to, so this pass
+    # reads that same copy.
     SARIF_ARGS=("${RS_ARGS[@]}")
-    if [[ "${NO_FETCH}" != true ]]; then
+    if [[ "${RS_NO_FETCH}" != true ]]; then
         SARIF_ARGS+=(--no-fetch)
     fi
     "${RS_TOOL}" "${SARIF_ARGS[@]}" --format sarif > "${RS_BASE}.sarif" 2>> "${LOG}" || true
@@ -138,40 +86,13 @@ if [[ "${SARIF}" == true ]]; then
     RS_REPORTS+=("${RS_BASE}.sarif")
 fi
 
-VULNERABILITIES=$(jq '.vulnerabilities.count' "${JSON}")
-DENIED_JSON=$(printf '%s\n' ${DENIED[@]+"${DENIED[@]}"} | jq -Rsc 'split("\n") | map(select(. != ""))')
-# The warnings deny turns into errors: every kind for "warnings".
-RS_COUNTS=$(jq -c --argjson denied "${DENIED_JSON}" '{
-    vulnerabilities: .vulnerabilities.count,
-    warnings: (.warnings | map_values(length)),
-    denied_warnings: ([.warnings | to_entries[] | select(($denied | index("warnings")) or ($denied | index(.key))) | .value | length] | add // 0)
-}' "${JSON}")
-
-echo "cargo audit scanned $(jq '.lockfile."dependency-count"' "${JSON}") crates against $(jq '.database."advisory-count"' "${JSON}") advisories."
-# shellcheck disable=SC2016 # jq program, not shell
-jq -r '
-    (.vulnerabilities.list[] | "  vulnerability  \(.advisory.id)  \(.package.name) \(.package.version)  \(.advisory.title)"),
-    (.warnings | to_entries[] | .value[] | "  \(.kind)  \(.advisory.id // "-")  \(.package.name) \(.package.version)\(if .advisory then "  " + .advisory.title else "" end)")
-' "${JSON}"
+# shellcheck disable=SC2034 # read by rs_run_record
+RS_COUNTS=$(rs_audit_counts "${JSON}")
+echo "cargo audit checked $(jq '.lockfile."dependency-count"' "${JSON}") crates against $(jq '.database."advisory-count"' "${JSON}") advisories."
+rs_audit_summary "${JSON}" "  "
 
 if [[ "${JUNIT}" == true ]]; then
-    # shellcheck disable=SC2016 # jq program, not shell
-    CASES=$(jq -c --argjson denied "${DENIED_JSON}" '
-        [(.vulnerabilities.list[] | {
-            classname: "cargo-audit.vulnerability",
-            name: "\(.advisory.id) \(.package.name) \(.package.version)",
-            status: "failed",
-            message: .advisory.title,
-            detail: "\(.advisory.url // ("https://rustsec.org/advisories/" + .advisory.id))\nPatched: \((.versions.patched // []) | join(", ") | if . == "" then "none" else . end)"
-        }),
-        (.warnings | to_entries[] | .key as $kind | .value[] | {
-            classname: "cargo-audit.\($kind)",
-            name: "\(.advisory.id // $kind) \(.package.name) \(.package.version)",
-            status: (if ($denied | index("warnings")) or ($denied | index($kind)) then "failed" else "skipped" end),
-            message: (.advisory.title // "\($kind) crate"),
-            detail: (.advisory.url // "")
-        })]' "${JSON}")
-    rs_junit "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${PARAM_REPORT_NAME}" "${CASES}"
+    rs_junit "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${PARAM_REPORT_NAME}" "$(rs_audit_cases "${JSON}" cargo-audit)"
     RS_REPORTS+=("${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml")
 fi
 
@@ -188,4 +109,4 @@ if [[ "${RUN_RECORD}" == true ]]; then
     rs_run_record "${RS_BASE}.run-record.json" audit "${OUTCOME}" "${RC}" "${STARTED}"
 fi
 rs_gate "${FINDINGS}" "${REPORT_ONLY}" \
-    "cargo audit found ${VULNERABILITIES} vulnerabilities and $(jq '.denied_warnings' <<< "${RS_COUNTS}") denied warnings in ${LOCKFILE}."
+    "cargo audit found $(jq '.vulnerabilities' <<< "${RS_COUNTS}") vulnerabilities and $(jq '.denied_warnings' <<< "${RS_COUNTS}") denied warnings in ${LOCKFILE}."

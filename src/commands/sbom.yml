@@ -1,0 +1,126 @@
+description: >
+  Writes CycloneDX SBOMs of a workspace from Cargo's metadata with cargo cyclonedx, one per member
+  (or per binary), into output_dir/<report_name>/, keeping their paths relative to the workspace
+  root. For an SBOM of exactly what a shipped binary links, use verify_auditable with cyclonedx on
+  a binary built with auditable_build.
+parameters:
+  working_dir:
+    type: string
+    default: .
+    description: Directory to run cargo cyclonedx in.
+  manifest_path:
+    type: string
+    default: ""
+    description: >
+      The Cargo.toml of the workspace to describe (--manifest-path). cargo cyclonedx writes an
+      SBOM for every workspace member. Environment variables are expanded.
+  format:
+    type: enum
+    enum: ["json", "xml"]
+    default: json
+    description: The SBOM format.
+  spec_version:
+    type: enum
+    enum: ["1.3", "1.4", "1.5"]
+    default: "1.5"
+    description: >
+      The CycloneDX specification version. cargo cyclonedx's own default is 1.3; 1.5 is the
+      newest it writes.
+  describe:
+    type: enum
+    enum: ["crate", "binaries", "all-cargo-targets"]
+    default: crate
+    description: >
+      What each SBOM describes: each crate, each binary (and library) it builds, or every
+      Cargo target.
+  features:
+    type: string
+    default: ""
+    description: Features to enable, separated by commas or spaces.
+  all_features:
+    type: boolean
+    default: false
+    description: Enable every feature.
+  no_default_features:
+    type: boolean
+    default: false
+    description: Disable the default features.
+  target:
+    type: string
+    default: ""
+    description: >
+      Describe the dependencies of this target triple, or all for every target. Defaults to
+      the host's. A CARGO_BUILD_TARGET in the environment is ignored when this is set.
+  top_level:
+    type: boolean
+    default: false
+    description: List only the direct dependencies, not every transitive one.
+  offline:
+    type: boolean
+    default: false
+    description: Use only cargo's cache, without network access (CARGO_NET_OFFLINE).
+  locked:
+    type: boolean
+    default: true
+    description: >
+      Fail when Cargo.lock is missing or out of date, since cargo cyclonedx would otherwise
+      update it and describe versions it doesn't pin.
+  extra_args:
+    type: string
+    default: ""
+    description: >
+      More cargo cyclonedx options, split like shell words; nothing in them is expanded or
+      run.
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory to write the reports into. Environment variables are not
+      expanded, since the path is also passed to store_artifacts.
+  report_name:
+    type: string
+    default: sbom
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Also write <report_name>.run-record.json: cargo-cyclonedx's version and SHA-512 and how
+      it was installed, the lockfile's SHA-256, the arguments and every SBOM's SHA-256.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir as job artifacts under rust-security-reports/, including when the step
+      fails.
+steps:
+  - run:
+      name: cargo cyclonedx
+      working_directory: << parameters.working_dir >>
+      environment:
+        PARAM_ALL_FEATURES: << parameters.all_features >>
+        PARAM_DESCRIBE: << parameters.describe >>
+        PARAM_EXTRA_ARGS: << parameters.extra_args >>
+        PARAM_FEATURES: << parameters.features >>
+        PARAM_FORMAT: << parameters.format >>
+        PARAM_LOCKED: << parameters.locked >>
+        PARAM_MANIFEST_PATH: << parameters.manifest_path >>
+        PARAM_NO_DEFAULT_FEATURES: << parameters.no_default_features >>
+        PARAM_OFFLINE: << parameters.offline >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        PARAM_SPEC_VERSION: << parameters.spec_version >>
+        PARAM_TARGET: << parameters.target >>
+        PARAM_TOP_LEVEL: << parameters.top_level >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/sbom.sh) >>
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always

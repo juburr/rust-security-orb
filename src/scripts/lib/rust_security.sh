@@ -209,15 +209,18 @@ rs_output() {
     RS_BASE="${RS_OUT%/}/$2"
 }
 
-# rs_list PARAMETER VALUE: sets RS_LIST to VALUE split on commas and spaces.
+# rs_list PARAMETER VALUE: sets RS_LIST to VALUE, with environment variables
+# expanded, split on commas and spaces.
 rs_list() {
+    local value
     RS_LIST=()
-    if [[ "$2" == *$'\n'* ]]; then
+    value=$(rs_subst "$2")
+    if [[ "${value}" == *$'\n'* ]]; then
         echo "ERROR: ${1} must be separated by commas or spaces, not newlines." >&2
         exit 1
     fi
     # shellcheck disable=SC2034 # read by the script that evals this file
-    read -r -a RS_LIST <<< "${2//,/ }"
+    read -r -a RS_LIST <<< "${value//,/ }"
 }
 
 # rs_sha256 FILE: prints FILE's SHA-256.
@@ -370,4 +373,124 @@ rs_run_record() {
         return 0
     fi
     echo "Run record: ${file}"
+}
+
+# rs_audit_options: reads the cargo audit parameters the audit and audit_bin
+# commands share (db_path, no_fetch, allow_stale, deny, target_arch,
+# target_os, no_yanked) and sets:
+#   RS_AUDIT_OPTS    the cargo audit options they make
+#   RS_DENIED        the warning kinds deny turns into errors
+#   RS_DB            the advisory database directory cargo audit reads
+#   RS_NO_FETCH      true when the database is used without fetching
+# The database is db_path, or else the one fetch_advisory_db exported in
+# RUSTSEC_ADVISORY_DB, or else cargo-audit's default. Without fetching,
+# cargo audit doesn't check the database's age, so rs_db_fresh applies its
+# rule here.
+rs_audit_options() {
+    local db allow_stale no_yanked kind value
+    db=$(rs_subst "${PARAM_DB_PATH}")
+    db=${db:-${RUSTSEC_ADVISORY_DB:-}}
+    RS_NO_FETCH=$(rs_bool no_fetch "${PARAM_NO_FETCH}")
+    allow_stale=$(rs_bool allow_stale "${PARAM_ALLOW_STALE}")
+    no_yanked=$(rs_bool no_yanked "${PARAM_NO_YANKED}")
+    RS_AUDIT_OPTS=()
+    RS_DENIED=()
+    if [[ -n "${db}" ]]; then
+        RS_AUDIT_OPTS+=(--db "${db}")
+    fi
+    # shellcheck disable=SC2034 # read by rs_run_record
+    RS_DB=${db:-${CARGO_HOME:-${HOME:-}/.cargo}/advisory-db}
+    if [[ "${RS_NO_FETCH}" == true ]]; then
+        RS_AUDIT_OPTS+=(--no-fetch)
+        rs_db_fresh "${RS_DB}" "${allow_stale}"
+    elif [[ "${allow_stale}" == true ]]; then
+        RS_AUDIT_OPTS+=(--stale)
+    fi
+    rs_list deny "${PARAM_DENY}"
+    for kind in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        case "${kind}" in
+            warnings | unmaintained | unsound | yanked) ;;
+            *)
+                echo "ERROR: deny takes warnings, unmaintained, unsound and yanked, not '${kind}'." >&2
+                exit 1
+                ;;
+        esac
+        RS_DENIED+=("${kind}")
+        RS_AUDIT_OPTS+=(--deny "${kind}")
+    done
+    rs_list target_arch "${PARAM_TARGET_ARCH}"
+    for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        RS_AUDIT_OPTS+=(--target-arch "${value}")
+    done
+    rs_list target_os "${PARAM_TARGET_OS}"
+    for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        RS_AUDIT_OPTS+=(--target-os "${value}")
+    done
+    if [[ "${no_yanked}" == true ]]; then
+        RS_AUDIT_OPTS+=(--no-yanked)
+    fi
+}
+
+# rs_audit_extra_args: sets RS_EXTRA to the extra_args words, refusing the
+# options that would change the report format these commands write.
+rs_audit_extra_args() {
+    local word extra
+    extra=$(rs_subst "${PARAM_EXTRA_ARGS}")
+    rs_words extra_args "${extra}"
+    RS_EXTRA=(${RS_WORDS[@]+"${RS_WORDS[@]}"})
+    for word in ${RS_EXTRA[@]+"${RS_EXTRA[@]}"}; do
+        case "${word}" in
+            --json | --format | --format=*)
+                echo "ERROR: extra_args can't set ${word}: this command writes the JSON and SARIF reports itself." >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# rs_audit_counts JSON: prints the counts of a cargo audit JSON report, with
+# the warnings RS_DENIED turns into errors counted as denied_warnings.
+rs_audit_counts() {
+    jq -c --argjson denied "$(rs_denied_json)" '{
+        vulnerabilities: .vulnerabilities.count,
+        warnings: (.warnings | map_values(length)),
+        denied_warnings: ([.warnings | to_entries[] | select(($denied | index("warnings")) or ($denied | index(.key))) | .value | length] | add // 0)
+    }' "$1"
+}
+
+# rs_denied_json: prints RS_DENIED as a JSON array.
+rs_denied_json() {
+    printf '%s\n' ${RS_DENIED[@]+"${RS_DENIED[@]}"} | jq -Rsc 'split("\n") | map(select(. != ""))'
+}
+
+# rs_audit_summary JSON PREFIX: prints a cargo audit JSON report's findings,
+# one per line, each line starting with PREFIX.
+rs_audit_summary() {
+    # shellcheck disable=SC2016 # jq program, not shell
+    jq -r --arg prefix "$2" '
+        (.vulnerabilities.list[] | "\($prefix)vulnerability  \(.advisory.id)  \(.package.name) \(.package.version)  \(.advisory.title)"),
+        (.warnings | to_entries[] | .value[] | "\($prefix)\(.kind)  \(.advisory.id // "-")  \(.package.name) \(.package.version)\(if .advisory then "  " + .advisory.title else "" end)")
+    ' "$1"
+}
+
+# rs_audit_cases JSON CLASSNAME: prints a cargo audit JSON report's findings
+# as JUnit test cases for rs_junit: vulnerabilities and denied warnings fail,
+# other warnings are skipped.
+rs_audit_cases() {
+    # shellcheck disable=SC2016 # jq program, not shell
+    jq -c --argjson denied "$(rs_denied_json)" --arg class "$2" '
+        [(.vulnerabilities.list[] | {
+            classname: "\($class).vulnerability",
+            name: "\(.advisory.id) \(.package.name) \(.package.version)",
+            status: "failed",
+            message: .advisory.title,
+            detail: "\(.advisory.url // ("https://rustsec.org/advisories/" + .advisory.id))\nPatched: \((.versions.patched // []) | join(", ") | if . == "" then "none" else . end)"
+        }),
+        (.warnings | to_entries[] | .key as $kind | .value[] | {
+            classname: "\($class).\($kind)",
+            name: "\(.advisory.id // $kind) \(.package.name) \(.package.version)",
+            status: (if ($denied | index("warnings")) or ($denied | index($kind)) then "failed" else "skipped" end),
+            message: (.advisory.title // "\($kind) crate"),
+            detail: (.advisory.url // "")
+        })]' "$1"
 }
