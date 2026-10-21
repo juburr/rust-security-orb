@@ -100,11 +100,13 @@ RS_REPORTS=()
 for format in "${FORMATS[@]}"; do
     file="${RS_BASE}.${format}"
     echo "Listing licences as ${format} with ${RS_TOOL_VERSION:-cargo-deny}..."
-    if ! "${RS_TOOL}" "${RS_ARGS[@]}" --format "${format}" > "${file}" 2> "${RS_BASE}.log"; then
-        echo "ERROR: cargo deny list failed. Its output:" >&2
+    rc=0
+    "${RS_TOOL}" "${RS_ARGS[@]}" --format "${format}" > "${file}" 2> "${RS_BASE}.log" || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        echo "ERROR: cargo deny list failed (exit code ${rc}). Its output:" >&2
         sed 's/^/  /' "${RS_BASE}.log" | tail -n 40 >&2
         if [[ "${RUN_RECORD}" == true ]]; then
-            rs_run_record "${RS_BASE}.run-record.json" licenses error 1 "${STARTED}"
+            rs_run_record "${RS_BASE}.run-record.json" licenses error "${rc}" "${STARTED}"
         fi
         exit 1
     fi

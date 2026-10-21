@@ -369,7 +369,9 @@ rs_run_record() {
         fi
     done
     if [[ -n "${RS_TOOL:-}" && -f "${RS_TOOL}" ]]; then
-        tool_sha=$(sha512sum "${RS_TOOL}" | awk '{ print $1 }')
+        # Without sha512sum the record says so with a null SHA-512, as rs_tool
+        # only warns.
+        tool_sha=$(sha512sum "${RS_TOOL}" 2> /dev/null | awk '{ print $1 }') || tool_sha=""
         entry="$(dirname "${RS_TOOL}")/.${RS_TOOL##*/}.install.json"
         # The install record counts only if it describes this very binary.
         # shellcheck disable=SC2016 # jq program, not shell

@@ -175,7 +175,7 @@ format=human
 prev=""
 for a in "$@"; do [[ "${prev}" == --format ]] && format=${a}; prev=${a}; done
 if [[ "${args}" == *" list "* ]]; then
-    if [[ "${mode}" == crash ]]; then echo "error: list failed" >&2; exit 1; fi
+    if [[ "${mode}" == crash ]]; then echo "error: list failed" >&2; exit 3; fi
     case "${format}:${args}" in
         json:*" --layout license "*) echo '{"licenses":[["Apache-2.0",["smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index"]],["MIT",["app 0.1.0 path+file:///app","smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index"]]],"unlicensed":[]}' ;;
         json:*) echo '{"smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index":{"licenses":["MIT","Apache-2.0"]},"app 0.1.0 path+file:///app":{"licenses":["MIT"]}}' ;;
@@ -749,6 +749,13 @@ check "and warns that the binary is not one the install command verified" \
 audit_case
 run audit.sh
 check "a verified binary gets no such warning" not_said "install command verified"
+audit_case
+mkdir -p "${CASE}/nosha"
+printf '#!/bin/sh\necho "sha512sum: not available" >&2\nexit 127\n' > "${CASE}/nosha/sha512sum"
+chmod +x "${CASE}/nosha/sha512sum"
+run audit.sh "PATH=${CASE}/nosha:${STUBS}:${PATH}" PARAM_RUN_RECORD=1
+check "without a working sha512sum, the step still passes" succeeded
+check "and the run record has no SHA-512 for the tool" json_is "${CASE}/out/cargo-audit.run-record.json" .tool.sha512 null
 
 # --- audit_bin
 DEFAULTS=(PARAM_BINARIES="app" PARAM_REQUIRE_AUDITABLE=0 PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false
@@ -1012,6 +1019,7 @@ run licenses.sh STUB_DENY=crash PARAM_RUN_RECORD=true
 check "a failing cargo deny list fails" failed
 check "with its error" said "error: list failed"
 check "and a run record that says so" json_is "${CASE}/out/licenses.run-record.json" .outcome error
+check "with cargo deny's exit code" json_is "${CASE}/out/licenses.run-record.json" .exit_code 3
 for bad in "PARAM_FORMATS=csv" "PARAM_FORMATS=" "PARAM_LAYOUT=tree" "PARAM_CONFIG_PATH=missing.toml"; do
     deny_case
     run licenses.sh "${bad}"
