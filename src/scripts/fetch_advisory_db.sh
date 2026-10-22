@@ -204,6 +204,19 @@ if [[ ! -e "${STAGED}/.git" ]] || ! COMMIT=$(git -C "${STAGED}" log -1 --format=
     echo "  such as the archive fetch_advisory_db writes." >&2
     exit 1
 fi
+# cargo-deny names a database's directory after its URL, so an imported copy
+# of another repository would be read as url's database. Only an https origin
+# can be compared; a local path or ssh remote says nothing about the URL.
+if [[ -n "${IMPORT}" ]]; then
+    ORIGIN=$(git -C "${STAGED}" remote get-url origin 2> /dev/null || true)
+    ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#' <<< "${ORIGIN}")
+    ORIGIN=${ORIGIN%%[?#]*}
+    if [[ "${ORIGIN,,}" == https://* && "$(rs_url_key "${ORIGIN}")" != "$(rs_url_key "${URL}")" ]]; then
+        echo "ERROR: The imported database is a copy of ${ORIGIN}, not of url (${URL}), and cargo-deny would read it as url's." >&2
+        echo "  Set url to ${ORIGIN} (and deny.toml's db-urls to it, if it names a database), or import a copy of ${URL}." >&2
+        exit 1
+    fi
+fi
 # cargo-audit and cargo-deny scan the files as they are, and run records name
 # the commit, so the files must be exactly the commit's.
 if ! CHANGES=$(git -C "${STAGED}" status --porcelain --untracked-files=all --ignored 2> /dev/null); then

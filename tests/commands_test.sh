@@ -363,7 +363,9 @@ if [[ "$1" == clone ]]; then
     n=$(find "${CALLS}" -name "git-clone.*" | wc -l)
     { printf '%s\n' "$@"; printf 'header=%s\n' "${GIT_CONFIG_VALUE_0:-}"; } > "${CALLS}/git-clone.$((n + 1))"
     [[ -n "${FAKE_CLONE_FAIL:-}" ]] && { echo "fatal: repository not found" >&2; exit 128; }
-    exec "${REAL_GIT}" clone --quiet "${FAKE_REMOTE}" "${@: -1}"
+    # The clone's origin is the URL asked for, as with a real clone.
+    "${REAL_GIT}" clone --quiet "${FAKE_REMOTE}" "${@: -1}" && exec "${REAL_GIT}" -C "${@: -1}" remote set-url origin "${@: -2:1}"
+    exit 128
 fi
 exec "${REAL_GIT}" "$@"
 EOF
@@ -549,6 +551,23 @@ touch "${CASE}/staged/.git/FETCH_HEAD"
 run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/staged"
 check "imports a directory" exists "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}/crates"
 check "dropping its FETCH_HEAD, which cargo-deny would date it by" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}/.git/FETCH_HEAD"
+new_case
+cp -a "${REMOTE}" "${CASE}/mirror"
+"${REAL_GIT}" -C "${CASE}/mirror" remote add origin "https://ci:s3cret@mirror.example.test/advisory-db?x=1"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/mirror"
+check "refuses a copy of another URL than url, which cargo deny would read as url's" failed
+check "naming the URL to set" said "is a copy of https://mirror.example.test/advisory-db, not of url (https://github.com/RustSec/advisory-db)"
+check "without the credentials in its remote" not_said "s3cret"
+new_case
+cp -a "${REMOTE}" "${CASE}/mirror"
+"${REAL_GIT}" -C "${CASE}/mirror" remote add origin "https://Mirror.Example.Test:0443/advisory-db"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/mirror" "PARAM_URL=https://mirror.example.test/advisory-db"
+check "takes it when url is that URL, however it is spelled" succeeded
+new_case
+cp -a "${REMOTE}" "${CASE}/local"
+"${REAL_GIT}" -C "${CASE}/local" remote add origin "/srv/advisory-db"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/local"
+check "and a copy whose origin is a local path, which says nothing about the URL" succeeded
 for change in "rm crates/smallvec/RUSTSEC-2021-0003.md" "echo changed >> crates/smallvec/RUSTSEC-2021-0003.md" \
     "mkdir crates/x && echo extra > crates/x/RUSTSEC-0000-0001.md"; do
     new_case
