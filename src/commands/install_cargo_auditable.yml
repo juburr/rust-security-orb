@@ -20,7 +20,7 @@ parameters:
       Artifactory or Nexus remote repository, to download from instead of
       https://github.com. It replaces https://github.com in the release URL,
       so the mirror must serve the same path. It must be an https:// URL, without credentials
-      (user:password@), which would show in the log.
+      (user:password@) or a query or fragment, which would show in the log.
       What is downloaded is still verified against this orb's checksum table.
       Environment variables are expanded.
   install_path:

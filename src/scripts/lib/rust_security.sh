@@ -388,10 +388,11 @@ rs_run_record() {
     if [[ -n "${RS_DB:-}" && ! -e "${RS_DB}/.git" ]]; then
         db_json=$(jq -cn --arg path "${RS_DB}" '{path: $path, url: null, commit: null, commit_time: null}')
     elif [[ -n "${RS_DB:-}" ]]; then
-        # A remote URL can carry credentials (https://user:token@host/...),
-        # which must not reach a stored artifact.
+        # A remote URL can carry credentials (https://user:token@host/... or
+        # ?access_token=...), which must not reach a stored artifact.
         url=$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)
         url=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#' <<< "${url}")
+        url=${url%%[?#]*}
         db_json=$(jq -cn --arg path "${RS_DB}" \
             --arg url "${url}" \
             --arg commit "$(git -C "${RS_DB}" log -1 --format=%H 2> /dev/null || true)" \
@@ -527,13 +528,24 @@ rs_expand_path() {
 # directory when the config names no db-urls. Empty when it can't tell, such
 # as for a relative db-path or one that cargo-deny couldn't expand either.
 rs_deny_db() {
-    local settings db_path="" has_urls=false
+    local settings db_path="" has_urls=false origin url
+    local -a urls=()
     RS_DB=""
     if [[ -n "${RS_DENY_CONFIG:-}" && -f "${RS_DENY_CONFIG}" ]]; then
         settings=$(awk -v q="'" '
-            /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
+            !in_urls && /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
             section != "[advisories]" { next }
-            /^[[:space:]]*db-urls[[:space:]]*=/ { print "urls" }
+            /^[[:space:]]*db-urls[[:space:]]*=/ { print "urls"; in_urls = 1; sub(/^[^=]*=/, "") }
+            in_urls {
+                line = $0
+                sub(/#.*/, "", line)
+                while (match(line, "\"[^\"]*\"|" q "[^" q "]*" q)) {
+                    print "url=" substr(line, RSTART + 1, RLENGTH - 2)
+                    line = substr(line, RSTART + RLENGTH)
+                }
+                if (index(line, "]")) { in_urls = 0 }
+                next
+            }
             /^[[:space:]]*db-path[[:space:]]*=/ {
                 value = $0
                 sub(/^[^=]*=[[:space:]]*/, "", value)
@@ -545,6 +557,7 @@ rs_deny_db() {
             }' "${RS_DENY_CONFIG}")
         if grep -qx urls <<< "${settings}"; then
             has_urls=true
+            mapfile -t urls < <(sed -n 's/^url=//p' <<< "${settings}")
         fi
         db_path=$(sed -n 's/^path=//p' <<< "${settings}" | head -n 1)
     fi
@@ -557,11 +570,37 @@ rs_deny_db() {
         return 0
     fi
     db_path=${db_path%/}
-    if [[ -n "${RUSTSEC_ADVISORY_DB:-}" && "${RUSTSEC_ADVISORY_DB}" == "${db_path}"/* ]]; then
-        RS_DB=${RUSTSEC_ADVISORY_DB}
-    elif [[ "${has_urls}" == false && -d "${db_path}/advisory-db-3157b0e258782691" ]]; then
-        RS_DB="${db_path}/advisory-db-3157b0e258782691"
+    # Without db-urls, cargo-deny reads RustSec's database. With them, it
+    # reads each URL's database, in a directory named after the URL, so
+    # fetch_advisory_db's copy is one of them only if it was cloned from one
+    # of those URLs.
+    if [[ "${has_urls}" == false ]]; then
+        if [[ -d "${db_path}/advisory-db-3157b0e258782691" ]]; then
+            RS_DB="${db_path}/advisory-db-3157b0e258782691"
+        fi
+    elif [[ -n "${RUSTSEC_ADVISORY_DB:-}" && "${RUSTSEC_ADVISORY_DB%/*}" == "${db_path}" && -e "${RUSTSEC_ADVISORY_DB}/.git" ]]; then
+        origin=$(git -C "${RUSTSEC_ADVISORY_DB}" remote get-url origin 2> /dev/null) || origin=""
+        for url in ${urls[@]+"${urls[@]}"}; do
+            if [[ -n "${origin}" && "$(rs_url_key "${url}")" == "$(rs_url_key "${origin}")" ]]; then
+                RS_DB=${RUSTSEC_ADVISORY_DB}
+            fi
+        done
     fi
+}
+
+# rs_url_key URL: URL as cargo-deny names a database's directory after it:
+# lowercased, without https's default port, and with an empty path written
+# as "/".
+rs_url_key() {
+    local url=${1,,} host path
+    if [[ "${url}" != https://* ]]; then
+        printf '%s\n' "${url}"
+        return 0
+    fi
+    host=${url#https://}
+    host=${host%%/*}
+    path=${url#https://"${host}"}
+    printf 'https://%s%s\n' "${host%:443}" "${path:-/}"
 }
 
 # rs_audit_options: reads the cargo audit parameters the audit and audit_bin
@@ -639,17 +678,40 @@ rs_audit_options() {
 # rs_audit_extra_args: sets RS_EXTRA to the extra_args words, refusing the
 # options that would change the report format these commands write.
 rs_audit_extra_args() {
-    local word extra
+    local word extra flags parameter
     extra=$(rs_subst "${PARAM_EXTRA_ARGS}")
     rs_words extra_args "${extra}"
     RS_EXTRA=(${RS_WORDS[@]+"${RS_WORDS[@]}"})
     for word in ${RS_EXTRA[@]+"${RS_EXTRA[@]}"}; do
+        parameter=""
         case "${word}" in
             --json | --format | --format=*)
                 echo "ERROR: extra_args can't set ${word}: this command writes the JSON and SARIF reports itself." >&2
                 exit 1
                 ;;
+            # The database and whether it is fetched decide the staleness
+            # check and the database the run record names.
+            --no-fetch) parameter=no_fetch ;;
+            --db | --db=*) parameter=db_path ;;
+            --*) ;;
+            # Short options can be grouped, as in -qn. q, h and V take no
+            # value; any other option's value is the rest of the word.
+            -?*)
+                flags=${word#-}
+                while [[ -n "${flags}" && -z "${parameter}" ]]; do
+                    case "${flags:0:1}" in
+                        n) parameter=no_fetch ;;
+                        d) parameter=db_path ;;
+                        q | h | V) flags=${flags:1} ;;
+                        *) flags="" ;;
+                    esac
+                done
+                ;;
         esac
+        if [[ -n "${parameter}" ]]; then
+            echo "ERROR: extra_args can't set ${word}: use the ${parameter} parameter, which the database's staleness check and the run record follow." >&2
+            exit 1
+        fi
     done
 }
 

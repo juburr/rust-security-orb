@@ -31,8 +31,8 @@ parameters:
       Artifactory or Nexus remote repository, to download the prebuilt tools
       from instead of https://github.com. It replaces https://github.com in
       each release URL, so the mirror must serve the same paths. It must be an
-      https:// URL, without credentials (user:password@), which would show in
-      the log. What is downloaded is still verified against this orb's
+      https:// URL, without credentials (user:password@) or a query or
+      fragment, which would show in the log. What is downloaded is still verified against this orb's
       checksum table. The tools built from source download from crates.io and
       the registry cargo is configured for.
   install_path:

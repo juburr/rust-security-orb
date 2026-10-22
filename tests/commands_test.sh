@@ -243,13 +243,15 @@ EOF
 
 # cargo-cyclonedx writes an SBOM beside every member's Cargo.toml (members
 # from STUB_MEMBERS, relative to the working directory); STUB_CDX=crash fails,
-# and STUB_CDX=busy also writes other JSON and XML files meanwhile.
+# STUB_CDX=busy also writes other JSON and XML files meanwhile, STUB_CDX=bad
+# writes an SBOM that isn't one, and STUB_CDX=none writes nothing.
 {
     echo '#!/usr/bin/env bash'
     record
     cat << 'EOF'
 if [[ "$2" == --version ]]; then echo "cargo-cyclonedx-cyclonedx 0.5.9"; exit 0; fi
 if [[ "${STUB_CDX:-}" == crash ]]; then echo "Error: cargo metadata failed" >&2; exit 1; fi
+if [[ "${STUB_CDX:-}" == none ]]; then exit 0; fi
 format=xml
 prev=""
 for a in "$@"; do [[ "${prev}" == --format ]] && format=${a}; prev=${a}; done
@@ -257,7 +259,9 @@ for member in ${STUB_MEMBERS:-.}; do
     name=$(basename "$(cd "${member}" && pwd)")
     # STUB_CDX=busy: another process writes project files meanwhile.
     if [[ "${STUB_CDX:-}" == busy ]]; then echo '{"name":"web"}' > "${member}/package.json"; echo '<x/>' > "${member}/pom.xml"; fi
-    if [[ "${format}" == json ]]; then
+    if [[ "${STUB_CDX:-}" == bad ]]; then
+        echo '{"name":"not an sbom"}' > "${member}/${name}.cdx.${format}"
+    elif [[ "${format}" == json ]]; then
         printf '{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"dep"}],"target":"%s","offline":"%s"}\n' \
             "${CARGO_BUILD_TARGET:-unset}" "${CARGO_NET_OFFLINE:-unset}" > "${member}/${name}.cdx.json"
     else
@@ -286,6 +290,7 @@ EOF
     echo '#!/usr/bin/env bash'
     record
     cat << 'EOF'
+if [[ "${STUB_A2C:-}" == crash ]]; then echo "Error: invalid dependency list" >&2; exit 2; fi
 printf '{"bomFormat":"CycloneDX","specVersion":"1.3","metadata":{"component":{"name":"app"}},"components":[{"name":"smallvec"}]}'
 EOF
 } > "${STUBS}/auditable2cdx"
@@ -296,7 +301,9 @@ EOF
 } > "${STUBS}/cargo-auditable"
 
 # cargo: --version, metadata (STUB_LOCK=stale fails --locked; the workspace
-# root is the working directory, the members STUB_MEMBERS), and auditable.
+# root is the working directory, the members STUB_MEMBERS, and the workspace's
+# and root package's metadata tables STUB_WORKSPACE_METADATA and
+# STUB_PACKAGE_METADATA), locate-project and auditable.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -314,10 +321,18 @@ case "$1" in
         for member in ${STUB_MEMBERS:-.}; do
             dir=$(cd "${member}" && pwd)
             id="path+file://${dir}#$(basename "${dir}")@0.1.0"
-            packages+="${packages:+,}{\"id\":\"${id}\",\"manifest_path\":\"${dir}/Cargo.toml\"}"
+            metadata=null
+            [[ "${dir}" == "${root}" ]] && metadata=${STUB_PACKAGE_METADATA:-null}
+            packages+="${packages:+,}{\"id\":\"${id}\",\"manifest_path\":\"${dir}/Cargo.toml\",\"metadata\":${metadata}}"
             members+="${members:+,}\"${id}\""
         done
-        printf '{"workspace_root":"%s","workspace_members":[%s],"packages":[%s]}\n' "${root}" "${members}" "${packages}"
+        printf '{"workspace_root":"%s","workspace_members":[%s],"packages":[%s],"metadata":%s}\n' \
+            "${root}" "${members}" "${packages}" "${STUB_WORKSPACE_METADATA:-null}"
+        exit 0 ;;
+    locate-project)
+        manifest="$(pwd)/Cargo.toml"
+        [[ "$2 $3 $4" == "--message-format plain --manifest-path" ]] && manifest=$(cd "$(dirname "$5")" && pwd)/${5##*/}
+        echo "${manifest}"
         exit 0 ;;
 esac
 echo "cargo stand-in: unexpected $*" >&2
@@ -684,6 +699,18 @@ for word in --json --format=sarif; do
     run audit.sh "PARAM_EXTRA_ARGS=${word}"
     check "refuses ${word} in extra_args" failed
 done
+for word in --no-fetch -n -qn --db --db=/elsewhere -d/elsewhere -qd; do
+    audit_case
+    run audit.sh "PARAM_EXTRA_ARGS=${word}"
+    check "refuses ${word} in extra_args, which the staleness check and run record wouldn't follow" failed
+    check "naming the parameter to use" said "use the $([[ "${word}" == *d* ]] && echo db_path || echo no_fetch) parameter"
+    check "before running cargo audit" call_count cargo-audit 0
+done
+for word in -q -cnever "--color never"; do
+    audit_case
+    run audit.sh "PARAM_EXTRA_ARGS=${word}"
+    check "takes ${word}" succeeded
+done
 audit_case
 # shellcheck disable=SC2016 # expanded by the script
 run audit.sh 'PARAM_LOCKFILE=${LOCK_NAME}' LOCK_NAME=Cargo.lock
@@ -1024,6 +1051,11 @@ run deny.sh PARAM_RUN_RECORD=true
 check "records the database's remote without the credentials in its URL" \
     json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.url "https://mirror.example.test/advisory-db"
 check "anywhere in the run record" not_file_has "${CASE}/out/cargo-deny.run-record.json" "s3cret-token"
+"${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" remote set-url origin "https://mirror.example.test/advisory-db?access_token=s3cret-token#x"
+run deny.sh PARAM_RUN_RECORD=true
+check "nor in its query or fragment" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.url "https://mirror.example.test/advisory-db"
+check "which reach the run record nowhere" not_file_has "${CASE}/out/cargo-deny.run-record.json" "s3cret-token"
 check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "--manifest-path app/Cargo.toml check"
 deny_case
 mkdir -p "${CASE}/home/dbs"
@@ -1049,6 +1081,26 @@ make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
 printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
 run deny.sh PARAM_RUN_RECORD=true
 check "and the RustSec default's copy when deny.toml names other db-urls" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+for urls in '["https://mirror.example.test/advisory-db"]' $'[\n  "https://other.example.test/db", # first\n  \'https://mirror.example.test/advisory-db\',\n]'; do
+    deny_case
+    make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
+    "${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://Mirror.Example.Test:443/advisory-db"
+    printf '[advisories]\ndb-urls = %s\n' "${urls}" > "${CASE}/work/deny.toml"
+    run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+    check "records fetch_advisory_db's copy of a URL db-urls names (${urls//$'\n'/ })" \
+        json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+done
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
+"${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://github.com/rustsec/advisory-db"
+printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+check "but not its copy of another URL, which cargo deny doesn't read" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
+"${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://mirror.example.test/advisory-db"
+run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+check "nor a mirror's copy without db-urls, when cargo deny reads RustSec's" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
 deny_case
 mkdir -p "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
 run deny.sh PARAM_RUN_RECORD=true
@@ -1156,6 +1208,12 @@ check "cyclonedx turns it into a CycloneDX SBOM" json_is "${CASE}/out/auditable-
 check "with auditable2cdx" called auditable2cdx app
 check "listed in the index" json_is "${CASE}/out/auditable.json" '.binaries[0].sbom' "${CASE}/out/auditable-app.cdx.json"
 bin_case
+run verify_auditable.sh PARAM_CYCLONEDX=true PARAM_RUN_RECORD=true STUB_A2C=crash
+check "an auditable2cdx that fails fails the step" failed
+check "with its error" said "Error: invalid dependency list"
+check "the run record says error" json_is "${CASE}/out/auditable.run-record.json" .outcome error
+check "with auditable2cdx's exit code" json_is "${CASE}/out/auditable.run-record.json" .exit_code 2
+bin_case
 run verify_auditable.sh PARAM_CYCLONEDX=true PARAM_RUN_RECORD=true
 check "the run record names auditable2cdx as well" json_is "${CASE}/out/auditable.run-record.json" '.other_tools[0].path' "${STUBS}/auditable2cdx"
 check "with its SHA-512" json_is "${CASE}/out/auditable.run-record.json" '.other_tools[0].sha512' "$(sha512sum "${STUBS}/auditable2cdx" | awk '{ print $1 }')"
@@ -1252,9 +1310,21 @@ run sbom.sh PARAM_OFFLINE=true PARAM_MANIFEST_PATH=Cargo.toml
 check "offline keeps cargo metadata off the network" called cargo metadata --format-version 1 --locked --manifest-path Cargo.toml --offline
 check "and cargo cyclonedx's cargo too" json_is "${CASE}/out/sbom/work.cdx.json" .offline true
 sbom_case
-run sbom.sh STUB_CDX=crash
+run sbom.sh STUB_CDX=crash PARAM_RUN_RECORD=true
 check "a failing cargo cyclonedx fails" failed
 check "with its error" said "Error: cargo metadata failed"
+check "the run record says error" json_is "${CASE}/out/sbom.run-record.json" .outcome error
+check "with its exit code and log" json_is "${CASE}/out/sbom.run-record.json" '"\(.exit_code) \([.reports[].path | split("/")[-1]] | join(" "))"' "1 sbom.log"
+sbom_case
+run sbom.sh STUB_CDX=bad PARAM_RUN_RECORD=true
+check "an SBOM that isn't one fails" failed
+check "naming it" said "ERROR: work.cdx.json is not a CycloneDX JSON document."
+check "with an error run record that lists it" json_is "${CASE}/out/sbom.run-record.json" '"\(.outcome) \([.reports[].path | split("/")[-1]] | join(" "))"' "error work.cdx.json"
+sbom_case
+run sbom.sh STUB_CDX=none PARAM_RUN_RECORD=true
+check "no SBOM at all fails" failed
+check "saying so" said "ERROR: cargo cyclonedx wrote no SBOM"
+check "with an error run record" json_is "${CASE}/out/sbom.run-record.json" .outcome error
 for bad in PARAM_FORMAT=spdx PARAM_SPEC_VERSION=1.6 PARAM_DESCRIBE=all PARAM_EXTRA_ARGS=--override-filename=x; do
     sbom_case
     run sbom.sh "${bad}"
@@ -1286,6 +1356,20 @@ check "records the store's files" json_is "${CASE}/out/cargo-vet.run-record.json
 check "and the counts" json_is "${CASE}/out/cargo-vet.run-record.json" .counts.vetted_with_exemptions 1
 check "and the workspace's Cargo.lock, which cargo vet's graph comes from" \
     json_is "${CASE}/out/cargo-vet.run-record.json" '.inputs[] | select(.role == "lockfile") | .path' "${CASE}/work/Cargo.lock"
+for table in WORKSPACE PACKAGE; do
+    vet_case
+    mkdir -p "${CASE}/work/audit-store"
+    echo "[cargo-vet]" > "${CASE}/work/audit-store/config.toml"
+    run vet.sh PARAM_RUN_RECORD=true "STUB_${table}_METADATA={\"vet\":{\"store\":{\"path\":\"audit-store\"}}}"
+    check "records the store ${table,,} metadata sets, which cargo vet reads" \
+        json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "store") | .path] | join(" ")' "${CASE}/work/audit-store/config.toml"
+done
+vet_case
+mkdir -p "${CASE}/work/given"
+echo "[cargo-vet]" > "${CASE}/work/given/config.toml"
+run vet.sh PARAM_RUN_RECORD=true PARAM_STORE_PATH=given 'STUB_WORKSPACE_METADATA={"vet":{"store":{"path":"audit-store"}}}'
+check "store_path wins over metadata, as --store-path does" \
+    json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "store") | .path] | join(" ")' "${CASE}/work/given/config.toml"
 vet_case
 run vet.sh STUB_VET=fail PARAM_JUNIT=true
 check "unvetted crates fail the step" failed

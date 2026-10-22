@@ -83,15 +83,28 @@ if [[ -n "${FILTER_GRAPH}" ]]; then
 fi
 RS_ARGS+=(${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"})
 
-# The workspace root, for the lockfile cargo vet's graph comes from and the
-# default store, supply-chain beside it. --no-deps resolves nothing, so it
-# neither writes Cargo.lock nor uses the network.
-METADATA_ARGS=(metadata --no-deps --format-version 1)
+# The workspace root, for the lockfile cargo vet's graph comes from, and the
+# store cargo vet reads: store_path, or else the store path the root
+# package's [package.metadata.vet] or else [workspace.metadata.vet] sets
+# (relative to the directory cargo vet runs in), or else supply-chain in the
+# workspace root. --no-deps resolves nothing, so it neither writes Cargo.lock
+# nor uses the network.
+MANIFEST_ARGS=()
 if [[ -n "${MANIFEST_PATH}" ]]; then
-    METADATA_ARGS+=(--manifest-path "${MANIFEST_PATH}")
+    MANIFEST_ARGS+=(--manifest-path "${MANIFEST_PATH}")
 fi
-ROOT=$("${CARGO}" "${METADATA_ARGS[@]}" 2> /dev/null | jq -r '.workspace_root' 2> /dev/null) || ROOT=""
-STORE=${STORE_PATH:-${ROOT:-.}/supply-chain}
+METADATA=$("${CARGO}" metadata --no-deps --format-version 1 ${MANIFEST_ARGS[@]+"${MANIFEST_ARGS[@]}"} 2> /dev/null) || METADATA=""
+ROOT=$(jq -r '.workspace_root // empty' <<< "${METADATA}" 2> /dev/null) || ROOT=""
+STORE=${STORE_PATH}
+if [[ -z "${STORE}" ]]; then
+    # The root package is the one the manifest belongs to, as cargo resolves it.
+    MANIFEST=$("${CARGO}" locate-project --message-format plain ${MANIFEST_ARGS[@]+"${MANIFEST_ARGS[@]}"} 2> /dev/null) || MANIFEST=""
+    # shellcheck disable=SC2016 # jq program, not shell
+    STORE=$(jq -r --arg manifest "${MANIFEST}" '
+        ([.packages[]? | select(.manifest_path == $manifest) | .metadata?.vet?.store?.path? | strings] | .[0])
+            // (.metadata?.vet?.store?.path? | strings) // empty' <<< "${METADATA}" 2> /dev/null) || STORE=""
+fi
+STORE=${STORE:-${ROOT:-.}/supply-chain}
 RS_INPUTS=()
 if [[ -n "${ROOT}" && -f "${ROOT}/Cargo.lock" ]]; then
     RS_INPUTS+=("lockfile:${ROOT}/Cargo.lock")

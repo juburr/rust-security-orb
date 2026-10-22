@@ -101,10 +101,15 @@ for binary in "${BINARIES[@]}"; do
     entry=$(jq -cn --arg binary "${binary}" --arg sha "$(rs_sha256 "${binary}")" --arg report "${base}.audit.json" \
         --argjson packages "${packages}" '{binary: $binary, sha256: $sha, auditable: true, packages: $packages, report: $report}')
     if [[ "${CYCLONEDX}" == true ]]; then
-        if ! "${CDX}" "${binary}" > "${base}.cdx.json" 2> "${base}.log" \
-            || ! rs_json_is "${base}.cdx.json" '.bomFormat == "CycloneDX"'; then
-            echo "ERROR: auditable2cdx could not turn ${binary}'s dependency list into a CycloneDX SBOM. Its output:" >&2
+        rc=0
+        "${CDX}" "${binary}" > "${base}.cdx.json" 2> "${base}.log" || rc=$?
+        if [[ "${rc}" -ne 0 ]] || ! rs_json_is "${base}.cdx.json" '.bomFormat == "CycloneDX"'; then
+            echo "ERROR: auditable2cdx could not turn ${binary}'s dependency list into a CycloneDX SBOM (exit code ${rc}). Its output:" >&2
             sed 's/^/  /' "${base}.log" | tail -n 20 >&2
+            if [[ "${RUN_RECORD}" == true ]]; then
+                RS_REPORTS+=("${base}.log")
+                rs_run_record "${RS_BASE}.run-record.json" verify_auditable error "${rc}" "${STARTED}"
+            fi
             exit 1
         fi
         rm -f "${base}.log"

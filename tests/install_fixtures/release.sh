@@ -49,6 +49,14 @@ fixture_checks() {
     check "saying they would show in the log" said "download_base_url must not hold credentials"
     check "without printing them" not_said "s3cret"
     check "before downloading anything" no_downloads
+    for value in "https://mirror.example/github?access_token=s3cret" "https://mirror.example/github#s3cret"; do
+        new_case
+        run_install "PARAM_DOWNLOAD_BASE_URL=${value}"
+        check "refuses a query or fragment ('${value//s3cret/...}')" failed
+        check "saying it could hold a token" said "download_base_url must not have a query or fragment"
+        check "without printing it" not_said "s3cret"
+        check "before downloading anything" no_downloads
+    done
     begin "${TOOL_NAME}: install record"
     new_case
     run_install

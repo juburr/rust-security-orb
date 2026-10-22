@@ -76,7 +76,9 @@ parameters:
     description: >
       More cargo audit arguments, split like shell words. Nothing in them is
       expanded or run; environment variables are expanded before splitting.
-      --json and --format are refused, since this command writes the reports.
+      --json and --format are refused, since this command writes the reports, and so are
+      --no-fetch and --db (-n, -d): use no_fetch and db_path, which the staleness check
+      and run record follow.
   output_dir:
     type: string
     default: /tmp/rust-security-reports

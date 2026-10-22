@@ -16,7 +16,8 @@ parameters:
     type: string
     default: ""
     description: >
-      The supply-chain store (--store-path). Defaults to supply-chain in the workspace root.
+      The supply-chain store (--store-path). Defaults, as cargo vet does, to the store path in Cargo.toml's
+      [package.metadata.vet] or [workspace.metadata.vet], or else supply-chain in the workspace root.
       Environment variables are expanded.
   locked:
     type: boolean

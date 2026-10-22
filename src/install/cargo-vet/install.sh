@@ -79,6 +79,11 @@ rs_download_base_url() {
     if [[ "${authority%%/*}" == *@* ]]; then
         orb_die "download_base_url must not hold credentials (user:password@ before the host): they would show in the log and on curl's command line."
     fi
+    # Nor can a query or fragment, which can hold a token too, and would end
+    # up in the middle of every release URL.
+    if [[ "${RS_DOWNLOAD_BASE_URL}" == *[?#]* ]]; then
+        orb_die "download_base_url must not have a query or fragment (? or #): it could hold a token, which would show in the log."
+    fi
     if [[ ! "${RS_DOWNLOAD_BASE_URL}" =~ ^https://[^[:space:]\"\'\<\>\\]+$ ]]; then
         orb_die "download_base_url must be an https:// URL, not '${RS_DOWNLOAD_BASE_URL}'."
     fi

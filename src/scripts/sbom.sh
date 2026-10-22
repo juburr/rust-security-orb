@@ -139,15 +139,32 @@ fi
 MARKER="${RS_BASE}.marker"
 touch -d "@$(($(date +%s) - 1))" "${MARKER}"
 echo "Writing CycloneDX ${SPEC_VERSION} SBOMs (${DESCRIBE}) with ${RS_TOOL_VERSION:-cargo-cyclonedx}..."
-if ! "${ENV_ARGS[@]}" "${RS_TOOL}" "${RS_ARGS[@]}" > "${RS_BASE}.log" 2>&1; then
+RC=0
+"${ENV_ARGS[@]}" "${RS_TOOL}" "${RS_ARGS[@]}" > "${RS_BASE}.log" 2>&1 || RC=$?
+RS_REPORTS=()
+if [[ "${RC}" -ne 0 ]]; then
     rm -f "${MARKER}"
-    echo "ERROR: cargo cyclonedx failed. Its output:" >&2
+    echo "ERROR: cargo cyclonedx failed (exit code ${RC}). Its output:" >&2
     sed 's/^/  /' "${RS_BASE}.log" | tail -n 40 >&2
+    if [[ "${RUN_RECORD}" == true ]]; then
+        RS_REPORTS+=("${RS_BASE}.log")
+        rs_run_record "${RS_BASE}.run-record.json" sbom error "${RC}" "${STARTED}"
+    fi
     exit 1
 fi
 
 DEST="${RS_OUT%/}/${PARAM_REPORT_NAME}"
-RS_REPORTS=()
+# sbom_error [FILE]: stops the step for output cargo cyclonedx should not
+# have written, with an error run record that lists FILE too.
+sbom_error() {
+    if [[ "${RUN_RECORD}" == true ]]; then
+        if [[ $# -gt 0 ]]; then
+            RS_REPORTS+=("$1")
+        fi
+        rs_run_record "${RS_BASE}.run-record.json" sbom error "${RC}" "${STARTED}"
+    fi
+    exit 1
+}
 SUMMARY="[]"
 for dir in "${MEMBER_DIRS[@]}"; do
     while IFS= read -r -d '' file; do
@@ -158,14 +175,14 @@ for dir in "${MEMBER_DIRS[@]}"; do
         if [[ "${FORMAT}" == json ]]; then
             if ! rs_json_is "${file}" '.bomFormat == "CycloneDX"'; then
                 echo "ERROR: ${relative} is not a CycloneDX JSON document." >&2
-                exit 1
+                sbom_error "${file}"
             fi
             SUMMARY=$(jq -c --arg file "${relative}" --argjson components "$(jq '.components | length' "${file}")" \
                 '. + [{file: $file, components: $components}]' <<< "${SUMMARY}")
         else
             if ! grep -q '<bom[[:space:]/>]' "${file}"; then
                 echo "ERROR: ${relative} is not a CycloneDX XML document." >&2
-                exit 1
+                sbom_error "${file}"
             fi
             SUMMARY=$(jq -c --arg file "${relative}" '. + [{file: $file}]' <<< "${SUMMARY}")
         fi
@@ -177,7 +194,7 @@ done
 rm -f "${MARKER}" "${RS_BASE}.log"
 if [[ ${#RS_REPORTS[@]} -eq 0 ]]; then
     echo "ERROR: cargo cyclonedx wrote no SBOM beside any workspace member's Cargo.toml." >&2
-    exit 1
+    sbom_error
 fi
 # shellcheck disable=SC2034 # read by rs_run_record
 RS_COUNTS=$(jq -c '{sboms: length}' <<< "${SUMMARY}")

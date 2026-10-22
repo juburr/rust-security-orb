@@ -21,7 +21,7 @@
       "enum": ["passed", "findings", "findings-reported", "error"]
     },
     "exit_code": {
-      "description": "The tool's own exit code (for audit_bin, the last binary's; for verify_auditable, 1 when a binary has no data; when a SARIF pass fails, that pass's).",
+      "description": "The tool's own exit code (for audit_bin, the last binary's; for verify_auditable, 1 when a binary has no data; when a SARIF pass or auditable2cdx fails, its own).",
       "type": "integer"
     },
     "started_at": { "$ref": "#/$defs/timestamp" },

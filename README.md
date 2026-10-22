@@ -323,7 +323,7 @@ Installs the tools named in `tools`, each verified against the orb's checksum ta
 | `install_path` | `$HOME/bin` | Absolute path of the directory to install into, writable without root. Created if needed, and added to `PATH` for later steps when it isn't already on it. |
 | `verify_checksums` | `strict` | `strict`, `known_versions` or `false`, for every tool. See [Checksum Verification](#-checksum-verification). |
 | `caching` | `true` | Cache each tool's verified download between jobs, keyed by tool, version, CPU architecture and home directory. A cached file is verified again before it is used. For the tools built from source, the archive is cached and built in each job. |
-| `download_base_url` | *(empty)* | An `https://` mirror of GitHub releases to download the prebuilt tools from, in place of `https://github.com`, serving the same paths. What it serves is still verified. Credentials in the URL (`user:password@`) are refused, since they would show in the log. |
+| `download_base_url` | *(empty)* | An `https://` mirror of GitHub releases to download the prebuilt tools from, in place of `https://github.com`, serving the same paths. What it serves is still verified. Credentials (`user:password@`), a query and a fragment are refused, since they would show in the log. |
 
 ### `rust-security/install_<tool>`
 
@@ -357,7 +357,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |
 | `no_yanked` | `false` | Skip the yanked-crate check, which queries the crates.io index (cargo-audit 0.22.2 and later). |
-| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused. |
+| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch` and `--db` (`-n`, `-d`): use `no_fetch` and `db_path`, which the staleness check and run record follow. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit`. |
 
 ### `rust-security/audit_bin`
@@ -447,7 +447,7 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `store_path` | *(empty)* | The store. Defaults to `supply-chain` in the workspace root. |
+| `store_path` | *(empty)* | The store. Defaults to the store path in `Cargo.toml`'s `[package.metadata.vet]` or `[workspace.metadata.vet]`, or else `supply-chain` in the workspace root, as cargo vet does. |
 | `locked` | `true` | Use the imports recorded in `imports.lock`, so cargo vet fetches nothing itself and never rewrites the store. |
 | `frozen` | `false` | Also keep cargo metadata off the network. |
 | `features`, `no_default_features`, `no_all_features` | | The feature set. cargo vet checks every feature unless `no_all_features` is true. |
