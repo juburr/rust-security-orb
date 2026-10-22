@@ -468,14 +468,17 @@ rs_manifest_inputs() {
 }
 
 # rs_deny_inputs MANIFEST_PATH CONFIG_PATH [WORKSPACE_ROOT]: adds the files
-# cargo-deny reads to RS_INPUTS, found the way it finds them: the config from
-# CONFIG_PATH, or else the first deny.toml, .deny.toml or .cargo/deny.toml in
-# the manifest's directory or above it, and the workspace's Cargo.lock. That
-# is the one in WORKSPACE_ROOT, from cargo metadata, since a member's own
-# lockfile doesn't count in a workspace; without it, the nearest Cargo.lock.
-# Sets RS_DENY_CONFIG to the config, or empty when there is none.
+# cargo-deny reads to RS_INPUTS, found the way cargo-deny 0.20.2 finds them:
+# the config from CONFIG_PATH, or else the first deny.toml, .deny.toml or
+# .cargo/deny.toml in the manifest's directory or above it; whatever the
+# config, the first deny.exceptions.toml, .deny.exceptions.toml or
+# .cargo/deny.exceptions.toml there, whose licence exceptions it adds; and
+# the workspace's Cargo.lock. That is the one in WORKSPACE_ROOT, from cargo
+# metadata, since a member's own lockfile doesn't count in a workspace;
+# without it, the nearest Cargo.lock. Sets RS_DENY_CONFIG to the config, or
+# empty when there is none.
 rs_deny_inputs() {
-    local dir name lockfile=""
+    local dir name lockfile="" exceptions=""
     RS_DENY_CONFIG=$2
     if [[ -n "${RS_DENY_CONFIG}" ]]; then
         RS_INPUTS+=("config:${RS_DENY_CONFIG}")
@@ -487,11 +490,17 @@ rs_deny_inputs() {
         fi
     fi
     dir=$(cd "$(dirname "${1:-./Cargo.toml}")" 2> /dev/null && pwd) || dir=""
-    while [[ -n "${dir}" && ( -z "${RS_DENY_CONFIG}" || -z "${lockfile}" ) ]]; do
+    while [[ -n "${dir}" && ( -z "${RS_DENY_CONFIG}" || -z "${exceptions}" || -z "${lockfile}" ) ]]; do
         for name in deny.toml .deny.toml .cargo/deny.toml; do
             if [[ -z "${RS_DENY_CONFIG}" && -f "${dir}/${name}" ]]; then
                 RS_DENY_CONFIG="${dir}/${name}"
                 RS_INPUTS+=("config:${RS_DENY_CONFIG}")
+            fi
+        done
+        for name in deny.exceptions.toml .deny.exceptions.toml .cargo/deny.exceptions.toml; do
+            if [[ -z "${exceptions}" && -f "${dir}/${name}" ]]; then
+                exceptions="${dir}/${name}"
+                RS_INPUTS+=("config:${exceptions}")
             fi
         done
         if [[ -z "${lockfile}" && -f "${dir}/Cargo.lock" ]]; then
@@ -571,10 +580,12 @@ rs_expand_path() {
 # Awk functions for the TOML readers below, which set q to a single quote.
 # They read keys by their full dotted name, so a setting means the same
 # whether written under its [table] header or as table.key, as in TOML.
-# - toml_table(line): the dotted name of the table a [header] line opens, or
-#   "[]" for an array of tables.
+# - toml_table(line): the dotted name of the table a [header] line opens,
+#   "[]" for an array of tables, or "\" for a name written with escapes.
 # - toml_key(line): the dotted key a key = value line sets, relative to its
-#   table, or "" when the text before = isn't a key (such as inside an array).
+#   table, "" when the text before = isn't a key (such as inside an array),
+#   or "\" for a quoted key written with escapes. Only a TOML parser would
+#   read an escaped name exactly, so the readers fail closed on "\".
 # - toml_rest(line): the value, the text after =.
 # - toml_plain(value): whether value is not a multiline string, nor a basic
 #   string with escapes, which only a TOML parser would read exactly.
@@ -591,11 +602,14 @@ RS_TOML_AWK='
         if (line ~ /^[[:space:]]*\[\[/) { return "[]" }
         sub(/^[[:space:]]*\[/, "", line)
         sub(/\][[:space:]]*$/, "", line)
-        return toml_name(line)
+        return index(line, "\\") ? "\\" : toml_name(line)
     }
-    function toml_key(line,    key) {
-        key = toml_name(substr(line, 1, index(line, "=") - 1))
-        return key ~ /^[A-Za-z0-9_.-]+$/ ? key : ""
+    function toml_key(line,    key, plain) {
+        key = substr(line, 1, index(line, "=") - 1)
+        plain = key
+        gsub(/\\./, "", plain)
+        if (toml_name(plain) !~ /^[A-Za-z0-9_.-]+$/) { return "" }
+        return index(key, "\\") ? "\\" : toml_name(key)
     }
     function toml_rest(line) {
         line = substr(line, index(line, "=") + 1)
@@ -630,9 +644,10 @@ rs_deny_db() {
     if [[ -n "${RS_DENY_CONFIG:-}" && -f "${RS_DENY_CONFIG}" ]]; then
         # Prints "urls" and "url=<url>" for each URL in advisories.db-urls,
         # an array that can span lines, "path=<path>" for advisories.db-path,
-        # and "unreadable" for an inline advisories table or a setting
-        # written as a multiline string or with escapes. Keys count by their
-        # full dotted name, as for rs_audit_config.
+        # and "unreadable" for an inline advisories table, a setting written
+        # as a multiline string or with escapes, or a name written with
+        # escapes. Keys count by their full dotted name, as for
+        # rs_audit_config.
         settings=$(awk -v q="'" "${RS_TOML_AWK}"'
             function urls(line) {
                 sub(/#.*/, "", line)
@@ -648,6 +663,10 @@ rs_deny_db() {
             index($0, "=") {
                 key = toml_key($0)
                 if (key == "") { next }
+                if (key == "\\" || table == "\\") {
+                    print "unreadable"
+                    next
+                }
                 key = table == "" ? key : table "." key
                 rest = toml_rest($0)
                 if (key == "advisories.db-urls") {
@@ -934,10 +953,11 @@ rs_audit_config() {
     fi
     # Prints "deny <kind>" for each kind in output.deny, an array that can
     # span lines, "<key> <value>" for database.path, fetch and stale,
-    # "unreadable <key>" for one of those it can't read, and "inline <table>"
-    # for a database or output table written inline. Keys
-    # count by their full dotted name, so [database] fetch = false and
-    # database.fetch = false are the same setting, as in TOML.
+    # "unreadable <key>" for one of those it can't read, "inline <table>"
+    # for a database or output table written inline, and "escaped" for a key
+    # or table name written with escapes. Keys count by their full dotted
+    # name, so [database] fetch = false and database.fetch = false are the
+    # same setting, as in TOML.
     while IFS= read -r line; do
         case "${line}" in
             "deny "*) RS_CONFIG_DENIED+=("${line#deny }") ;;
@@ -947,6 +967,11 @@ rs_audit_config() {
             "unreadable "*)
                 echo "ERROR: ${RS_AUDIT_CONFIG} writes ${line#unreadable } as a multiline string or with escapes, which this command can't read." >&2
                 echo "  Write it as a plain \"...\" or '...' string, so it reaches the staleness check and the run record." >&2
+                exit 1
+                ;;
+            escaped)
+                echo "ERROR: ${RS_AUDIT_CONFIG} writes a key or table name with escapes, which this command can't read." >&2
+                echo "  Write names plainly, such as [database] or database.fetch, so its settings reach the staleness check and the run record." >&2
                 exit 1
                 ;;
             "inline "*)
@@ -967,6 +992,10 @@ rs_audit_config() {
         index($0, "=") {
             key = toml_key($0)
             if (key == "") { next }
+            if (key == "\\" || table == "\\") {
+                print "escaped"
+                next
+            }
             key = table == "" ? key : table "." key
             rest = toml_rest($0)
             if (key == "output.deny" && !done) {

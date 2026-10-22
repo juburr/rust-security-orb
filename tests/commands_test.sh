@@ -164,7 +164,8 @@ EOF
 } > "${STUBS}/cargo-audit"
 
 # cargo-deny: STUB_DENY is clean, vuln, banned, crash, ignored-bare,
-# ignored-reason, warn or nolabel (a warning about no crate or advisory).
+# ignored-reason, warn, nolabel (a warning about no crate or advisory) or
+# nostd (std-replacement-data that couldn't be loaded).
 # "list" prints an inventory.
 {
     echo '#!/usr/bin/env bash'
@@ -196,7 +197,14 @@ if [[ "${format}" == sarif ]]; then
 fi
 zero='{"errors":0,"warnings":0,"notes":0,"helps":0}'
 adv=${zero} bans=${zero} rc=0
+# STUB_DENY_FETCH_FROM/TO: the JSON pass fetches a database, as cargo deny
+# does unless offline.
+if [[ -n "${STUB_DENY_FETCH_TO:-}" && "${format}" == json ]]; then
+    mkdir -p "$(dirname "${STUB_DENY_FETCH_TO}")" && cp -a "${STUB_DENY_FETCH_FROM}" "${STUB_DENY_FETCH_TO}"
+fi
 case "${mode}" in
+    nostd)
+        echo '{"fields":{"level":"ERROR","message":"failed to load std-replacement-data - failed to acquire std-replacement-data lock"},"type":"log"}' >&2 ;;
     vuln)
         echo '{"type":"diagnostic","fields":{"severity":"error","code":"vulnerability","message":"Buffer overflow","notes":["ID: RUSTSEC-2021-0003"],"labels":[],"graphs":[{"Krate":{"name":"smallvec","version":"1.6.0"}}],"advisory":{"id":"RUSTSEC-2021-0003"}}}' >&2
         adv='{"errors":1,"warnings":0,"notes":0,"helps":0}'; rc=1 ;;
@@ -876,6 +884,21 @@ for value in '"""/srv/stale-db"""' "'''/srv/stale-db'''" '"/srv/stale\u002Ddb"';
     check "saying how to write it" said "writes database.path as a multiline string or with escapes"
     check "before running cargo audit" call_count cargo-audit 0
 done
+for config in '"data\\u0062ase".fetch = false\n' '["data\\u0062ase"]\nfetch = false\n'; do
+    audit_case
+    mkdir -p "${CASE}/work/.cargo"
+    # shellcheck disable=SC2059 # the format is the config
+    printf "${config}" > "${CASE}/work/.cargo/audit.toml"
+    run audit.sh
+    check "a name written with escapes ($(head -n 1 "${CASE}/work/.cargo/audit.toml")) fails, rather than be missed" failed
+    check "saying how to write it" said "writes a key or table name with escapes"
+    check "before running cargo audit" call_count cargo-audit 0
+done
+audit_case
+mkdir -p "${CASE}/work/.cargo"
+printf '[output]\nquiet = false\n# C:\\notes = a comment\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh
+check "a backslash outside a name is no escaped name" succeeded
 audit_case
 mkdir -p "${CASE}/work/.cargo"
 printf 'database = { fetch = false }\n' > "${CASE}/work/.cargo/audit.toml"
@@ -1083,6 +1106,12 @@ check "is a JUnit case named by its code" file_has "${CASE}/out/junit/cargo-deny
 
 begin "deny: a cargo deny that doesn't complete"
 deny_case
+run deny.sh STUB_DENY=nostd PARAM_OFFLINE=true PARAM_RUN_RECORD=true
+check "fails when cargo deny skipped [bans.std-replacements] for want of its data" failed
+check "saying why" said "ERROR: cargo deny skipped its [bans.std-replacements] check: failed to load std-replacement-data"
+check "and how to fetch it first" said "cargo deny fetch std-replacement"
+check "with an error run record" json_is "${CASE}/out/cargo-deny.run-record.json" .outcome error
+deny_case
 run deny.sh STUB_DENY=crash PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
 check "fails the step even with report_only" failed
 check "saying it didn't complete" said "ERROR: cargo deny did not complete (exit code 1)"
@@ -1202,6 +1231,18 @@ run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_RUN_RECORD=true
 check "and a package's own lockfile when it is its own workspace" \
     json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path] | join(" ")' "${CASE}/work/app/Cargo.lock"
 deny_case
+mkdir -p "${CASE}/work/.cargo"
+echo "exceptions = []" > "${CASE}/work/.cargo/deny.exceptions.toml"
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_CONFIG_PATH=deny.toml PARAM_RUN_RECORD=true
+check "records the local exceptions file cargo deny adds to any config" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "config") | .path] | join(" ")' \
+    "${CASE}/work/deny.toml ${CASE}/work/.cargo/deny.exceptions.toml"
+deny_case
+make_db "${CASE}/fetched" 2
+run deny.sh PARAM_RUN_RECORD=true "STUB_DENY_FETCH_FROM=${CASE}/fetched" "STUB_DENY_FETCH_TO=${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+check "records the database cargo deny fetched during the check" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+deny_case
 mkdir -p "${CASE}/home/dbs"
 make_db "${CASE}/home/dbs/advisory-db-3157b0e258782691" 2
 printf '[advisories]\ndb-path = "~/dbs"\n' > "${CASE}/work/deny.toml"
@@ -1275,7 +1316,8 @@ printf 'advisories.db-urls = ["https://mirror.example.test/advisory-db"]\n' > "$
 run deny.sh PARAM_RUN_RECORD=true
 check "rather than RustSec's copy, which cargo deny doesn't read then" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
 for config in 'advisories = { db-path = "~/dbs" }' $'[advisories]\ndb-path = """~/dbs"""' $'[advisories]\ndb-path = \'\'\'~/dbs\'\'\'' \
-    $'[advisories]\ndb-path = "~/d\\u0062s"' $'[advisories]\ndb-urls = ["https://mirror.example.test/advisory\\u002ddb"]'; do
+    $'[advisories]\ndb-path = "~/d\\u0062s"' $'[advisories]\ndb-urls = ["https://mirror.example.test/advisory\\u002ddb"]' \
+    $'"advisori\\u0065s".db-path = "~/dbs"' $'["advisori\\u0065s"]\ndb-path = "~/dbs"'; do
     deny_case
     make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
     printf '%s\n' "${config}" > "${CASE}/work/deny.toml"
@@ -1320,6 +1362,13 @@ check "a failing cargo deny list fails" failed
 check "with its error" said "error: list failed"
 check "and a run record that says so" json_is "${CASE}/out/licenses.run-record.json" .outcome error
 check "with cargo deny's exit code" json_is "${CASE}/out/licenses.run-record.json" .exit_code 3
+check "and its log, which explains the failure" json_is "${CASE}/out/licenses.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' licenses.log
+deny_case
+echo "exceptions = []" > "${CASE}/work/deny.exceptions.toml"
+run licenses.sh PARAM_RUN_RECORD=true
+check "records the local exceptions file, whose licence exceptions cargo deny adds" \
+    json_is "${CASE}/out/licenses.run-record.json" '[.inputs[] | select(.role == "config") | .path] | join(" ")' \
+    "${CASE}/work/deny.toml ${CASE}/work/deny.exceptions.toml"
 for bad in "PARAM_FORMATS=csv" "PARAM_FORMATS=" "PARAM_LAYOUT=tree" "PARAM_CONFIG_PATH=missing.toml"; do
     deny_case
     run licenses.sh "${bad}"

@@ -108,6 +108,7 @@ for format in "${FORMATS[@]}"; do
         echo "ERROR: cargo deny list failed (exit code ${rc}). Its output:" >&2
         sed 's/^/  /' "${RS_BASE}.log" | tail -n 40 >&2
         if [[ "${RUN_RECORD}" == true ]]; then
+            RS_REPORTS+=("${RS_BASE}.log")
             rs_run_record "${RS_BASE}.run-record.json" licenses error "${rc}" "${STARTED}"
         fi
         exit 1

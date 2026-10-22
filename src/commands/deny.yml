@@ -66,7 +66,9 @@ parameters:
       Run without network access (--offline): cargo deny doesn't fetch the advisory database
       (fetch_advisory_db provides it) and cargo metadata uses only cargo's cache, so warm it
       or use metadata_path. The database's age is checked against deny.toml's
-      maximum-db-staleness (90 days by default).
+      maximum-db-staleness (90 days by default). With [bans.std-replacements], run
+      cargo deny fetch std-replacement earlier in the job: without that data cargo deny
+      skips the check, and the step fails rather than pass without it.
   locked:
     type: boolean
     default: false

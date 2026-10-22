@@ -140,7 +140,6 @@ RS_ARGS=(${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"} "${CHECK_ARGS[@]}")
 RS_INPUTS=()
 if [[ "${RUN_RECORD}" == true ]]; then
     rs_deny_record_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}" "${METADATA_PATH}"
-    rs_deny_db
 fi
 RS_REPORTS=()
 JSONL="${RS_BASE}.jsonl"
@@ -148,6 +147,10 @@ JSONL="${RS_BASE}.jsonl"
 echo "Running cargo deny ${CHECK_ARGS[*]} with ${RS_TOOL_VERSION:-cargo-deny}..."
 RC=0
 "${RS_TOOL}" --format json --log-level info "${RS_ARGS[@]}" 2> "${JSONL}" > "${RS_BASE}.audit.json" || RC=$?
+# The database cargo deny read, which it fetched just now unless offline.
+if [[ "${RUN_RECORD}" == true ]]; then
+    rs_deny_db
+fi
 if [[ "${AUDIT_COMPATIBLE}" == true && -s "${RS_BASE}.audit.json" ]]; then
     RS_REPORTS+=("${RS_BASE}.audit.json")
 else
@@ -166,6 +169,19 @@ if [[ -z "${SUMMARY}" ]]; then
     exit 1
 fi
 RS_REPORTS+=("${JSONL}")
+# With [bans.std-replacements], cargo deny skips that check when it can't
+# load the std-replacement-data it fetches into TMPDIR (offline doesn't fetch
+# it), logs an error, and still reports bans as passed.
+STD_DATA_ERROR=$(jq -rR 'fromjson? | select(.type? == "log" and .fields.level? == "ERROR"
+    and (.fields.message? // "" | startswith("failed to load std-replacement-data"))) | .fields.message' "${JSONL}" 2> /dev/null) || STD_DATA_ERROR=""
+if [[ -n "${STD_DATA_ERROR}" ]]; then
+    echo "ERROR: cargo deny skipped its [bans.std-replacements] check: ${STD_DATA_ERROR%%$'\n'*}" >&2
+    echo "  offline stops it fetching that data. Run cargo deny fetch std-replacement earlier in the job, or leave offline off." >&2
+    if [[ "${RUN_RECORD}" == true ]]; then
+        rs_run_record "${RS_BASE}.run-record.json" deny error "${RC}" "${STARTED}"
+    fi
+    exit 1
+fi
 
 if [[ "${SARIF}" == true ]]; then
     SARIF_ARGS=(--format sarif ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"})

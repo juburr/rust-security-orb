@@ -384,7 +384,7 @@ Runs `cargo deny check` against the project's `deny.toml`: advisories, bans, lic
 | `features`, `all_features`, `no_default_features` | | The feature set to check. |
 | `target` | *(empty)* | Check only this target triple's dependencies. `deny.toml`'s `[graph] targets` lists several. |
 | `workspace`, `exclude`, `exclude_dev` | `false`, *(empty)*, `false` | Check every workspace member, leave members out, leave out dev-dependencies. |
-| `offline` | `false` | Fetch nothing: no database update (use `fetch_advisory_db`), and cargo metadata from cargo's cache only. |
+| `offline` | `false` | Fetch nothing: no database update (use `fetch_advisory_db`), and cargo metadata from cargo's cache only. With `[bans.std-replacements]` in `deny.toml`, run `cargo deny fetch std-replacement` earlier in the job: without that data cargo deny skips the check, and the step fails rather than pass without it. |
 | `locked`, `frozen` | `false` | Fail when `Cargo.lock` is out of date; `frozen` is `locked` and `offline`. |
 | `allow`, `warn`, `deny` | *(empty)* | Diagnostic codes or levels to allow, warn on or deny, separated by commas or spaces. Prefer `deny.toml`, where a reason can go with them. |
 | `require_ignore_reasons` | `false` | Fail when an advisory or yanked crate ignored in `deny.toml` has no reason. |
