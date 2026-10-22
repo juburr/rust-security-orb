@@ -62,9 +62,13 @@ if [[ -n "${ARCHIVE}" ]]; then
     fi
     ARCHIVE_REAL=$(realpath -m -- "${ARCHIVE}" 2> /dev/null) || ARCHIVE_REAL=${ARCHIVE}
     DEST_REAL=$(realpath -m -- "${DEST}" 2> /dev/null) || DEST_REAL=${DEST}
-    if [[ "${ARCHIVE_REAL}" == "${DEST_REAL}/"* ]]; then
+    if [[ "${ARCHIVE_REAL}" == "${DEST_REAL}" || "${ARCHIVE_REAL}" == "${DEST_REAL}/"* ]]; then
         echo "ERROR: archive (${ARCHIVE}) is inside the database's directory, ${DEST}, so it would be archived into itself." >&2
         echo "  Write it somewhere else, such as the workspace." >&2
+        exit 1
+    fi
+    if [[ -d "${ARCHIVE}" ]]; then
+        echo "ERROR: archive (${ARCHIVE}) is a directory. Name the .tar.gz file to write, such as ${ARCHIVE%/}/advisory-db.tar.gz." >&2
         exit 1
     fi
 fi

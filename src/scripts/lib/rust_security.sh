@@ -773,7 +773,9 @@ rs_expand_path() {
 
 # Awk functions for the TOML readers below, which set q to a single quote.
 # They read keys by their full dotted name, so a setting means the same
-# whether written under its [table] header or as table.key, as in TOML.
+# whether written under its [table] header or as table.key, as in TOML. A
+# quoted key part keeps its dots, so "a.b" = 1 is one key, never the dotted
+# a.b, and toml_key, finding no plain name, skips it.
 # - toml_table(line): the dotted name of the table a [header] line opens,
 #   "[]" for an array of tables, or "\" for a name written with escapes.
 # - toml_key(line): the dotted key a key = value line sets, relative to its
@@ -786,10 +788,27 @@ rs_expand_path() {
 # - toml_string(value): the string value starts with, or else value without
 #   its comment.
 RS_TOML_AWK='
-    function toml_name(key) {
-        gsub(/[[:space:]"]/, "", key)
-        gsub(q, "", key)
-        return key
+    function toml_name(key,    name, i, c, quote) {
+        # Whitespace around a key part goes, quotes go, and a dot inside
+        # quotes stays part of its key part, as \001, so "a.b" never reads
+        # as the dotted a.b.
+        name = ""
+        quote = ""
+        for (i = 1; i <= length(key); i++) {
+            c = substr(key, i, 1)
+            if (quote != "") {
+                if (c == quote) {
+                    quote = ""
+                } else {
+                    name = name (c == "." ? "\001" : c)
+                }
+            } else if (c == "\"" || c == q) {
+                quote = c
+            } else if (c !~ /[[:space:]]/) {
+                name = name c
+            }
+        }
+        return name
     }
     function toml_table(line) {
         sub(/#.*/, "", line)

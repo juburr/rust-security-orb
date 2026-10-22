@@ -42,8 +42,9 @@ parameters:
       workspace or store, so later jobs import this very copy. The copy's git config keeps
       only what a checkout needs, with credentials stripped from remote URLs, so an imported
       copy's credentials and commands (per-worktree config and hooks included) reach neither
-      the archive nor the installed copy. A path inside the database's own directory is
-      refused, since the archive would hold itself.
+      the archive nor the installed copy. A path inside the database's own directory, or that
+      directory itself, is refused, since the archive would hold itself, and so is an existing
+      directory.
       Environment variables are expanded.
   auth_header_env_var:
     type: string

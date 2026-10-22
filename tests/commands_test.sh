@@ -617,13 +617,20 @@ run fetch_advisory_db.sh "PARAM_AUTH_HEADER_ENV_VAR=not a name"
 check "a name that can't be a variable fails" failed
 
 begin "fetch_advisory_db: archive and import"
-for archive in "advisory-dbs/${DB_NAME}/db.tar.gz" "advisory-dbs/x/../${DB_NAME}/sub/db.tar.gz"; do
+for archive in "advisory-dbs/${DB_NAME}/db.tar.gz" "advisory-dbs/x/../${DB_NAME}/sub/db.tar.gz" "advisory-dbs/${DB_NAME}" \
+    "advisory-dbs/${DB_NAME}/"; do
     new_case
     run fetch_advisory_db.sh "PARAM_ARCHIVE=${CASE}/home/.cargo/${archive}"
     check "refuses an archive inside the database's own directory (${archive#*/})" failed
     check "saying so" said "inside the database's directory"
     check "before fetching" call_count git-clone 0
 done
+new_case
+mkdir -p "${CASE}/out/existing"
+run fetch_advisory_db.sh "PARAM_ARCHIVE=${CASE}/out/existing"
+check "refuses an archive path that is a directory" failed
+check "saying so" said "is a directory"
+check "before fetching" call_count git-clone 0
 new_case
 run fetch_advisory_db.sh "PARAM_ARCHIVE=${CASE}/out/advisory-db.tar.gz"
 check "writes the archive" exists "${CASE}/out/advisory-db.tar.gz"
@@ -1067,6 +1074,15 @@ for config in 'database.path = "%s"\ndatabase.fetch = false\n' '"database" . "pa
     check "dotted and quoted keys are the same settings ($(head -n 1 "${CASE}/work/.cargo/audit.toml" | cut -c1-24)...)" failed
     check "so the stale database still fails" said "newest commit is 120 days old"
 done
+# A quoted key holding a dot is one key, not database.stale.
+printf '"database.stale" = true
+[database]
+path = "%s"
+fetch = false
+' "${CASE}/db" > "${CASE}/work/.cargo/audit.toml"
+run audit.sh PARAM_RUN_RECORD=1
+check "a quoted key with a dot (\"database.stale\") isn't read as database.stale" failed
+check "so the stale database still fails" said "newest commit is 120 days old"
 for value in '"""/srv/stale-db"""' "'''/srv/stale-db'''" '"/srv/stale\u002Ddb"'; do
     audit_case
     mkdir -p "${CASE}/work/.cargo"
@@ -1549,6 +1565,14 @@ make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
 "${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://mirror.example.test/advisory-db"
 run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
 check "nor a mirror's copy without db-urls, when cargo deny reads RustSec's" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+mkdir -p "${CASE}/home/dbs"
+make_db "${CASE}/home/dbs/advisory-db-3157b0e258782691" 2
+printf '"advisories.db-path" = "~/dbs"\n[advisories]\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true
+check "a quoted key with a dot (\"advisories.db-path\") isn't read as advisories.db-path" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
 # TOML sets the same key under its [table] header or dotted, quoted or not.
 for config in 'advisories.db-path = "~/dbs"' $'[advisories]\n"db-path" = \'~/dbs\'' $'[ "advisories" ] # the database\ndb-path = "~/dbs" # a copy'; do
     deny_case
