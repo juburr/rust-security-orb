@@ -53,6 +53,10 @@ for pattern in "${RS_LIST[@]}"; do
             echo "ERROR: ${file} is not a file." >&2
             exit 1
         fi
+        # The tools would read a name that starts with "-" as an option.
+        if [[ "${file}" == -* ]]; then
+            file="./${file}"
+        fi
         BINARIES+=("${file}")
     done
 done

@@ -53,6 +53,21 @@ if [[ "${DB_DIR}" != /* ]]; then
     DB_DIR="$(pwd)/${DB_DIR}"
 fi
 DEST="${DB_DIR%/}/${NAME}"
+# An archive inside the database's directory would be archived into itself,
+# and then left there, a file the database's commit doesn't have. realpath -m
+# resolves ".." and links without needing the path to exist.
+if [[ -n "${ARCHIVE}" ]]; then
+    if [[ "${ARCHIVE}" != /* ]]; then
+        ARCHIVE="$(pwd)/${ARCHIVE}"
+    fi
+    ARCHIVE_REAL=$(realpath -m -- "${ARCHIVE}" 2> /dev/null) || ARCHIVE_REAL=${ARCHIVE}
+    DEST_REAL=$(realpath -m -- "${DEST}" 2> /dev/null) || DEST_REAL=${DEST}
+    if [[ "${ARCHIVE_REAL}" == "${DEST_REAL}/"* ]]; then
+        echo "ERROR: archive (${ARCHIVE}) is inside the database's directory, ${DEST}, so it would be archived into itself." >&2
+        echo "  Write it somewhere else, such as the workspace." >&2
+        exit 1
+    fi
+fi
 if ! command -v git > /dev/null 2>&1; then
     echo "ERROR: git is not on the PATH. Fetching the database, and judging its age, need it." >&2
     exit 1
@@ -233,7 +248,10 @@ if [[ -n "${CARGO_HOME:-}" && "${DB_DIR%/}" != "${CARGO_HOME%/}/advisory-dbs" ]]
 fi
 
 if [[ -n "${ARCHIVE}" ]]; then
+    # Written in the work directory and then moved, so a failed write leaves
+    # no partial archive where a later job imports it.
     mkdir -p "$(dirname "${ARCHIVE}")"
-    tar -czf "${ARCHIVE}" -C "${DEST}" .
+    tar -czf "${WORK_DIR}/archive.tar.gz" -C "${DEST}" .
+    mv "${WORK_DIR}/archive.tar.gz" "${ARCHIVE}"
     echo "Wrote ${ARCHIVE} (SHA-256 $(rs_sha256 "${ARCHIVE}")), to import in later jobs."
 fi

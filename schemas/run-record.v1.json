@@ -86,13 +86,13 @@
       ]
     },
     "inputs": {
-      "description": "The files the result depends on, by role: lockfile, manifest (the Cargo.toml files of the workspace and of path packages outside it), config, metadata, store or binary.",
+      "description": "The files the result depends on, by role: lockfile, manifest (the Cargo.toml files of the workspace and of path packages outside it), license (those local packages' LICENSE*, COPYING* and license-file files, for deny, licenses and sbom), config, metadata, store or binary.",
       "type": "array",
       "items": {
         "type": "object",
         "required": ["role", "path", "sha256"],
         "properties": {
-          "role": { "enum": ["lockfile", "manifest", "config", "metadata", "store", "binary"] },
+          "role": { "enum": ["lockfile", "manifest", "license", "config", "metadata", "store", "binary"] },
           "path": { "type": "string" },
           "sha256": { "description": "null when the file doesn't exist.", "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }] }
         }

@@ -319,7 +319,8 @@ EOF
 
 # cargo: --version, metadata (STUB_LOCK=stale fails --locked; the workspace
 # root is STUB_WORKSPACE_ROOT or else the manifest's directory, the members
-# STUB_MEMBERS, each named after its directory at version 0.1.0, and the
+# STUB_MEMBERS, each named after its directory at version 0.1.0, with
+# STUB_LICENSE_FILE as the license-file of each but the root package, and the
 # workspace's and root package's metadata tables STUB_WORKSPACE_METADATA and
 # STUB_PACKAGE_METADATA), pkgid (STUB_PKGIDS lists "name@version=URL path"
 # pairs), locate-project and auditable.
@@ -346,8 +347,13 @@ case "$1" in
             dir=$(cd "${member}" && pwd)
             id="path+file://${dir}#$(basename "${dir}")@0.1.0"
             metadata=null
-            [[ "${dir}" == "${root}" ]] && metadata=${STUB_PACKAGE_METADATA:-null}
-            packages+="${packages:+,}{\"id\":\"${id}\",\"name\":\"$(basename "${dir}")\",\"version\":\"0.1.0\""
+            license_file=null
+            if [[ "${dir}" == "${root}" ]]; then
+                metadata=${STUB_PACKAGE_METADATA:-null}
+            elif [[ -n "${STUB_LICENSE_FILE:-}" ]]; then
+                license_file="\"${STUB_LICENSE_FILE}\""
+            fi
+            packages+="${packages:+,}{\"id\":\"${id}\",\"name\":\"$(basename "${dir}")\",\"version\":\"0.1.0\",\"license_file\":${license_file}"
             packages+=",\"manifest_path\":\"${dir}/Cargo.toml\",\"metadata\":${metadata}}"
             members+="${members:+,}\"${id}\""
         done
@@ -611,6 +617,13 @@ run fetch_advisory_db.sh "PARAM_AUTH_HEADER_ENV_VAR=not a name"
 check "a name that can't be a variable fails" failed
 
 begin "fetch_advisory_db: archive and import"
+for archive in "advisory-dbs/${DB_NAME}/db.tar.gz" "advisory-dbs/x/../${DB_NAME}/sub/db.tar.gz"; do
+    new_case
+    run fetch_advisory_db.sh "PARAM_ARCHIVE=${CASE}/home/.cargo/${archive}"
+    check "refuses an archive inside the database's own directory (${archive#*/})" failed
+    check "saying so" said "inside the database's directory"
+    check "before fetching" call_count git-clone 0
+done
 new_case
 run fetch_advisory_db.sh "PARAM_ARCHIVE=${CASE}/out/advisory-db.tar.gz"
 check "writes the archive" exists "${CASE}/out/advisory-db.tar.gz"
@@ -1152,6 +1165,11 @@ bin_case() {
 
 begin "audit_bin"
 bin_case
+echo AUDITABLE > "${CASE}/work/-app"
+run audit_bin.sh PARAM_BINARIES=-app
+check "audits a binary whose name starts with a dash as ./-app, which cargo audit can't read as an option" \
+    called cargo-audit audit --json bin ./-app
+bin_case
 run audit_bin.sh PARAM_BINARIES=app "PARAM_EXTRA_ARGS=bin target/release/tool"
 check "refuses a binary in extra_args, which cargo audit bin would audit and the report credit to another" failed
 check "before running cargo audit" call_count cargo-audit 0
@@ -1331,6 +1349,18 @@ check "with metadata_path, the run record lists the metadata" \
     json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "metadata" or .role == "manifest") | .role] | join(" ")' metadata
 check "and cargo metadata doesn't run, since cargo deny reads no manifest" not_called_with cargo metadata
 check "nor does cargo pkgid, for path packages' manifests" not_called_with cargo pkgid
+deny_case
+mkdir -p "${CASE}/registry/serde"
+for file in app/LICENSE app/TERMS app/README; do echo "${file}" > "${CASE}/work/${file}"; done
+echo "registry" > "${CASE}/registry/serde/LICENSE"
+jq -n --arg app "${CASE}/work/app/Cargo.toml" --arg serde "${CASE}/registry/serde/Cargo.toml" '{workspace_root: "", packages: [
+    {name: "app", source: null, manifest_path: $app, license_file: "TERMS"},
+    {name: "serde", source: "registry+https://github.com/rust-lang/crates.io-index", manifest_path: $serde, license_file: null}]}' \
+    > "${CASE}/work/metadata.json"
+run deny.sh PARAM_METADATA_PATH=metadata.json PARAM_RUN_RECORD=true
+check "with metadata_path, records the licence files of the local packages it names" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "license") | .path] | sort | join(",")' \
+    "${CASE}/work/app/LICENSE,${CASE}/work/app/TERMS"
 deny_case
 run deny.sh PARAM_CHECKS=advisory
 check "checks refuses a check cargo deny doesn't have" failed
@@ -1649,6 +1679,10 @@ DEFAULTS=(PARAM_BINARIES=app PARAM_CYCLONEDX=false PARAM_OUTPUT_DIR=/will/be/set
 
 begin "verify_auditable"
 bin_case
+echo AUDITABLE > "${CASE}/work/-app"
+run verify_auditable.sh PARAM_BINARIES=-app
+check "reads a binary whose name starts with a dash as ./-app" called rust-audit-info ./-app
+bin_case
 run verify_auditable.sh "PARAM_BINARIES=app target/release/*" PARAM_JUNIT=true
 check "succeeds" succeeded
 check "reads each binary with rust-audit-info" called rust-audit-info target/release/tool
@@ -1747,6 +1781,15 @@ check "records them in the run record" json_is "${CASE}/out/sbom.run-record.json
 check "with the workspace's manifests, which shape them" \
     json_is "${CASE}/out/sbom.run-record.json" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "work/Cargo.toml a/Cargo.toml"
 check "leaves CARGO_BUILD_TARGET alone without target" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
+sbom_case
+mkdir -p "${CASE}/work/legal"
+for file in LICENSE-MIT legal/terms.txt crates/a/COPYING crates/a/NOTICE; do echo "${file}" > "${CASE}/work/${file}"; done
+mkdir "${CASE}/work/crates/a/LICENSES"
+run sbom.sh PARAM_RUN_RECORD=true STUB_LICENSE_FILE=../../legal/terms.txt
+check "records the local packages' licence files, which cargo cyclonedx and cargo-deny read: LICENSE* and COPYING* files and license-file" \
+    json_is "${CASE}/out/sbom.run-record.json" '[.inputs[] | select(.role == "license") | .path] | sort | join(",")' \
+    "${CASE}/work/LICENSE-MIT,${CASE}/work/crates/a/COPYING,${CASE}/work/legal/terms.txt"
+check "with their hashes" json_is "${CASE}/out/sbom.run-record.json" '[.inputs[] | select(.role == "license") | .sha256 | strings] | length' 3
 sbom_case
 rm "${CASE}/work/Cargo.lock"
 run sbom.sh PARAM_LOCKED=false PARAM_RUN_RECORD=true
@@ -1854,6 +1897,8 @@ check "says it passed" said "Passed: cargo vet: success."
 check "records the store's files" json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "store")] | length' 2
 check "and the workspace's manifest" json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "manifest") | .path] | join(" ")' "${CASE}/work/Cargo.toml"
 check "and the counts" json_is "${CASE}/out/cargo-vet.run-record.json" .counts.vetted_with_exemptions 1
+check "and no licence files, which cargo vet doesn't read" \
+    json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "license")] | length' 0
 check "and the workspace's Cargo.lock, which cargo vet's graph comes from" \
     json_is "${CASE}/out/cargo-vet.run-record.json" '.inputs[] | select(.role == "lockfile") | .path' "${CASE}/work/Cargo.lock"
 vet_case
@@ -1939,6 +1984,33 @@ LIB_TEST() {
     OUTPUT=$(PATH="${STUBS}:${PATH}" bash -c 'set -euo pipefail; eval "${SCRIPT_RUST_SECURITY_LIB}"; '"$1" 2>&1)
     RC=$?
 }
+# rs_db_files_match, against databases holding things git status wouldn't
+# open, under a timeout, since opening a FIFO or /dev/zero never returns.
+db_match() {
+    # shellcheck disable=SC2016 # expanded by the helper's shell
+    OUTPUT=$(timeout 30 bash -c 'eval "${SCRIPT_RUST_SECURITY_LIB}"; rs_db_files_match "$1"' _ "$1" 2>&1)
+    RC=$?
+}
+new_case
+for kind in fifo devzero; do
+    make_db "${CASE}/${kind}" 1
+    if [[ "${kind}" == fifo ]]; then
+        mkfifo "${CASE}/${kind}/crates/smallvec/pipe"
+    else
+        ln -s /dev/zero "${CASE}/${kind}/crates/smallvec/zero"
+    fi
+    db_match "${CASE}/${kind}"
+    check "rs_db_files_match doesn't open an untracked ${kind} (exit ${RC})" succeeded
+    check "and says the files differ" said false
+done
+make_db "${CASE}/linked" 1
+ln -s RUSTSEC-2021-0003.md "${CASE}/linked/crates/smallvec/latest.md"
+"${REAL_GIT}" -C "${CASE}/linked" add -A && "${REAL_GIT}" -C "${CASE}/linked" -c user.name=t -c user.email=t@example.test commit -q -m link
+db_match "${CASE}/linked"
+check "a committed symbolic link matches its commit, hashed as a link" said true
+ln -sfn /etc/hostname "${CASE}/linked/crates/smallvec/latest.md"
+db_match "${CASE}/linked"
+check "and one pointed elsewhere doesn't" said false
 # shellcheck disable=SC2016 # expanded by the helpers
 LIB_TEST 'rs_list features "a, b,,c  \${X}"; printf "<%s>" "${RS_LIST[@]}"' X=d
 check "rs_list splits on commas and spaces" said "<a><b><c>"

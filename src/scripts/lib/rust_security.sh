@@ -368,6 +368,9 @@ rs_gate() {
 rs_run_record() {
     local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url match
     rs_path_manifest_inputs
+    case "$2" in
+        deny | licenses | sbom) rs_license_inputs ;;
+    esac
     for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
         role=${entry%%:*}
         path=${entry#*:}
@@ -483,14 +486,23 @@ rs_manifest_inputs() {
 # they aren't, and null when git can't tell. It hashes the files itself rather
 # than ask git status, which an index's skip-worktree (sparse) and
 # assume-unchanged entries mislead, and with --no-filters, so nothing the
-# repository's config names runs.
+# repository's config names runs. It opens regular files only: a symbolic
+# link is hashed as its target's path, as git commits it, and a FIFO, socket
+# or device, which no commit holds and which could block forever, is a
+# difference.
 rs_db_files_match() {
-    local committed files sums present i
-    local -a paths=() hashes=()
+    local committed files links other sums entry target i
+    local -a paths=() hashes=() lines=()
     if ! committed=$(git -C "$1" -c core.quotePath=false ls-tree -r --full-tree HEAD 2> /dev/null \
         | awk -F '\t' '{ split($1, f, " "); print f[3] " " $2 }' | LC_ALL=C sort) \
-        || ! files=$(cd "$1" && find . -path ./.git -prune -o ! -type d -print | sed 's|^\./||'); then
+        || ! files=$(cd "$1" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||') \
+        || ! links=$(cd "$1" && find . -path ./.git -prune -o -type l -print | sed 's|^\./||') \
+        || ! other=$(cd "$1" && find . -path ./.git -prune -o ! -type d ! -type f ! -type l -print); then
         echo null
+        return 0
+    fi
+    if [[ -n "${other}" ]]; then
+        echo false
         return 0
     fi
     if [[ -n "${files}" ]]; then
@@ -500,11 +512,21 @@ rs_db_files_match() {
         fi
         mapfile -t paths <<< "${files}"
         mapfile -t hashes <<< "${sums}"
+        for ((i = 0; i < ${#paths[@]}; i++)); do
+            lines+=("${hashes[i]:-} ${paths[i]}")
+        done
     fi
-    present=$(for ((i = 0; i < ${#paths[@]}; i++)); do
-        printf '%s %s\n' "${hashes[i]:-}" "${paths[i]}"
-    done | LC_ALL=C sort)
-    if [[ "${committed}" == "${present}" ]]; then
+    if [[ -n "${links}" ]]; then
+        while IFS= read -r entry; do
+            if ! target=$(cd "$1" && readlink "./${entry}") \
+                || ! sums=$(printf '%s' "${target}" | git -C "$1" hash-object --stdin 2> /dev/null); then
+                echo null
+                return 0
+            fi
+            lines+=("${sums} ${entry}")
+        done <<< "${links}"
+    fi
+    if [[ "${committed}" == "$(printf '%s\n' ${lines[@]+"${lines[@]}"} | LC_ALL=C sort)" ]]; then
         echo true
     else
         echo false
@@ -572,6 +594,71 @@ rs_path_manifest_inputs() {
         package && /^version = "/ { version = $0; sub(/^version = "/, "", version); sub(/"[ \t]*$/, "", version) }
         package && /^source = / { source = "yes" }
         END { flush() }' "${lockfile}")
+}
+
+# rs_license_inputs: adds to RS_INPUTS the licence files of the local
+# packages (those with no source: the workspace's and path packages), which
+# cargo-deny reads for a package without a licence expression, and cargo
+# cyclonedx for license-file: each package directory's regular files whose
+# names start with LICENSE or COPYING, as cargo-deny 0.20.2's
+# find_license_files lists them, and its license-file. The packages are those
+# of RS_INPUTS' metadata file, or else those whose manifests it lists. A
+# registry crate's files come with the crate, which the lockfile pins.
+rs_license_inputs() {
+    local entry metadata="" manifest license file path
+    local -A manifests=() listed=() licenses=() known=()
+    local -a candidates=()
+    for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
+        case "${entry}" in
+            manifest:*) manifests[${entry#manifest:}]=1 ;;
+            metadata:*) metadata=${entry#metadata:} ;;
+            license:*) known[${entry#license:}]=1 ;;
+        esac
+    done
+    # Each local package's manifest and license-file, tab-separated. cargo
+    # metadata gives license-file as the manifest has it, relative to the
+    # package's directory.
+    # shellcheck disable=SC2016 # jq program, not shell
+    local filter='.packages[]? | select(.source == null) | "\(.manifest_path)\t\(.license_file // "")"'
+    if [[ -n "${metadata}" ]]; then
+        while IFS=$'\t' read -r manifest license; do
+            licenses[${manifest}]=${license}
+        done < <(jq -r "${filter}" "${metadata}" 2> /dev/null)
+    elif command -v cargo > /dev/null 2>&1; then
+        # One cargo metadata call lists a whole workspace, so a manifest an
+        # earlier call listed needs none of its own.
+        for manifest in "${!manifests[@]}"; do
+            if [[ -n "${listed[${manifest}]:-}" ]]; then
+                continue
+            fi
+            listed[${manifest}]=1
+            while IFS=$'\t' read -r path license; do
+                listed[${path}]=1
+                if [[ -n "${manifests[${path}]:-}" ]]; then
+                    licenses[${path}]=${license}
+                fi
+            done < <(cargo metadata --no-deps --format-version 1 --manifest-path "${manifest}" 2> /dev/null | jq -r "${filter}" 2> /dev/null)
+        done
+    fi
+    for manifest in "${!licenses[@]}"; do
+        candidates=("${manifest%/*}"/LICENSE* "${manifest%/*}"/COPYING*)
+        license=${licenses[${manifest}]}
+        if [[ "${license}" == /* ]]; then
+            candidates+=("${license}")
+        elif [[ -n "${license}" ]]; then
+            candidates+=("${manifest%/*}/${license}")
+        fi
+        for file in "${candidates[@]}"; do
+            if [[ ! -f "${file}" ]]; then
+                continue
+            fi
+            path=$(cd "$(dirname "${file}")" && pwd)/${file##*/}
+            if [[ -z "${known[${path}]:-}" ]]; then
+                known[${path}]=1
+                RS_INPUTS+=("license:${path}")
+            fi
+        done
+    done
 }
 
 # rs_deny_inputs MANIFEST_PATH CONFIG_PATH [WORKSPACE_ROOT]: adds the files
