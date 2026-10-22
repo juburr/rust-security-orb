@@ -354,6 +354,13 @@ EOF
 
 printf '#!/usr/bin/env bash\necho "rustc 1.99.0 (stand-in)"\n' > "${STUBS}/rustc"
 
+# env: records its arguments, so a test can tell what reached a command line.
+{
+    echo '#!/bin/bash'
+    record
+    echo 'exec /usr/bin/env "$@"'
+} > "${STUBS}/env"
+
 # git: "clone" copies the repository FAKE_REMOTE (whatever the URL), recording
 # its arguments and whether an Authorization header came through the
 # environment; everything else is the real git.
@@ -482,6 +489,19 @@ for port in 65536 0000065536; do
     check "refuses port ${port}" said "ERROR: url's port must be 65535 or less."
     check "before cloning" call_count git-clone 0
 done
+# The url crate reads a host ending in a number as an IPv4 address, and
+# writes it (or refuses it) its own way.
+for host in 127.1 0x7f.0.0.1 2130706433 127.000.0.1 127.0.0.1. 256.0.0.1 mirror.0x10; do
+    new_case
+    run fetch_advisory_db.sh "PARAM_URL=https://${host}/advisory-db"
+    check "refuses the host ${host}, which the url crate doesn't keep as written" said "ERROR: url's host must be a name, or an IPv4 address"
+    check "before cloning" call_count git-clone 0
+done
+for host in 192.0.2.10 0.0.0.0 mirror1.example.test 1mirror.example.test; do
+    new_case
+    run fetch_advisory_db.sh "PARAM_URL=https://${host}/advisory-db"
+    check "takes the host ${host}" succeeded
+done
 
 begin "fetch_advisory_db: fetching"
 new_case
@@ -524,6 +544,7 @@ run fetch_advisory_db.sh PARAM_AUTH_HEADER_ENV_VAR=MIRROR_AUTH "MIRROR_AUTH=Bear
 check "succeeds" succeeded
 check "reaches git through its environment" called_with git-clone "header=Authorization: Bearer s3cret-value"
 check "not its arguments" not_called_with git-clone "Authorization: Bearer s3cret-value"
+check "nor any other command's, such as env's" test -z "$(grep -rhF -- s3cret-value "${CALLS}" | grep -v '^header=')"
 check "and is never printed" not_said "s3cret-value"
 new_case
 run fetch_advisory_db.sh PARAM_AUTH_HEADER_ENV_VAR=MIRROR_AUTH
@@ -892,6 +913,12 @@ check "and warns that the binary is not one the install command verified" \
 audit_case
 run audit.sh
 check "a verified binary gets no such warning" not_said "install command verified"
+audit_case
+run audit.sh PARAM_RUN_RECORD=true "PARAM_EXTRA_ARGS=--url https://ci:s3cret-token@mirror.example.test/advisory-db?access_token=s3cret-token#x -uhttps://ci:s3cret-token@mirror.example.test/db"
+check "records a URL in the arguments without its credentials, query or fragment" \
+    json_is "${CASE}/out/cargo-audit.run-record.json" '.arguments[3:] | join(" ")' \
+    "--url https://mirror.example.test/advisory-db -uhttps://mirror.example.test/db"
+check "which reach the run record nowhere" not_file_has "${CASE}/out/cargo-audit.run-record.json" "s3cret-token"
 audit_case
 mkdir -p "${CASE}/nosha"
 printf '#!/bin/sh\necho "sha512sum: not available" >&2\nexit 127\n' > "${CASE}/nosha/sha512sum"
@@ -1439,6 +1466,12 @@ check "records them in the run record" json_is "${CASE}/out/sbom.run-record.json
 check "with the workspace's manifests, which shape them" \
     json_is "${CASE}/out/sbom.run-record.json" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "work/Cargo.toml a/Cargo.toml"
 check "leaves CARGO_BUILD_TARGET alone without target" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
+sbom_case
+echo '{"bomFormat":"CycloneDX","components":[]}' > "${CASE}/work/crates/a/just-written.cdx.json"
+run sbom.sh
+check "leaves an SBOM written just before the step, in the same second, where it was" exists "${CASE}/work/crates/a/just-written.cdx.json"
+check "and out of output_dir" absent "${CASE}/out/sbom/crates/a/just-written.cdx.json"
+check "taking only the SBOMs cargo cyclonedx wrote" said "Wrote 2 SBOMs to ${CASE}/out/sbom."
 sbom_case
 run sbom.sh STUB_CDX=busy
 check "leaves other JSON files written meanwhile in the workspace" exists "${CASE}/work/crates/a/package.json"

@@ -391,7 +391,7 @@ rs_run_record() {
         # A remote URL can carry credentials (https://user:token@host/... or
         # ?access_token=...), which must not reach a stored artifact.
         url=$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)
-        url=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#' <<< "${url}")
+        url=$(sed -E 's|^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@|\1|' <<< "${url}")
         url=${url%%[?#]*}
         db_json=$(jq -cn --arg path "${RS_DB}" \
             --arg url "${url}" \
@@ -401,12 +401,16 @@ rs_run_record() {
                 commit_time: (if $time == "" then null else $time end)}')
     fi
     # NUL-separated, so arguments that start with "-" never reach jq's own
-    # option parsing.
+    # option parsing. A URL among them, such as cargo audit's --url from
+    # extra_args, loses its userinfo, query and fragment, as the database's
+    # URL does.
     args="[]"
     if [[ -n "${RS_ARGS[*]+set}" ]]; then
         # Ended by a word rather than a NUL, which jq 1.6 drops from the
         # end of raw input.
-        args=$({ printf '%s\0' "${RS_ARGS[@]}"; printf 'end'; } | jq -Rsc 'split("\u0000") | .[:-1]')
+        args=$({ printf '%s\0' "${RS_ARGS[@]}"; printf 'end'; } | jq -Rsc 'split("\u0000") | .[:-1]
+            | map(gsub("(?<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/?#\\s]*@"; "\(.scheme)")
+                | gsub("(?<url>[A-Za-z][A-Za-z0-9+.-]*://[^?#\\s]*)[?#]\\S*"; "\(.url)"))')
     fi
     toolchain=$(jq -cn --arg cargo "$(cargo --version 2> /dev/null || true)" --arg rustc "$(rustc --version 2> /dev/null || true)" \
         '{cargo: (if $cargo == "" then null else $cargo end), rustc: (if $rustc == "" then null else $rustc end)}')

@@ -113,6 +113,17 @@ if [[ "${URL_PATH}/" =~ /(\.|\.\.|%2e|%2e%2e|\.%2e|%2e\.)/ ]]; then
     echo "ERROR: url's path must not have . or .. segments." >&2
     exit 1
 fi
+# The url crate reads a host whose last label is a number (decimal, or hex
+# with 0x) as an IPv4 address, and writes it as four decimal numbers, so
+# 127.1 is 127.0.0.1. Only that form keeps the directory name cargo-deny
+# computes.
+LABEL=${HOST%.}
+LABEL=${LABEL##*.}
+OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+if rs_match "${LABEL}" '^([0-9]+|0x[0-9a-f]*)$' && ! rs_match "${HOST}" "^${OCTET}(\\.${OCTET}){3}\$"; then
+    echo "ERROR: url's host must be a name, or an IPv4 address written as four decimal numbers from 0 to 255, such as 192.0.2.10." >&2
+    exit 1
+fi
 # The url crate reads the port as a number, so :0443 is https's default port,
 # which it leaves out, and :08080 is :8080.
 if [[ -n "${PORT}" ]]; then
@@ -171,18 +182,24 @@ if [[ -n "${IMPORT}" ]]; then
     fi
 else
     echo "Fetching the advisory database from ${URL}..."
-    GIT_ENV=(env GIT_TERMINAL_PROMPT=0)
     if [[ -n "${AUTH_ENV_VAR}" ]]; then
         rs_env_var_name auth_header_env_var "${AUTH_ENV_VAR}"
         if [[ -z "${!AUTH_ENV_VAR:-}" ]]; then
             echo "ERROR: auth_header_env_var names ${AUTH_ENV_VAR}, which is empty or not set." >&2
             exit 1
         fi
-        # The header reaches git through its environment, never its command
-        # line, and nothing here prints it.
-        GIT_ENV+=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader "GIT_CONFIG_VALUE_0=Authorization: ${!AUTH_ENV_VAR}")
     fi
-    if ! "${GIT_ENV[@]}" git clone --quiet --depth 1 -- "${URL}" "${STAGED}"; then
+    # The header reaches git through its environment, exported by the shell
+    # itself, so it is on no command line (not even env's), and nothing here
+    # prints it.
+    if ! (
+        export GIT_TERMINAL_PROMPT=0
+        if [[ -n "${AUTH_ENV_VAR}" ]]; then
+            export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
+            export GIT_CONFIG_VALUE_0="Authorization: ${!AUTH_ENV_VAR}"
+        fi
+        git clone --quiet --depth 1 -- "${URL}" "${STAGED}"
+    ); then
         echo "ERROR: Could not clone ${URL}. Check the URL and the job's network access; re-run the job if the host was failing." >&2
         exit 1
     fi

@@ -136,10 +136,14 @@ if [[ "${LOCKED}" == true ]]; then
     fi
 fi
 
-# Files cargo cyclonedx writes from now on are newer than this marker (made a
-# second early for file systems that keep whole seconds).
+# Files cargo cyclonedx writes from now on are newer than this marker, and an
+# SBOM written before it isn't, even where file times keep whole seconds:
+# cargo cyclonedx starts once the clock has passed the marker's second.
 MARKER="${RS_BASE}.marker"
-touch -d "@$(($(date +%s) - 1))" "${MARKER}"
+touch "${MARKER}"
+while [[ "$(date +%s)" -le "$(date -r "${MARKER}" +%s)" ]]; do
+    sleep 0.1
+done
 echo "Writing CycloneDX ${SPEC_VERSION} SBOMs (${DESCRIBE}) with ${RS_TOOL_VERSION:-cargo-cyclonedx}..."
 RC=0
 "${ENV_ARGS[@]}" "${RS_TOOL}" "${RS_ARGS[@]}" > "${RS_BASE}.log" 2>&1 || RC=$?

@@ -11,7 +11,8 @@ parameters:
     default: "https://github.com/RustSec/advisory-db"
     description: >
       The advisory database's git repository: RustSec's, or an internal mirror of it, over
-      https, with a path of plain ASCII and no . or .. segments. Use the URL your deny.toml's db-urls names, if it names one, since the directory
+      https, with a path of plain ASCII and no . or .. segments, and a host that is a name or an
+      IPv4 address written as four decimal numbers. Use the URL your deny.toml's db-urls names, if it names one, since the directory
       cargo deny reads is named after the URL. A database whose newest commit is dated in
       the future fails the step, since neither tool could tell it is stale. Environment
       variables are expanded.
