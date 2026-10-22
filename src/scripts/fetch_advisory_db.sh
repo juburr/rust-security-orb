@@ -143,17 +143,19 @@ if [[ ! -d "${STAGED}/.git" || -L "${STAGED}/.git" ]]; then
     echo "  Import a copy with its .git directory, such as the archive fetch_advisory_db writes." >&2
     exit 1
 fi
-# The copy must also be self-contained. A symbolic link could lead outside
-# it: in .git, git's writes, and anywhere else cargo-audit's and cargo-deny's
-# reads of the advisories, to contents neither the commit nor the archive
-# holds, even when the link itself is committed. A repository kept elsewhere
-# (commondir, as in a linked worktree) or objects borrowed from one
-# (alternates, from git clone's --reference or --shared) would leave an
-# archive that can't be imported without that repository.
-LINK=$(find "${STAGED}" -type l -print -quit)
-if [[ -n "${LINK}" ]]; then
-    echo "ERROR: The advisory database holds a symbolic link (${LINK#"${STAGED}/"}), which git or the tools could follow" >&2
-    echo "  outside the copy. Use a copy without symbolic links, such as the archive fetch_advisory_db writes." >&2
+# The copy must also be self-contained, plain files and directories only. A
+# symbolic link could lead outside it: in .git, git's writes, and anywhere
+# else cargo-audit's and cargo-deny's reads of the advisories, to contents
+# neither the commit nor the archive holds, even when the link itself is
+# committed. A FIFO, socket or device, such as a FIFO at .git/config, would
+# block git or the tools forever. A repository kept elsewhere (commondir, as
+# in a linked worktree) or objects borrowed from one (alternates, from git
+# clone's --reference or --shared) would leave an archive that can't be
+# imported without that repository.
+ODD=$(find "${STAGED}" ! -type f ! -type d -print -quit)
+if [[ -n "${ODD}" ]]; then
+    echo "ERROR: The advisory database holds ${ODD#"${STAGED}/"}, which is a symbolic link, FIFO, socket or device: git or the" >&2
+    echo "  tools could follow it outside the copy or block on it. Use a copy of plain files, such as the archive fetch_advisory_db writes." >&2
     exit 1
 fi
 if [[ -e "${STAGED}/.git/commondir" ]]; then

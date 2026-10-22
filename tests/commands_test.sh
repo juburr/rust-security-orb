@@ -719,8 +719,19 @@ for target in /etc/hostname /etc; do
     "${REAL_GIT}" -C "${CASE}/linking" add -A && "${REAL_GIT}" -C "${CASE}/linking" -c user.name=t -c user.email=t@example.test commit -q -m link
     run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/linking"
     check "refuses a copy with a committed symbolic link (to ${target}), which the tools would follow out of the copy" failed
-    check "saying so" said "symbolic link (crates/smallvec/RUSTSEC-0000-0009.md)"
+    check "saying so" said "crates/smallvec/RUSTSEC-0000-0009.md, which is a symbolic link"
     check "leaving nothing behind" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+done
+for place in .git/config crates/smallvec/pipe; do
+    new_case
+    cp -a "${REMOTE}" "${CASE}/piped"
+    rm -f "${CASE}/piped/${place}"
+    mkfifo "${CASE}/piped/${place}"
+    OUTPUT=$(cd "${CASE}/work" && env -u CARGO_HOME -u RUSTSEC_ADVISORY_DB PATH="${STUBS}:${PATH}" HOME="${CASE}/home" \
+        BASH_ENV="${CASE}/bash_env" "${DEFAULTS[@]}" "PARAM_IMPORT=${CASE}/piped" timeout 30 bash "${SCRIPTS}/fetch_advisory_db.sh" 2>&1)
+    RC=$?
+    check "refuses a copy with a FIFO at ${place}, which git or the tools would block on (exit ${RC})" failed
+    check "saying so" said "${place}, which is a symbolic link, FIFO, socket or device"
 done
 new_case
 "${REAL_GIT}" clone -q --shared "${REMOTE}" "${CASE}/borrowing"
