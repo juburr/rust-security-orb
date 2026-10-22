@@ -55,6 +55,13 @@ for word in ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}; do
             echo "ERROR: extra_args can't set ${word%%=*}: use the ${parameter//-/_} parameter, which the run record follows." >&2
             exit 1
             ;;
+        # cargo vet passes --cargo-arg values on to cargo metadata, whose
+        # --manifest-path would check another workspace than the one recorded.
+        --cargo-arg=--manifest-path | --cargo-arg=--manifest-path=*)
+            echo "ERROR: extra_args can't pass --manifest-path to cargo with --cargo-arg: use the manifest_path parameter, which the" >&2
+            echo "  run record follows." >&2
+            exit 1
+            ;;
     esac
 done
 

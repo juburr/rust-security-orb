@@ -231,8 +231,10 @@ case "${mode}" in
     nolabel)
         echo '{"type":"diagnostic","fields":{"severity":"warning","code":"license-not-encountered","message":"license was not encountered","labels":[]}}' >&2
         ;;
+    # The ignore reason label's span is the reason's text: STUB_REASON, or else "never called".
     ignored-reason)
-        echo '{"type":"diagnostic","fields":{"severity":"note","code":"advisory-ignored","message":"advisory was not encountered","labels":[{"message":"advisory ignored here","span":"RUSTSEC-2021-0003"},{"message":"ignore reason","span":"never called"}]}}' >&2 ;;
+        printf '{"type":"diagnostic","fields":{"severity":"note","code":"advisory-ignored","message":"advisory was not encountered","labels":[{"message":"advisory ignored here","span":"RUSTSEC-2021-0003"},{"message":"ignore reason","span":"%s"}]}}\n' \
+            "${STUB_REASON-never called}" >&2 ;;
 esac
 printf '{"type":"summary","fields":{"advisories":%s,"bans":%s,"licenses":%s,"sources":%s}}\n' "${adv}" "${bans}" "${zero}" "${zero}" >&2
 if [[ "${args}" == *" --audit-compatible-output "* ]]; then echo '{"vulnerabilities":[]}'; fi
@@ -1483,6 +1485,12 @@ check "counted in the run record" json_is "${CASE}/out/cargo-deny.run-record.jso
 deny_case
 run deny.sh STUB_DENY=ignored-reason PARAM_REQUIRE_IGNORE_REASONS=true
 check "an ignore with a reason passes" succeeded
+for reason in "" "  "; do
+    deny_case
+    run deny.sh STUB_DENY=ignored-reason "STUB_REASON=${reason}" PARAM_REQUIRE_IGNORE_REASONS=true
+    check "an ignore whose reason is blank (\"${reason}\"), which cargo deny accepts, counts as one without a reason" failed
+    check "naming the advisory" said "Ignored without a reason in deny.toml: RUSTSEC-2021-0003"
+done
 deny_case
 run deny.sh STUB_DENY=ignored-bare
 check "an ignore without a reason passes unless require_ignore_reasons is true" succeeded
@@ -2088,13 +2096,17 @@ check "passes the options after the subcommand, with --locked for frozen" \
 vet_case
 run vet.sh PARAM_EXTRA_ARGS=--output-format=human
 check "refuses --output-format in extra_args" failed
-for word in "--store-path=lenient" "--store-path lenient" "--manifest-path other/Cargo.toml"; do
+for word in "--store-path=lenient" "--store-path lenient" "--manifest-path other/Cargo.toml" \
+    "--cargo-arg=--manifest-path=other/Cargo.toml" "--cargo-arg=--manifest-path --cargo-arg=other/Cargo.toml"; do
     vet_case
     run vet.sh "PARAM_EXTRA_ARGS=${word}"
     check "refuses ${word} in extra_args, which the run record wouldn't follow" failed
     check "naming the parameter to use" said "use the $([[ "${word}" == --store* ]] && echo store_path || echo manifest_path) parameter"
     check "before running cargo vet" not_called_with cargo-vet vet check
 done
+vet_case
+run vet.sh "PARAM_EXTRA_ARGS=--cargo-arg=--offline"
+check "passes other arguments for cargo" called_with cargo-vet vet check --cargo-arg=--offline
 vet_case
 run vet.sh "PATH=$(path_without cargo)"
 check "needs cargo" failed

@@ -248,9 +248,10 @@ if [[ "${SARIF}" == true ]]; then
 fi
 
 # Advisories ignored in deny.toml without a reason: cargo-deny notes each
-# ignore that applied, with its reason as a label when it has one.
+# ignore that applied, with its reason as a label when it has one, whose span
+# is the reason's text. A reason of only spaces, or "", gives none.
 MISSING_REASONS=$(jq -c 'select(.type? == "diagnostic" and (.fields.code == "advisory-ignored" or .fields.code == "yanked-ignored"))
-    | select([.fields.labels[]?.message] | index("ignore reason") | not)
+    | select([.fields.labels[]? | select(.message == "ignore reason" and ((.span // "") | test("[^[:space:]]")))] | length == 0)
     | .fields.labels[0].span' "${JSONL}" | jq -sc '.')
 # shellcheck disable=SC2034 # read by rs_run_record
 RS_COUNTS=$(jq -c --argjson missing "${MISSING_REASONS}" '. + {ignores_without_reason: ($missing | length)}' <<< "${SUMMARY}")

@@ -113,8 +113,8 @@ parameters:
     default: false
     description: >
       Fail when an advisory or yanked crate ignored in deny.toml has no reason ({ id =
-      "RUSTSEC-...", reason = "..." }). It reads cargo deny's own report of each ignore it
-      applied, so only ignores that matched count.
+      "RUSTSEC-...", reason = "..." }), or a blank one. It reads cargo deny's own report of
+      each ignore it applied, so only ignores that matched count.
   audit_compatible_output:
     type: boolean
     default: false

@@ -290,7 +290,7 @@ The orb adds no exception file. Each tool already has one:
   ]
   ```
 
-  With `require_ignore_reasons: true`, `deny` fails when an ignore that applied has no reason, and lists it. It reads cargo-deny's own report of the ignores it applied, so only entries that matched an advisory count.
+  With `require_ignore_reasons: true`, `deny` fails when an ignore that applied has no reason, or one of only spaces, and lists it. It reads cargo-deny's own report of the ignores it applied, so only entries that matched an advisory count.
 - **`.cargo/audit.toml`** takes bare advisory IDs under `[advisories] ignore`, with no field for a reason. Teams that need justified exceptions should keep them in `deny.toml` and run `deny`'s advisories check, or keep a comment above each entry by convention.
 
 Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a field only this orb understood would tie every adopter to it.
@@ -387,7 +387,7 @@ Runs `cargo deny check` against the project's `deny.toml`: advisories, bans, lic
 | `offline` | `false` | Fetch nothing: no database update (use `fetch_advisory_db`), and cargo metadata from cargo's cache only. With `[bans.std-replacements]` in `deny.toml`, run `cargo deny fetch std-replacement` earlier in the job: without that data cargo deny skips the check, and the step fails rather than pass without it. |
 | `locked`, `frozen` | `false` | Fail when `Cargo.lock` is out of date; `frozen` is `locked` and `offline`. |
 | `allow`, `warn`, `deny` | *(empty)* | Diagnostic codes or levels to allow, warn on or deny, separated by commas or spaces. Prefer `deny.toml`, where a reason can go with them. |
-| `require_ignore_reasons` | `false` | Fail when an advisory or yanked crate ignored in `deny.toml` has no reason. |
+| `require_ignore_reasons` | `false` | Fail when an advisory or yanked crate ignored in `deny.toml` has no reason, or a blank one. |
 | `audit_compatible_output` | `false` | Also write the advisories in cargo audit's JSON format, to `<report_name>.audit.json`. |
 | `working_dir`, `extra_args` | | As for `audit`. `--format` is refused in `extra_args`, and so is `--audit-compatible-output`: use `audit_compatible_output`, which keeps that report. `extra_args` takes only options and their values, since cargo deny would read any other word as a check to run: use `checks`. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-deny`. |
@@ -452,7 +452,7 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 | `frozen` | `false` | Also keep cargo metadata off the network. |
 | `features`, `no_default_features`, `no_all_features` | | The feature set. cargo vet checks every feature unless `no_all_features` is true. |
 | `filter_graph` | *(empty)* | A `--filter-graph` expression, such as `exclude(eq(is_dev_only(true)))`. |
-| `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. `--store-path` and `--manifest-path` are refused in `extra_args`: use `store_path` and `manifest_path`, which the run record follows. |
+| `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. `--store-path` and `--manifest-path` are refused in `extra_args`, and so is `--manifest-path` passed to cargo with `--cargo-arg`: use `store_path` and `manifest_path`, which the run record follows. |
 | `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-vet`. |
 
 String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except `output_dir`, `report_name` and `install`'s `tools`, which CircleCI reads when it compiles the config, before the job's environment exists. In `extra_args` and the lists, that happens before the value is split, so quote a variable that may hold spaces.
