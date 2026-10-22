@@ -89,10 +89,15 @@ if [[ "${SARIF}" == true ]]; then
     if [[ "${RS_NO_FETCH}" != true ]]; then
         SARIF_ARGS+=(--no-fetch)
     fi
-    "${RS_TOOL}" "${SARIF_ARGS[@]}" --format sarif > "${RS_BASE}.sarif" 2>> "${LOG}" || true
+    SARIF_RC=0
+    "${RS_TOOL}" "${SARIF_ARGS[@]}" --format sarif > "${RS_BASE}.sarif" 2>> "${LOG}" || SARIF_RC=$?
     if ! rs_json_is "${RS_BASE}.sarif" '.version == "2.1.0" and (.runs | type == "array")'; then
         echo "ERROR: cargo audit did not write a SARIF report. Its output:" >&2
         sed 's/^/  /' "${LOG}" | tail -n 20 >&2
+        if [[ "${RUN_RECORD}" == true ]]; then
+            RS_REPORTS=("${JSON}" "${LOG}")
+            rs_run_record "${RS_BASE}.run-record.json" audit error "${SARIF_RC}" "${STARTED}"
+        fi
         exit 1
     fi
     RS_REPORTS+=("${RS_BASE}.sarif")

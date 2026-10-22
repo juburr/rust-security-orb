@@ -21,7 +21,7 @@
       "enum": ["passed", "findings", "findings-reported", "error"]
     },
     "exit_code": {
-      "description": "The tool's own exit code (for audit_bin, the last binary's; for verify_auditable, 1 when a binary has no data).",
+      "description": "The tool's own exit code (for audit_bin, the last binary's; for verify_auditable, 1 when a binary has no data; when a SARIF pass fails, that pass's).",
       "type": "integer"
     },
     "started_at": { "$ref": "#/$defs/timestamp" },
@@ -45,43 +45,11 @@
       "description": "The absolute directory the command ran in. Relative paths in arguments are relative to it.",
       "type": "string"
     },
-    "tool": {
-      "type": "object",
-      "required": ["name", "path", "version", "sha512", "install"],
-      "properties": {
-        "name": { "type": "string" },
-        "path": { "description": "The binary that ran.", "type": "string" },
-        "version": { "description": "What the binary reports as its version; empty when it reports none.", "type": "string" },
-        "sha512": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha512" }] },
-        "install": {
-          "description": "How the orb installed the binary that ran, from the record its install command left beside it. null when there is none, or when it describes another binary than the one that ran.",
-          "oneOf": [
-            { "type": "null" },
-            {
-              "type": "object",
-              "required": ["tool", "version", "arch", "method", "verify_checksums"],
-              "properties": {
-                "tool": { "type": "string" },
-                "version": { "type": "string" },
-                "arch": {
-                  "description": "The checksum table entry's architecture: amd64 or arm64 for a release binary, noarch for a crate's source archive, which is built for the machine it is installed on.",
-                  "enum": ["amd64", "arm64", "noarch"]
-                },
-                "method": {
-                  "description": "prebuilt: a release binary. source-built: built with cargo install --locked from a crate source archive.",
-                  "enum": ["prebuilt", "source-built"]
-                },
-                "asset": { "description": "The file that was verified: the release asset or the crate's source archive.", "type": "string" },
-                "asset_sha512": {
-                  "description": "The SHA-512 the orb's checksum table lists for it; empty when it was not verified.",
-                  "oneOf": [{ "const": "" }, { "$ref": "#/$defs/sha512" }]
-                },
-                "verify_checksums": { "enum": ["false", "known_versions", "strict"] }
-              }
-            }
-          ]
-        }
-      }
+    "tool": { "description": "The tool binary the command ran.", "$ref": "#/$defs/tool" },
+    "other_tools": {
+      "description": "Other binaries the command ran, each described as tool is: auditable2cdx for verify_auditable with cyclonedx, rust-audit-info for audit_bin with require_auditable, and none otherwise.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/tool" }
     },
     "arguments": {
       "description": "The arguments the tool ran with, after the binary's name, except the options the command adds to read the tool's results (cargo audit's --json, cargo deny's --format json and --log-level info, cargo vet's --output-format json and --output-file) and the binaries audit_bin and verify_auditable read, which are in inputs.",
@@ -146,6 +114,44 @@
   "$defs": {
     "timestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$" },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "sha512": { "type": "string", "pattern": "^[0-9a-f]{128}$" }
+    "sha512": { "type": "string", "pattern": "^[0-9a-f]{128}$" },
+    "tool": {
+      "type": "object",
+      "required": ["name", "path", "version", "sha512", "install"],
+      "properties": {
+        "name": { "type": "string" },
+        "path": { "description": "The binary that ran.", "type": "string" },
+        "version": { "description": "What the binary reports as its version; empty when it reports none.", "type": "string" },
+        "sha512": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha512" }] },
+        "install": {
+          "description": "How the orb installed the binary that ran, from the record its install command left beside it. null when there is none, or when it describes another binary than the one that ran.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["tool", "version", "arch", "method", "verify_checksums"],
+              "properties": {
+                "tool": { "type": "string" },
+                "version": { "type": "string" },
+                "arch": {
+                  "description": "The checksum table entry's architecture: amd64 or arm64 for a release binary, noarch for a crate's source archive, which is built for the machine it is installed on.",
+                  "enum": ["amd64", "arm64", "noarch"]
+                },
+                "method": {
+                  "description": "prebuilt: a release binary. source-built: built with cargo install --locked from a crate source archive.",
+                  "enum": ["prebuilt", "source-built"]
+                },
+                "asset": { "description": "The file that was verified: the release asset or the crate's source archive.", "type": "string" },
+                "asset_sha512": {
+                  "description": "The SHA-512 the orb's checksum table lists for it; empty when it was not verified.",
+                  "oneOf": [{ "const": "" }, { "$ref": "#/$defs/sha512" }]
+                },
+                "verify_checksums": { "enum": ["false", "known_versions", "strict"] }
+              }
+            }
+          ]
+        }
+      }
+    }
   }
 }

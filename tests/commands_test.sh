@@ -151,6 +151,7 @@ elif [[ "${mode}" == yanked-unchecked && "${args}" != *" --no-yanked "* ]]; then
     echo "error: couldn't check if the package is yanked: not found: No such crate in crates.io index: smallvec" >&2
 fi
 if [[ "${args}" == *" --format sarif "* && "${args}" != *" --json "* ]]; then
+    if [[ "${STUB_SARIF:-}" == crash ]]; then echo "thread 'main' panicked at src/sarif.rs" >&2; exit 101; fi
     echo '{"$schema":"https://json.schemastore.org/sarif-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"cargo-audit"}},"results":[]}]}'
     exit "${rc}"
 fi
@@ -189,6 +190,7 @@ if [[ "${mode}" == crash ]]; then
     exit 1
 fi
 if [[ "${format}" == sarif ]]; then
+    if [[ "${STUB_SARIF:-}" == crash ]]; then echo "thread 'main' panicked at src/sarif.rs" >&2; exit 101; fi
     echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"cargo-deny"}},"results":[]}]}'
     exit 0
 fi
@@ -641,6 +643,13 @@ check "a non-zero exit with nothing reported fails even with report_only" failed
 check "saying so" said "ERROR: cargo audit exited with 1 but reported no vulnerability or warning."
 check "the run record says error" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
 audit_case
+run audit.sh STUB_SARIF=crash PARAM_REPORT_ONLY=1 PARAM_RUN_RECORD=1
+check "a SARIF pass that fails fails the step even with report_only" failed
+check "saying so, with its output" said "thread 'main' panicked at src/sarif.rs"
+check "the run record says error" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
+check "with the SARIF pass's exit code" json_is "${CASE}/out/cargo-audit.run-record.json" .exit_code 101
+check "and the report and log" json_is "${CASE}/out/cargo-audit.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-audit.json cargo-audit.log"
+audit_case
 run audit.sh STUB_AUDIT=yanked-unchecked
 check "a yanked check that couldn't run passes" succeeded
 check "with a warning naming the crate" said "WARN:   error: couldn't check if the package is yanked: not found: No such crate in crates.io index: smallvec"
@@ -751,6 +760,7 @@ RECORD="${CASE}/out/cargo-audit.run-record.json"
 check "names the binary that ran" json_is "${RECORD}" .tool.path "${CASE}/bin/cargo-audit"
 check "with its SHA-512" json_is "${RECORD}" .tool.sha512 "$(sha512sum "${CASE}/bin/cargo-audit" | awk '{ print $1 }')"
 check "and the install record that matches it" json_is "${RECORD}" .tool.install.method prebuilt
+check "and no other tools" json_is "${RECORD}" '.other_tools | length' 0
 check "records the lockfile's SHA-256" json_is "${RECORD}" '.inputs[0].sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
 check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "audit --file Cargo.lock"
 check "records the CircleCI job" json_is "${RECORD}" .ci.build_url https://circleci.example/1
@@ -760,7 +770,7 @@ echo "changed" >> "${CASE}/bin/cargo-audit"
 run audit.sh "PATH=${CASE}/bin:${STUBS}:${PATH}" PARAM_RUN_RECORD=1
 check "leaves out an install record that doesn't match the binary" json_is "${RECORD}" .tool.install null
 check "and warns that the binary is not one the install command verified" \
-    said "WARN: ${CASE}/bin/cargo-audit is not a cargo-audit this orb's install command verified against its checksum table."
+    said "WARN: ${CASE}/bin/cargo-audit is not the cargo-audit this orb's install command verified against its checksum table."
 audit_case
 run audit.sh
 check "a verified binary gets no such warning" not_said "install command verified"
@@ -834,6 +844,17 @@ check "naming it" said "1 carry no cargo-auditable data (require_auditable): dis
 check "listing it in the index" json_is "${CASE}/out/cargo-audit-bin.json" '.without_auditable_data[0]' dist/plain
 check "and in JUnit" file_has "${CASE}/out/junit/cargo-audit-bin.xml" 'classname="cargo-audit-bin.auditable" name="dist/plain"'
 bin_case
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 PARAM_RUN_RECORD=1
+check "require_auditable's run record names rust-audit-info as well" \
+    json_is "${CASE}/out/cargo-audit-bin.run-record.json" '.other_tools[0].install.tool' rust-audit-info
+bin_case
+mkdir -p "${CASE}/bin"
+cp "${STUBS}/rust-audit-info" "${CASE}/bin/rust-audit-info"
+echo "# changed" >> "${CASE}/bin/rust-audit-info"
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 "PATH=${CASE}/bin:${STUBS}:${PATH}"
+check "and warns about one the install command didn't verify" \
+    said "WARN: ${CASE}/bin/rust-audit-info is not the rust-audit-info this orb's install command verified"
+bin_case
 run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 "PATH=$(path_without rust-audit-info)"
 check "require_auditable needs rust-audit-info" failed
 check "saying how to install it" said "require_auditable needs rust-audit-info"
@@ -844,6 +865,13 @@ check "saying so" said "matches no file"
 bin_case
 run audit_bin.sh PARAM_BINARIES=
 check "no binaries fails" failed
+bin_case
+run audit_bin.sh STUB_SARIF=crash PARAM_RUN_RECORD=1
+check "a SARIF pass that fails fails the step" failed
+check "saying so" said "ERROR: cargo audit bin did not write a SARIF report for app."
+check "the run record says error" json_is "${CASE}/out/cargo-audit-bin.run-record.json" .outcome error
+check "with the SARIF pass's exit code" json_is "${CASE}/out/cargo-audit-bin.run-record.json" .exit_code 101
+check "and its log" json_is "${CASE}/out/cargo-audit-bin.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-audit-bin-app.json cargo-audit-bin-app.sarif.log"
 
 # --- deny
 DEFAULTS=(PARAM_CHECKS= PARAM_MANIFEST_PATH= PARAM_CONFIG_PATH= PARAM_METADATA_PATH= PARAM_FEATURES= PARAM_ALL_FEATURES=false
@@ -916,6 +944,13 @@ check "saying it didn't complete" said "ERROR: cargo deny did not complete (exit
 check "with cargo deny's own error" said "failed to validate configuration file deny.toml"
 check "without a SARIF pass" call_count cargo-deny 2
 check "the run record says error" json_is "${CASE}/out/cargo-deny.run-record.json" .outcome error
+deny_case
+run deny.sh STUB_SARIF=crash PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
+check "a SARIF pass that fails fails the step even with report_only" failed
+check "saying so" said "ERROR: cargo deny did not write a SARIF report."
+check "the run record says error" json_is "${CASE}/out/cargo-deny.run-record.json" .outcome error
+check "with the SARIF pass's exit code" json_is "${CASE}/out/cargo-deny.run-record.json" .exit_code 101
+check "and its log" json_is "${CASE}/out/cargo-deny.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-deny.jsonl cargo-deny.sarif.log"
 deny_case
 run deny.sh PARAM_CONFIG_PATH=missing.toml
 check "a config_path that doesn't exist fails" failed
@@ -1120,6 +1155,19 @@ run verify_auditable.sh PARAM_CYCLONEDX=true
 check "cyclonedx turns it into a CycloneDX SBOM" json_is "${CASE}/out/auditable-app.cdx.json" .specVersion 1.3
 check "with auditable2cdx" called auditable2cdx app
 check "listed in the index" json_is "${CASE}/out/auditable.json" '.binaries[0].sbom' "${CASE}/out/auditable-app.cdx.json"
+bin_case
+run verify_auditable.sh PARAM_CYCLONEDX=true PARAM_RUN_RECORD=true
+check "the run record names auditable2cdx as well" json_is "${CASE}/out/auditable.run-record.json" '.other_tools[0].path' "${STUBS}/auditable2cdx"
+check "with its SHA-512" json_is "${CASE}/out/auditable.run-record.json" '.other_tools[0].sha512' "$(sha512sum "${STUBS}/auditable2cdx" | awk '{ print $1 }')"
+check "and its install record" json_is "${CASE}/out/auditable.run-record.json" '.other_tools[0].install.tool' auditable2cdx
+bin_case
+mkdir -p "${CASE}/bin"
+cp "${STUBS}/auditable2cdx" "${CASE}/bin/auditable2cdx"
+echo "# changed" >> "${CASE}/bin/auditable2cdx"
+run verify_auditable.sh PARAM_CYCLONEDX=true PARAM_RUN_RECORD=true "PATH=${CASE}/bin:${STUBS}:${PATH}"
+check "an auditable2cdx the install command didn't verify gets the warning" \
+    said "WARN: ${CASE}/bin/auditable2cdx is not the auditable2cdx this orb's install command verified against its checksum table."
+check "and no install record in the run record" json_is "${CASE}/out/auditable.run-record.json" '.other_tools[0].install' null
 bin_case
 run verify_auditable.sh "PARAM_BINARIES=app dist/plain" PARAM_JUNIT=true PARAM_RUN_RECORD=true
 check "a binary without the data fails" failed

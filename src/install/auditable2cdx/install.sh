@@ -110,9 +110,34 @@ rs_install_record() {
     fi
 }
 
+# rs_require_glibc: stops before anything is downloaded when the release
+# build for this architecture links glibc (tool_glibc ARCH names the oldest
+# glibc it runs with) and the system has none that new. Alpine and other musl
+# systems have none.
+rs_require_glibc() {
+    local need found
+    if ! declare -F tool_glibc > /dev/null; then
+        return 0
+    fi
+    need=$(tool_glibc "${ORB_ARCH}")
+    if [[ -z "${need}" ]]; then
+        return 0
+    fi
+    found=$(getconf GNU_LIBC_VERSION 2> /dev/null) || found=""
+    found=${found#glibc }
+    # Versions compare as major * 1000 + minor.
+    if [[ "${found}" =~ ^([0-9]+)\.([0-9]+) ]] \
+        && (( 10#${BASH_REMATCH[1]} * 1000 + 10#${BASH_REMATCH[2]} >= 10#${need%%.*} * 1000 + 10#${need#*.} )); then
+        return 0
+    fi
+    orb_die "${TOOL_NAME}'s ${ORB_ARCH} release needs glibc ${need} or newer, and this system has ${found:+glibc }${found:-none (it may use musl, as Alpine does)}." \
+        "Use an image with glibc ${need} or newer, such as cimg/rust or the Debian-based rust images."
+}
+
 # rs_install_prebuilt: installs the release binary the shared install logic
 # downloads and verifies.
 rs_install_prebuilt() {
+    rs_require_glibc
     rs_download_base_url
     orb_install_binary
     rs_install_record prebuilt
@@ -124,6 +149,7 @@ rs_install_prebuilt() {
 # it is verified.
 rs_install_tar_xz() {
     local member=$1 dir="${ORB_WORK_DIR}/unpacked"
+    rs_require_glibc
     rs_download_base_url
     if ! command -v xz > /dev/null 2>&1; then
         orb_die "Installing ${TOOL_NAME} needs 'xz' to unpack its .tar.xz release, which is not available." \

@@ -58,6 +58,23 @@ for entry in "${TOOLS[@]}"; do
     if [[ ! -f "${ROOT}/src/commands/install_${tool//-/_}.yml" ]]; then
         fail "src/commands/install_${tool//-/_}.yml is missing"
     fi
+    # A release that links glibc must name the glibc it needs in tool_glibc,
+    # so the install stops before downloading it on a system without one.
+    gnu=$(
+        # shellcheck source=/dev/null
+        source <(block "${ROOT}/src/install/${tool}/install.sh" "# >>> tool definition >>>" "# <<< tool definition <<<")
+        if declare -F tool_target > /dev/null; then
+            for arch in ${TOOL_ARCHES}; do
+                if [[ "$(tool_target "${arch}")" == *-gnu* ]] \
+                    && { ! declare -F tool_glibc > /dev/null || [[ -z "$(tool_glibc "${arch}")" ]]; }; then
+                    printf '%s ' "${arch}"
+                fi
+            done
+        fi
+    )
+    if [[ -n "${gnu}" ]]; then
+        fail "${tool} downloads a glibc build for ${gnu% }, but tool_glibc doesn't name the glibc it needs"
+    fi
     if [[ -z "${first}" ]]; then
         first=${tool}
         continue
@@ -88,7 +105,7 @@ for dir in "${ROOT}"/src/install/*/; do
     fi
 done
 if [[ "${FAILURES}" -eq 0 ]]; then
-    echo "ok: every tool has its install.sh, install_hash.sh and command, and their shared parts are identical"
+    echo "ok: every tool has its install.sh, install_hash.sh and command, their shared parts are identical, and glibc builds name the glibc they need"
 fi
 
 SELECTED=()

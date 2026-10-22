@@ -193,17 +193,22 @@ rs_json_is() {
 # on the PATH: the install command leaves a record beside each binary it
 # installs, naming the binary's SHA-512.
 rs_tool() {
-    local record sha
-    # shellcheck disable=SC2034 # read by the script that evals this file
     if ! RS_TOOL=$(command -v "$1"); then
         echo "ERROR: $1 is not on the PATH. Install it in an earlier step with this orb's install command" >&2
         echo "  (tools: $1), or with install_${1//-/_}." >&2
         exit 1
     fi
-    record="$(dirname "${RS_TOOL}")/.$1.install.json"
-    sha=$(sha512sum "${RS_TOOL}" 2> /dev/null | awk '{ print $1 }') || sha=""
+    rs_tool_verified "$1" "${RS_TOOL}"
+}
+
+# rs_tool_verified NAME PATH: warns unless PATH is a NAME this orb's install
+# command verified, as the install record it leaves beside the binary says.
+rs_tool_verified() {
+    local record sha
+    record="$(dirname "$2")/.$1.install.json"
+    sha=$(sha512sum "$2" 2> /dev/null | awk '{ print $1 }') || sha=""
     if [[ -z "${sha}" || ! -f "${record}" ]] || ! grep -qF "\"binary_sha512\":\"${sha}\"" "${record}"; then
-        echo "WARN: ${RS_TOOL} is not a $1 this orb's install command verified against its checksum table." >&2
+        echo "WARN: $2 is not the $1 this orb's install command verified against its checksum table." >&2
         echo "WARN: Install $1 with the install command, and put its install_path first on the PATH, to run a verified one." >&2
     fi
 }
@@ -350,6 +355,7 @@ rs_gate() {
 # this command checked, so a reviewer can tell without running it again. It
 # reads what the command set:
 #   RS_TOOL          the tool binary that ran
+#   RS_OTHER_TOOLS   other binaries the command ran, as an array
 #   RS_ARGS          the arguments it ran with, as an array
 #   RS_INPUTS        "role:path" entries, such as "lockfile:Cargo.lock"
 #   RS_REPORTS       the report files written
@@ -358,8 +364,7 @@ rs_gate() {
 # OUTCOME is passed, findings, findings-reported (findings with report_only)
 # or error.
 rs_run_record() {
-    local file=$1 entry path role sha tool_json db_json="null" toolchain args inputs="[]" reports="[]" install="null"
-    local tool_sha="" url
+    local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url
     for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
         role=${entry%%:*}
         path=${entry#*:}
@@ -376,20 +381,10 @@ rs_run_record() {
             reports=$(jq -c --arg path "${path}" --arg sha "$(rs_sha256 "${path}")" '. + [{path: $path, sha256: $sha}]' <<< "${reports}")
         fi
     done
-    if [[ -n "${RS_TOOL:-}" && -f "${RS_TOOL}" ]]; then
-        # Without sha512sum the record says so with a null SHA-512, as rs_tool
-        # only warns.
-        tool_sha=$(sha512sum "${RS_TOOL}" 2> /dev/null | awk '{ print $1 }') || tool_sha=""
-        entry="$(dirname "${RS_TOOL}")/.${RS_TOOL##*/}.install.json"
-        # The install record counts only if it describes this very binary.
-        # shellcheck disable=SC2016 # jq program, not shell
-        if [[ -f "${entry}" ]] && rs_json_is "${entry}" '.binary_sha512 == $sha' --arg sha "${tool_sha}"; then
-            install=$(jq -c 'del(.binary_sha512)' "${entry}")
-        fi
-    fi
-    tool_json=$(jq -cn --arg name "${RS_TOOL##*/}" --arg path "${RS_TOOL:-}" --arg version "${RS_TOOL_VERSION:-}" \
-        --arg sha "${tool_sha}" --argjson install "${install}" \
-        '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end), install: $install}')
+    tool_json=$(rs_tool_json "${RS_TOOL:-}" "${RS_TOOL_VERSION:-}")
+    for path in ${RS_OTHER_TOOLS[@]+"${RS_OTHER_TOOLS[@]}"}; do
+        others=$(jq -c --argjson tool "$(rs_tool_json "${path}" "")" '. + [$tool]' <<< "${others}")
+    done
     if [[ -n "${RS_DB:-}" && ! -e "${RS_DB}/.git" ]]; then
         db_json=$(jq -cn --arg path "${RS_DB}" '{path: $path, url: null, commit: null, commit_time: null}')
     elif [[ -n "${RS_DB:-}" ]]; then
@@ -416,7 +411,7 @@ rs_run_record() {
         '{cargo: (if $cargo == "" then null else $cargo end), rustc: (if $rustc == "" then null else $rustc end)}')
     if ! jq -n --arg command "$2" --arg outcome "$3" --argjson code "$4" --arg started "$5" \
         --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg cwd "$(pwd)" \
-        --argjson tool "${tool_json}" --argjson toolchain "${toolchain}" --argjson db "${db_json}" \
+        --argjson tool "${tool_json}" --argjson others "${others}" --argjson toolchain "${toolchain}" --argjson db "${db_json}" \
         --argjson inputs "${inputs}" --argjson reports "${reports}" --argjson counts "${RS_COUNTS:-null}" \
         --arg build_url "${CIRCLE_BUILD_URL:-}" --arg sha1 "${CIRCLE_SHA1:-}" --arg job "${CIRCLE_JOB:-}" \
         --argjson args "${args}" '{
@@ -425,13 +420,32 @@ rs_run_record() {
             started_at: $started, finished_at: $finished,
             ci: (if $build_url == "" then null else {build_url: $build_url, sha1: $sha1, job: $job} end),
             working_directory: $cwd,
-            tool: $tool, arguments: $args, toolchain: $toolchain,
+            tool: $tool, other_tools: $others, arguments: $args, toolchain: $toolchain,
             advisory_db: $db, inputs: $inputs, counts: $counts, reports: $reports
         }' > "${file}"; then
         echo "WARN: Could not write the run record ${file}." >&2
         return 0
     fi
     echo "Run record: ${file}"
+}
+
+# rs_tool_json PATH VERSION: describes a binary that ran for the run record:
+# its SHA-512, and how the orb installed it, from the install record beside
+# it when that record describes this very binary.
+rs_tool_json() {
+    local sha="" install="null" entry
+    if [[ -n "$1" && -f "$1" ]]; then
+        # Without sha512sum the record says so with a null SHA-512, as rs_tool
+        # only warns.
+        sha=$(sha512sum "$1" 2> /dev/null | awk '{ print $1 }') || sha=""
+        entry="$(dirname "$1")/.${1##*/}.install.json"
+        # shellcheck disable=SC2016 # jq program, not shell
+        if [[ -f "${entry}" ]] && rs_json_is "${entry}" '.binary_sha512 == $sha' --arg sha "${sha}"; then
+            install=$(jq -c 'del(.binary_sha512)' "${entry}")
+        fi
+    fi
+    jq -cn --arg name "${1##*/}" --arg path "$1" --arg version "$2" --arg sha "${sha}" --argjson install "${install}" \
+        '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end), install: $install}'
 }
 
 # rs_deny_inputs MANIFEST_PATH CONFIG_PATH: adds the files cargo-deny reads to

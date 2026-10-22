@@ -172,10 +172,15 @@ if [[ "${SARIF}" == true ]]; then
     if [[ "${FROZEN}" != true && "${OFFLINE}" != true ]]; then
         SARIF_ARGS+=(--offline)
     fi
-    "${RS_TOOL}" "${SARIF_ARGS[@]}" "${CHECK_ARGS[@]}" > "${RS_BASE}.sarif" 2> "${RS_BASE}.sarif.log" || true
+    SARIF_RC=0
+    "${RS_TOOL}" "${SARIF_ARGS[@]}" "${CHECK_ARGS[@]}" > "${RS_BASE}.sarif" 2> "${RS_BASE}.sarif.log" || SARIF_RC=$?
     if ! rs_json_is "${RS_BASE}.sarif" '.version == "2.1.0" and (.runs | type == "array")'; then
         echo "ERROR: cargo deny did not write a SARIF report. Its output:" >&2
         sed 's/^/  /' "${RS_BASE}.sarif.log" | tail -n 20 >&2
+        if [[ "${RUN_RECORD}" == true ]]; then
+            RS_REPORTS+=("${RS_BASE}.sarif.log")
+            rs_run_record "${RS_BASE}.run-record.json" deny error "${SARIF_RC}" "${STARTED}"
+        fi
         exit 1
     fi
     rm -f "${RS_BASE}.sarif.log"

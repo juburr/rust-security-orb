@@ -37,6 +37,9 @@ if [[ "${REQUIRE_AUDITABLE}" == true ]]; then
         echo "  install command's tools, or use install_rust_audit_info." >&2
         exit 1
     fi
+    rs_tool_verified rust-audit-info "${AUDIT_INFO}"
+    # shellcheck disable=SC2034 # read by rs_run_record
+    RS_OTHER_TOOLS=("${AUDIT_INFO}")
 fi
 
 # Every binary named, with shell patterns expanded. A pattern that matches
@@ -147,11 +150,16 @@ for binary in "${BINARIES[@]}"; do
         if [[ "${RS_NO_FETCH}" != true ]]; then
             OPTS+=(--no-fetch)
         fi
+        sarif_rc=0
         "${RS_TOOL}" audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${OPTS[@]+"${OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} \
-            --format sarif bin "${binary}" > "${base}.sarif" 2> "${base}.sarif.log" || true
+            --format sarif bin "${binary}" > "${base}.sarif" 2> "${base}.sarif.log" || sarif_rc=$?
         if ! rs_json_is "${base}.sarif" '.version == "2.1.0"'; then
             echo "ERROR: cargo audit bin did not write a SARIF report for ${binary}. Its output:" >&2
             sed 's/^/  /' "${base}.sarif.log" | tail -n 20 >&2
+            if [[ "${RUN_RECORD}" == true ]]; then
+                RS_REPORTS+=("${base}.sarif.log")
+                rs_run_record "${RS_BASE}.run-record.json" audit_bin error "${sarif_rc}" "${STARTED}"
+            fi
             exit 1
         fi
         rm -f "${base}.sarif.log"

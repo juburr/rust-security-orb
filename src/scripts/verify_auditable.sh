@@ -28,6 +28,9 @@ if [[ "${CYCLONEDX}" == true ]]; then
         echo "  tools, or use install_auditable2cdx." >&2
         exit 1
     fi
+    rs_tool_verified auditable2cdx "${CDX}"
+    # shellcheck disable=SC2034 # read by rs_run_record
+    RS_OTHER_TOOLS=("${CDX}")
 fi
 
 rs_list binaries "${PARAM_BINARIES}"

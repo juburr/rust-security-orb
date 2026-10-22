@@ -2,7 +2,8 @@
 # Release binaries downloaded from GitHub (cargo-audit, cargo-deny,
 # cargo-auditable, cargo-cyclonedx). On top of the shared contract, the
 # download_base_url mirror: it replaces https://github.com in the release URL,
-# and what it serves is verified like any download.
+# and what it serves is verified like any download. Then the install record,
+# and the glibc an arm64 release that links it needs.
 fixture_checks() {
     local mirror="https://mirror.example/artifactory/github" mirror_url listed_file tampered_file
     begin "${TOOL_NAME}: download_base_url"
@@ -55,4 +56,26 @@ fixture_checks() {
     check "records a prebuilt install beside the binary" said '"method":"prebuilt"'
     check "with the version and the verified checksum" said "\"version\":\"${LISTED}\""
     check "and the installed binary's SHA-512" said "\"binary_sha512\":\"$(sha512sum "${CASE}/bin/${TOOL_BINARY}" | awk '{ print $1 }')\""
+    # A tool whose arm64 release links glibc (tool_glibc) is refused on an
+    # arm64 system without a glibc that new, before anything is downloaded.
+    if declare -F tool_glibc > /dev/null && [[ -n "$(tool_glibc arm64)" ]]; then
+        begin "${TOOL_NAME}: glibc for the arm64 release"
+        mkdir -p "${WORK}/getconf-musl" "${WORK}/getconf-old"
+        printf '#!/bin/sh\necho "getconf: GNU_LIBC_VERSION: unknown variable" >&2\nexit 1\n' > "${WORK}/getconf-musl/getconf"
+        printf '#!/bin/sh\necho "glibc 2.17"\n' > "${WORK}/getconf-old/getconf"
+        chmod +x "${WORK}/getconf-musl/getconf" "${WORK}/getconf-old/getconf"
+        new_case
+        run_install FAKE_ARCH=aarch64 "PATH=${WORK}/getconf-musl:${STUBS}:${PATH}"
+        check "refuses a system without glibc, such as Alpine" failed
+        check "saying what the release needs" said "${TOOL_NAME}'s arm64 release needs glibc $(tool_glibc arm64) or newer, and this system has none"
+        check "before downloading anything" no_downloads
+        new_case
+        run_install FAKE_ARCH=aarch64 "PATH=${WORK}/getconf-old:${STUBS}:${PATH}"
+        check "refuses an older glibc" failed
+        check "naming it" said "this system has glibc 2.17."
+        check "before downloading anything" no_downloads
+        new_case
+        run_install FAKE_ARCH=x86_64 "PATH=${WORK}/getconf-musl:${STUBS}:${PATH}"
+        check "installs the static amd64 release without glibc" installed
+    fi
 }
