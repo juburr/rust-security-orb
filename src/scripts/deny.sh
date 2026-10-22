@@ -117,9 +117,19 @@ fi
 
 CHECK_ARGS=(check)
 rs_list checks "${PARAM_CHECKS}"
+# cargo deny reads the advisory database only for the advisories check, which
+# runs when checks names it or all, or names nothing.
+READS_DB=false
+if [[ ${#RS_LIST[@]} -eq 0 ]]; then
+    READS_DB=true
+fi
 for check in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
     case "${check}" in
-        advisories | bans | licenses | sources | all) CHECK_ARGS+=("${check}") ;;
+        advisories | all)
+            READS_DB=true
+            CHECK_ARGS+=("${check}")
+            ;;
+        bans | licenses | sources) CHECK_ARGS+=("${check}") ;;
         *)
             echo "ERROR: checks takes advisories, bans, licenses, sources and all, not '${check}'." >&2
             exit 1
@@ -152,7 +162,7 @@ echo "Running cargo deny ${CHECK_ARGS[*]} with ${RS_TOOL_VERSION:-cargo-deny}...
 RC=0
 "${RS_TOOL}" --format json --log-level info "${RS_ARGS[@]}" 2> "${JSONL}" > "${RS_BASE}.audit.json" || RC=$?
 # The database cargo deny read, which it fetched just now unless offline.
-if [[ "${RUN_RECORD}" == true ]]; then
+if [[ "${RUN_RECORD}" == true && "${READS_DB}" == true ]]; then
     rs_deny_db
 fi
 if [[ "${AUDIT_COMPATIBLE}" == true && -s "${RS_BASE}.audit.json" ]]; then

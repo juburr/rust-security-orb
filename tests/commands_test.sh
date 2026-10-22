@@ -608,6 +608,11 @@ cp -a "${REMOTE}" "${CASE}/withcreds"
 "${REAL_GIT}" -C "${CASE}/withcreds" remote add origin "https://ci:s3cret-token@github.com/RustSec/advisory-db?access_token=s3cret-token"
 "${REAL_GIT}" -C "${CASE}/withcreds" config http.https://github.com/.extraheader "AUTHORIZATION: basic s3cret-token"
 "${REAL_GIT}" -C "${CASE}/withcreds" config url.https://ci:s3cret-token@mirror.example.test/.insteadOf https://mirror.example.test/
+"${REAL_GIT}" -C "${CASE}/withcreds" config http.proxy "https://ci:s3cret-token@proxy.example.test"
+"${REAL_GIT}" -C "${CASE}/withcreds" config remote.origin.proxy "https://ci:s3cret-token@proxy.example.test"
+printf '#!/bin/sh\ntouch "%s"\n' "${CASE}/fsmonitor-ran" > "${CASE}/fsmonitor"
+chmod +x "${CASE}/fsmonitor"
+"${REAL_GIT}" -C "${CASE}/withcreds" config core.fsmonitor "${CASE}/fsmonitor"
 run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/withcreds" "PARAM_ARCHIVE=${CASE}/out/advisory-db.tar.gz"
 check "imports a copy whose git config holds credentials" succeeded
 check "keeping its remote without them" \
@@ -616,6 +621,16 @@ check "and dropping its http.extraHeader and insteadOf" not_file_has "${CASE}/ho
 mkdir -p "${CASE}/unpacked" && tar -xzf "${CASE}/out/advisory-db.tar.gz" -C "${CASE}/unpacked"
 check "so the archive holds none of them" test -z "$(grep -rl s3cret-token "${CASE}/unpacked/.git" 2> /dev/null)"
 check "nor the log" not_said "s3cret-token"
+check "and git ran none of the copy's own commands, such as its core.fsmonitor" absent "${CASE}/fsmonitor-ran"
+check "keeping the settings a checkout needs" \
+    test "$("${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" config --get core.repositoryformatversion)" = 0
+new_case
+cp -a "${REMOTE}" "${CASE}/linked"
+mv "${CASE}/linked/.git" "${CASE}/linked-gitdir"
+echo "gitdir: ${CASE}/linked-gitdir" > "${CASE}/linked/.git"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/linked"
+check "refuses a copy whose .git only points to another directory" failed
+check "saying it needs its own .git directory" said "not a git checkout with its own .git directory"
 for change in "rm crates/smallvec/RUSTSEC-2021-0003.md" "echo changed >> crates/smallvec/RUSTSEC-2021-0003.md" \
     "mkdir crates/x && echo extra > crates/x/RUSTSEC-0000-0001.md"; do
     new_case
@@ -928,6 +943,13 @@ run audit.sh
 check "a backslash outside a name is no escaped name" succeeded
 audit_case
 mkdir -p "${CASE}/work/.cargo"
+printf '[output]\ndeny = ["uns\\u006fund"]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh
+check "a denied kind written with escapes fails, rather than be missed" failed
+check "saying how to write it" said "writes output.deny as a multiline string or with escapes"
+check "before running cargo audit" call_count cargo-audit 0
+audit_case
+mkdir -p "${CASE}/work/.cargo"
 printf 'database = { fetch = false }\n' > "${CASE}/work/.cargo/audit.toml"
 run audit.sh
 check "an inline database table fails, rather than be ignored" failed
@@ -1228,6 +1250,17 @@ RECORD="${CASE}/out/cargo-deny.run-record.json"
 check "records the deny.toml cargo deny finds above the manifest" json_is "${RECORD}" '.inputs[] | select(.role == "config") | .path' "${CASE}/work/deny.toml"
 check "and the workspace's lockfile" json_is "${RECORD}" '.inputs[] | select(.role == "lockfile") | .sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
 check "records the database cargo deny reads" json_is "${RECORD}" .advisory_db.commit "$(git -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" log -1 --format=%H)"
+for checks in "bans licenses" "sources"; do
+    deny_case
+    make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+    run deny.sh PARAM_RUN_RECORD=true "PARAM_CHECKS=${checks}"
+    check "but none when checks (${checks}) leaves out advisories, so cargo deny reads no database" \
+        json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+done
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+run deny.sh PARAM_RUN_RECORD=true "PARAM_CHECKS=bans advisories"
+check "and does when checks names advisories" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path | split("/")[-1]' "${DB_NAME}"
 check "records every report" json_is "${RECORD}" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-deny.jsonl cargo-deny.sarif"
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
@@ -1647,6 +1680,12 @@ begin "vet"
 vet_case
 run vet.sh PARAM_RUN_RECORD=true
 check "succeeds" succeeded
+check "warns that without locked the run record can't hash the imported audits cargo vet fetched" said "WARN: Without locked, cargo vet fetches imported audits"
+vet_case
+run vet.sh PARAM_RUN_RECORD=true PARAM_LOCKED=true
+check "but not with locked" not_said "WARN: Without locked"
+vet_case
+run vet.sh PARAM_RUN_RECORD=true
 check "runs cargo-vet with the job's cargo, writing JSON" called cargo-vet vet check --output-format json --output-file "${CASE}/out/cargo-vet.json"
 check "writes the report" json_is "${CASE}/out/cargo-vet.json" .conclusion success
 check "says it passed" said "Passed: cargo vet: success."

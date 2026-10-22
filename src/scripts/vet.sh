@@ -74,6 +74,13 @@ fi
 if [[ "${FROZEN}" == true ]]; then
     RS_ARGS+=(--frozen)
 fi
+# Without --locked cargo vet fetches the imported audits, and a check that
+# fails doesn't write them to imports.lock, so the store the run record
+# hashes isn't what decided it.
+if [[ "${RUN_RECORD}" == true && "${LOCKED}" != true && "${FROZEN}" != true ]]; then
+    echo "WARN: Without locked, cargo vet fetches imported audits and, when the check fails, doesn't write them to" >&2
+    echo "WARN: imports.lock, so the run record can't hash the audits that decided it. Keep locked on for a record that does." >&2
+fi
 rs_list features "${PARAM_FEATURES}"
 if [[ ${#RS_LIST[@]} -gt 0 ]]; then
     RS_ARGS+=(--features "${RS_LIST[*]}")

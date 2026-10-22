@@ -112,6 +112,36 @@ if [[ "${ADVISORIES}" -eq 0 ]]; then
     echo "ERROR: The advisory database has no advisories in crates/." >&2
     exit 1
 fi
+# An imported copy's git config is its importer's: it can hold credentials
+# (in a remote URL, an http.extraHeader or http.proxy) and commands git runs
+# (core.fsmonitor, core.sshCommand). So before any other git command reads
+# the copy, its config keeps only the settings a checkout needs, with remote
+# URLs stripped of credentials, and the rest reaches neither git here, nor
+# the archive, nor a later job. --git-dir keeps git from looking for another
+# repository in a parent directory to change.
+if [[ ! -d "${STAGED}/.git" ]]; then
+    echo "ERROR: The advisory database is not a git checkout with its own .git directory, so its age can't be told." >&2
+    echo "  Import a copy with its .git directory, such as the archive fetch_advisory_db writes." >&2
+    exit 1
+fi
+GIT_STAGED=(git --git-dir="${STAGED}/.git")
+declare -A SEEN=()
+while IFS= read -r -d '' ENTRY; do
+    KEY=${ENTRY%%$'\n'*}
+    if [[ -n "${SEEN[${KEY}]:-}" ]]; then
+        continue
+    fi
+    SEEN[${KEY}]=1
+    if rs_match "${KEY}" '^remote\..+\.(url|pushurl)$'; then
+        mapfile -t VALUES < <("${GIT_STAGED[@]}" config --local --get-all "${KEY}")
+        "${GIT_STAGED[@]}" config --local --unset-all "${KEY}"
+        for VALUE in ${VALUES[@]+"${VALUES[@]}"}; do
+            "${GIT_STAGED[@]}" config --local --add "${KEY}" "$(rs_url_public "${VALUE}")"
+        done
+    elif ! rs_match "${KEY}" '^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)|extensions\.[a-z0-9]+|remote\..+\.(fetch|tagopt)|branch\..+\.(remote|merge))$'; then
+        "${GIT_STAGED[@]}" config --local --unset-all "${KEY}"
+    fi
+done < <("${GIT_STAGED[@]}" config --local --null --list 2> /dev/null)
 # git -C searches parent directories, so a copy without its own .git inside
 # another work tree would be dated by that repository.
 if [[ ! -e "${STAGED}/.git" ]] || ! COMMIT=$(git -C "${STAGED}" log -1 --format=%H 2> /dev/null) || [[ -z "${COMMIT}" ]]; then
@@ -151,20 +181,6 @@ if ((COMMITTED - $(date +%s) > 86400)); then
     echo "  so cargo-audit and cargo-deny could never tell it is stale. Check the clock of whatever made the copy." >&2
     exit 1
 fi
-# An imported copy's git config can hold credentials: in a remote's URL
-# (user:token@ or a query), an http.extraHeader, or a url.*.insteadOf base.
-# None of them may reach the archive or a later job, so remote URLs lose
-# them and the others go; reading the database needs none.
-while IFS= read -r KEY; do
-    mapfile -t VALUES < <(git -C "${STAGED}" config --local --get-all "${KEY}")
-    git -C "${STAGED}" config --local --unset-all "${KEY}"
-    for VALUE in ${VALUES[@]+"${VALUES[@]}"}; do
-        git -C "${STAGED}" config --local --add "${KEY}" "$(rs_url_public "${VALUE}")"
-    done
-done < <(git -C "${STAGED}" config --local --get-regexp '^remote\..*\.(push)?url$' 2> /dev/null | awk '{ print $1 }' | sort -u)
-while IFS= read -r KEY; do
-    git -C "${STAGED}" config --local --unset-all "${KEY}"
-done < <(git -C "${STAGED}" config --local --get-regexp '^(http\..*extraheader|url\..*\.(push)?insteadof)$' 2> /dev/null | awk '{ print $1 }' | sort -u)
 rm -f "${STAGED}/.git/FETCH_HEAD"
 touch -d "@${COMMITTED}" "${STAGED}/.git/HEAD"
 

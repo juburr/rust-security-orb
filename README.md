@@ -340,7 +340,7 @@ Fetches the RustSec advisory database (a shallow git clone), or imports a copy s
 | `url` | `https://github.com/RustSec/advisory-db` | The database's git repository, or an internal mirror of it, over `https`, with a path of plain ASCII and no `.` or `..` segments, and a host that is a name or an IPv4 address written as four decimal numbers. Use the URL `deny.toml`'s `db-urls` names, if it names one: cargo-deny's directory is named after it. A database whose newest commit is dated in the future fails the step, since neither tool could tell it is stale. |
 | `import` | *(empty)* | Import instead of fetching: a directory holding the database's git checkout, or a `.tar.gz` that `archive` wrote. Needs no network access. Its files must be exactly its newest commit's, since run records name that commit, and a copy cloned over https must be a copy of `url`, since cargo-deny reads it as `url`'s database. |
 | `db_dir` | `$CARGO_HOME/advisory-dbs` | Where to put the database, under its URL-derived name. cargo-deny reads another directory only if `deny.toml`'s `db-path` names it. |
-| `archive` | *(empty)* | Also write the database, git history included, to this `.tar.gz`, to persist to the workspace or store. Credentials in an imported copy's git config (in a remote URL, an `http.extraHeader` or a `url.*.insteadOf`) are removed first, from the archive and the installed copy alike. |
+| `archive` | *(empty)* | Also write the database, git history included, to this `.tar.gz`, to persist to the workspace or store. The copy's git config keeps only what a checkout needs, with credentials stripped from remote URLs, so an imported copy's credentials (an `http.extraHeader`, `http.proxy` or `url.*.insteadOf`) and commands (`core.fsmonitor`) reach neither the archive nor the installed copy. |
 | `auth_header_env_var` | *(empty)* | *Name* of the environment variable holding an `Authorization` header value (`Bearer <token>` or `Basic <base64>`) for a private mirror. It reaches git through its environment, never its command line, and is never printed. |
 
 ### `rust-security/audit`
@@ -448,7 +448,7 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `store_path` | *(empty)* | The store. Defaults to the store path in `Cargo.toml`'s `[package.metadata.vet]` or `[workspace.metadata.vet]`, or else `supply-chain` in the workspace root, as cargo vet does. |
-| `locked` | `true` | Use the imports recorded in `imports.lock`, so cargo vet fetches nothing itself and never rewrites the store. |
+| `locked` | `true` | Use the imports recorded in `imports.lock`, so cargo vet fetches nothing itself and never rewrites the store. Without it, a check that fails used imported audits that cargo vet doesn't write to `imports.lock`, so the run record can't hash them, and the step warns. |
 | `frozen` | `false` | Also keep cargo metadata off the network. |
 | `features`, `no_default_features`, `no_all_features` | | The feature set. cargo vet checks every feature unless `no_all_features` is true. |
 | `filter_graph` | *(empty)* | A `--filter-graph` expression, such as `exclude(eq(is_dev_only(true)))`. |

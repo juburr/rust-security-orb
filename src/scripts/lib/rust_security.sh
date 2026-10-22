@@ -1082,7 +1082,7 @@ rs_audit_config() {
             "stale "*) RS_CONFIG_DB_STALE=${line#stale } ;;
             "unreadable "*)
                 echo "ERROR: ${RS_AUDIT_CONFIG} writes ${line#unreadable } as a multiline string or with escapes, which this command can't read." >&2
-                echo "  Write it as a plain \"...\" or '...' string, so it reaches the staleness check and the run record." >&2
+                echo "  Write it with plain \"...\" or '...' strings, which this command reads exactly." >&2
                 exit 1
                 ;;
             escaped)
@@ -1128,6 +1128,12 @@ rs_audit_config() {
             }
         }
         END {
+            # Only a TOML parser would read the kinds exactly if written
+            # with escapes.
+            if (index(buf, "\\")) {
+                print "unreadable output.deny"
+                exit
+            }
             gsub(q, "\"", buf)
             while (match(buf, /"[a-z]+"/)) {
                 print "deny " substr(buf, RSTART + 1, RLENGTH - 2)

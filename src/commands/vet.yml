@@ -25,7 +25,9 @@ parameters:
     description: >
       Use the imports recorded in imports.lock rather than fetching them (--locked), so cargo
       vet makes no network requests of its own and never rewrites the store. Turn it off to
-      fetch the imports config.toml names, whose hosts then need network access.
+      fetch the imports config.toml names, whose hosts then need network access. A check
+      that then fails used imported audits cargo vet doesn't write to imports.lock, so the
+      run record can't hash them, and the step warns.
   frozen:
     type: boolean
     default: false
