@@ -53,6 +53,7 @@ for format in "${FORMATS[@]}"; do
 done
 
 ROOT_ARGS=()
+# shellcheck disable=SC2034 # read by rs_run_record
 RS_INPUTS=()
 if [[ -n "${MANIFEST_PATH}" ]]; then
     ROOT_ARGS+=(--manifest-path "${MANIFEST_PATH}")
@@ -64,19 +65,17 @@ if [[ -n "${CONFIG_PATH}" ]]; then
     fi
     ROOT_ARGS+=(--config "${CONFIG_PATH}")
 fi
-# The config (licence clarifications can change the inventory) and lockfile,
-# for the run record.
-rs_deny_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}"
 if [[ -n "${METADATA_PATH}" ]]; then
     if [[ ! -f "${METADATA_PATH}" ]]; then
         echo "ERROR: metadata_path ${METADATA_PATH} does not exist (in $(pwd))." >&2
         exit 1
     fi
     ROOT_ARGS+=(--metadata-path "${METADATA_PATH}")
-    RS_INPUTS+=("metadata:${METADATA_PATH}")
-elif [[ "${RUN_RECORD}" == true ]] && command -v cargo > /dev/null 2>&1; then
-    # cargo deny reads the manifests through cargo metadata.
-    rs_manifest_inputs "$(cargo metadata --no-deps --format-version 1 ${MANIFEST_PATH:+--manifest-path "${MANIFEST_PATH}"} 2> /dev/null || true)"
+fi
+# The config (licence clarifications can change the inventory), lockfile and
+# manifests or metadata, for the run record.
+if [[ "${RUN_RECORD}" == true ]]; then
+    rs_deny_record_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}" "${METADATA_PATH}"
 fi
 rs_list features "${PARAM_FEATURES}"
 if [[ ${#RS_LIST[@]} -gt 0 ]]; then

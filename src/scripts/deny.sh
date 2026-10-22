@@ -136,15 +136,12 @@ CHECK_ARGS+=(${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"})
 RS_ARGS=(${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"} "${CHECK_ARGS[@]}")
 
 # The inputs and the advisory database, for the run record.
+# shellcheck disable=SC2034 # read by rs_run_record
 RS_INPUTS=()
-rs_deny_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}"
-if [[ -n "${METADATA_PATH}" ]]; then
-    RS_INPUTS+=("metadata:${METADATA_PATH}")
-elif [[ "${RUN_RECORD}" == true ]] && command -v cargo > /dev/null 2>&1; then
-    # cargo deny reads the manifests through cargo metadata.
-    rs_manifest_inputs "$(cargo metadata --no-deps --format-version 1 ${MANIFEST_PATH:+--manifest-path "${MANIFEST_PATH}"} 2> /dev/null || true)"
+if [[ "${RUN_RECORD}" == true ]]; then
+    rs_deny_record_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}" "${METADATA_PATH}"
+    rs_deny_db
 fi
-rs_deny_db
 RS_REPORTS=()
 JSONL="${RS_BASE}.jsonl"
 

@@ -463,16 +463,24 @@ rs_manifest_inputs() {
         (.workspace_members as $m | .packages[] | select(.id as $id | $m | index($id)) | .manifest_path)] | unique[]' <<< "$1" 2> /dev/null)
 }
 
-# rs_deny_inputs MANIFEST_PATH CONFIG_PATH: adds the files cargo-deny reads to
-# RS_INPUTS, found the way it finds them: the config from CONFIG_PATH, or else
-# the first deny.toml, .deny.toml or .cargo/deny.toml in the manifest's
-# directory or above it, and the nearest Cargo.lock. Sets RS_DENY_CONFIG to
-# the config, or empty when there is none.
+# rs_deny_inputs MANIFEST_PATH CONFIG_PATH [WORKSPACE_ROOT]: adds the files
+# cargo-deny reads to RS_INPUTS, found the way it finds them: the config from
+# CONFIG_PATH, or else the first deny.toml, .deny.toml or .cargo/deny.toml in
+# the manifest's directory or above it, and the workspace's Cargo.lock. That
+# is the one in WORKSPACE_ROOT, from cargo metadata, since a member's own
+# lockfile doesn't count in a workspace; without it, the nearest Cargo.lock.
+# Sets RS_DENY_CONFIG to the config, or empty when there is none.
 rs_deny_inputs() {
     local dir name lockfile=""
     RS_DENY_CONFIG=$2
     if [[ -n "${RS_DENY_CONFIG}" ]]; then
         RS_INPUTS+=("config:${RS_DENY_CONFIG}")
+    fi
+    if [[ -n "${3:-}" ]]; then
+        lockfile="$3/Cargo.lock"
+        if [[ -f "${lockfile}" ]]; then
+            RS_INPUTS+=("lockfile:${lockfile}")
+        fi
     fi
     dir=$(cd "$(dirname "${1:-./Cargo.toml}")" 2> /dev/null && pwd) || dir=""
     while [[ -n "${dir}" && ( -z "${RS_DENY_CONFIG}" || -z "${lockfile}" ) ]]; do
@@ -491,6 +499,27 @@ rs_deny_inputs() {
         fi
         dir=$(dirname "${dir}")
     done
+}
+
+# rs_deny_record_inputs MANIFEST_PATH CONFIG_PATH METADATA_PATH: adds what a
+# cargo-deny run reads to RS_INPUTS, for its run record: the config and the
+# lockfile (rs_deny_inputs), and the METADATA_PATH file, or else the
+# manifests, which cargo-deny reads through cargo metadata. Either names the
+# workspace root, whose Cargo.lock is the workspace's.
+rs_deny_record_inputs() {
+    local metadata="" root=""
+    if [[ -n "$3" ]]; then
+        root=$(jq -r '.workspace_root // empty' < "$3" 2> /dev/null) || root=""
+    elif command -v cargo > /dev/null 2>&1; then
+        metadata=$(cargo metadata --no-deps --format-version 1 ${1:+--manifest-path "$1"} 2> /dev/null) || metadata=""
+        root=$(jq -r '.workspace_root // empty' <<< "${metadata}" 2> /dev/null) || root=""
+    fi
+    rs_deny_inputs "$1" "$2" "${root}"
+    if [[ -n "$3" ]]; then
+        RS_INPUTS+=("metadata:$3")
+    elif [[ -n "${metadata}" ]]; then
+        rs_manifest_inputs "${metadata}"
+    fi
 }
 
 # rs_expand_path VALUE: expands a path from deny.toml's db-path the way
@@ -535,40 +564,106 @@ rs_expand_path() {
     printf '%s\n' "${out}${in}"
 }
 
+# Awk functions for the TOML readers below, which set q to a single quote.
+# They read keys by their full dotted name, so a setting means the same
+# whether written under its [table] header or as table.key, as in TOML.
+# - toml_table(line): the dotted name of the table a [header] line opens, or
+#   "[]" for an array of tables.
+# - toml_key(line): the dotted key a key = value line sets, relative to its
+#   table, or "" when the text before = isn't a key (such as inside an array).
+# - toml_rest(line): the value, the text after =.
+# - toml_plain(value): whether value is not a multiline string, nor a basic
+#   string with escapes, which only a TOML parser would read exactly.
+# - toml_string(value): the string value starts with, or else value without
+#   its comment.
+RS_TOML_AWK='
+    function toml_name(key) {
+        gsub(/[[:space:]"]/, "", key)
+        gsub(q, "", key)
+        return key
+    }
+    function toml_table(line) {
+        sub(/#.*/, "", line)
+        if (line ~ /^[[:space:]]*\[\[/) { return "[]" }
+        sub(/^[[:space:]]*\[/, "", line)
+        sub(/\][[:space:]]*$/, "", line)
+        return toml_name(line)
+    }
+    function toml_key(line,    key) {
+        key = toml_name(substr(line, 1, index(line, "=") - 1))
+        return key ~ /^[A-Za-z0-9_.-]+$/ ? key : ""
+    }
+    function toml_rest(line) {
+        line = substr(line, index(line, "=") + 1)
+        sub(/^[[:space:]]*/, "", line)
+        return line
+    }
+    function toml_plain(value) {
+        return !(substr(value, 1, 3) == "\"\"\"" || substr(value, 1, 3) == q q q || (substr(value, 1, 1) == "\"" && index(value, "\\")))
+    }
+    function toml_string(value,    quote) {
+        quote = substr(value, 1, 1)
+        if (quote == "\"" || quote == q) {
+            value = substr(value, 2)
+            return substr(value, 1, index(value, quote) - 1)
+        }
+        sub(/[[:space:]]*(#.*)?$/, "", value)
+        return value
+    }
+'
+
 # rs_deny_db: sets RS_DB, for the run record, to the advisory database
-# cargo-deny reads: in the [advisories] db-path of RS_DENY_CONFIG, or else
+# cargo-deny reads: in the advisories.db-path of RS_DENY_CONFIG, or else
 # $CARGO_HOME/advisory-dbs, the copy fetch_advisory_db exported
 # (RUSTSEC_ADVISORY_DB) if it is there, or else the RustSec default's
 # directory when the config names no db-urls. Empty when it can't tell, such
-# as for a relative db-path or one that cargo-deny couldn't expand either.
+# as for a relative db-path, one that cargo-deny couldn't expand either, or
+# settings written in a form the reader can't take exactly.
 rs_deny_db() {
     local settings db_path="" has_urls=false origin url
     local -a urls=()
     RS_DB=""
     if [[ -n "${RS_DENY_CONFIG:-}" && -f "${RS_DENY_CONFIG}" ]]; then
-        settings=$(awk -v q="'" '
-            !in_urls && /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
-            section != "[advisories]" { next }
-            /^[[:space:]]*db-urls[[:space:]]*=/ { print "urls"; in_urls = 1; sub(/^[^=]*=/, "") }
-            in_urls {
-                line = $0
+        # Prints "urls" and "url=<url>" for each URL in advisories.db-urls,
+        # an array that can span lines, "path=<path>" for advisories.db-path,
+        # and "unreadable" for an inline advisories table or a setting
+        # written as a multiline string or with escapes. Keys count by their
+        # full dotted name, as for rs_audit_config.
+        settings=$(awk -v q="'" "${RS_TOML_AWK}"'
+            function urls(line) {
                 sub(/#.*/, "", line)
                 while (match(line, "\"[^\"]*\"|" q "[^" q "]*" q)) {
+                    if (!toml_plain(substr(line, RSTART, RLENGTH))) { print "unreadable" }
                     print "url=" substr(line, RSTART + 1, RLENGTH - 2)
                     line = substr(line, RSTART + RLENGTH)
                 }
                 if (index(line, "]")) { in_urls = 0 }
-                next
             }
-            /^[[:space:]]*db-path[[:space:]]*=/ {
-                value = $0
-                sub(/^[^=]*=[[:space:]]*/, "", value)
-                quote = substr(value, 1, 1)
-                if (quote == "\"" || quote == q) {
-                    rest = substr(value, 2)
-                    print "path=" substr(rest, 1, index(rest, quote) - 1)
+            in_urls { urls($0); next }
+            /^[[:space:]]*\[/ { table = toml_table($0); next }
+            index($0, "=") {
+                key = toml_key($0)
+                if (key == "") { next }
+                key = table == "" ? key : table "." key
+                rest = toml_rest($0)
+                if (key == "advisories.db-urls") {
+                    print "urls"
+                    in_urls = 1
+                    urls(rest)
+                } else if (key == "advisories.db-path") {
+                    quote = substr(rest, 1, 1)
+                    if (toml_plain(rest) && (quote == "\"" || quote == q)) {
+                        print "path=" toml_string(rest)
+                    } else {
+                        print "unreadable"
+                    }
+                } else if (key == "advisories") {
+                    print "unreadable"
                 }
             }' "${RS_DENY_CONFIG}")
+        if grep -qx unreadable <<< "${settings}"; then
+            return 0
+        fi
         if grep -qx urls <<< "${settings}"; then
             has_urls=true
             mapfile -t urls < <(sed -n 's/^url=//p' <<< "${settings}")
@@ -703,7 +798,8 @@ rs_audit_options() {
 }
 
 # rs_audit_extra_args: sets RS_EXTRA to the extra_args words, refusing the
-# options that would change the report format these commands write.
+# options that would change the report format these commands write, and
+# those the parameters must set because the command reads them too.
 rs_audit_extra_args() {
     local word extra flags parameter
     extra=$(rs_subst "${PARAM_EXTRA_ARGS}")
@@ -717,9 +813,11 @@ rs_audit_extra_args() {
                 exit 1
                 ;;
             # The database and whether it is fetched decide the staleness
-            # check and the database the run record names.
+            # check and the database the run record names; the denied kinds
+            # decide which warnings the counts and JUnit report as failures.
             --no-fetch) parameter=no_fetch ;;
             --db | --db=*) parameter=db_path ;;
+            --deny | --deny=*) parameter=deny ;;
             --*) ;;
             # Short options can be grouped, as in -qn. q, h and V take no
             # value; any other option's value is the rest of the word.
@@ -729,13 +827,17 @@ rs_audit_extra_args() {
                     case "${flags:0:1}" in
                         n) parameter=no_fetch ;;
                         d) parameter=db_path ;;
+                        D) parameter=deny ;;
                         q | h | V) flags=${flags:1} ;;
                         *) flags="" ;;
                     esac
                 done
                 ;;
         esac
-        if [[ -n "${parameter}" ]]; then
+        if [[ "${parameter}" == deny ]]; then
+            echo "ERROR: extra_args can't set ${word}: use the deny parameter, which the counts and JUnit report follow to tell denied warnings apart." >&2
+            exit 1
+        elif [[ -n "${parameter}" ]]; then
             echo "ERROR: extra_args can't set ${word}: use the ${parameter} parameter, which the database's staleness check and the run record follow." >&2
             exit 1
         fi
@@ -849,57 +951,28 @@ rs_audit_config() {
                 exit 1
                 ;;
         esac
-    done < <(awk -v q="'" '
+    done < <(awk -v q="'" "${RS_TOML_AWK}"'
         function take(line) {
             sub(/#.*/, "", line)
             buf = buf " " line
             if (buf ~ /\]/) { collecting = 0; done = 1 }
         }
-        function value(line) {
-            sub(/^[^=]*=[[:space:]]*/, "", line)
-            quote = substr(line, 1, 1)
-            if (quote == "\"" || quote == q) {
-                line = substr(line, 2)
-                return substr(line, 1, index(line, quote) - 1)
-            }
-            sub(/[[:space:]]*(#.*)?$/, "", line)
-            return line
-        }
-        function name(key) {
-            gsub(/[[:space:]"]/, "", key)
-            gsub(q, "", key)
-            return key
-        }
         collecting { take($0); next }
-        /^[[:space:]]*\[/ {
-            table = $0
-            sub(/#.*/, "", table)
-            if (table ~ /^[[:space:]]*\[\[/) {
-                # An array of tables holds none of these settings.
-                table = "[]"
-            } else {
-                sub(/^[[:space:]]*\[/, "", table)
-                sub(/\][[:space:]]*$/, "", table)
-                table = name(table)
-            }
-            next
-        }
+        # An array of tables ("[]") holds none of these settings.
+        /^[[:space:]]*\[/ { table = toml_table($0); next }
         index($0, "=") {
-            key = name(substr($0, 1, index($0, "=") - 1))
-            if (key !~ /^[A-Za-z0-9_.-]+$/) { next }
+            key = toml_key($0)
+            if (key == "") { next }
             key = table == "" ? key : table "." key
+            rest = toml_rest($0)
             if (key == "output.deny" && !done) {
                 collecting = 1
-                take(substr($0, index($0, "=") + 1))
+                take(rest)
             } else if (key ~ /^database\.(path|fetch|stale)$/) {
-                # A multiline string, or a basic string with escapes, would
-                # need a TOML parser to read.
-                rest = substr($0, index($0, "=") + 1)
-                sub(/^[[:space:]]*/, "", rest)
-                if (substr(rest, 1, 3) == "\"\"\"" || substr(rest, 1, 3) == q q q || (substr(rest, 1, 1) == "\"" && index(rest, "\\"))) {
-                    print "unreadable " key
+                if (toml_plain(rest)) {
+                    print substr(key, 10) " " toml_string(rest)
                 } else {
-                    print substr(key, 10) " " value($0)
+                    print "unreadable " key
                 }
             } else if (key == "database" || key == "output") {
                 print "inline " key

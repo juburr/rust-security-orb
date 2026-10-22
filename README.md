@@ -357,7 +357,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |
 | `no_yanked` | `false` | Skip the yanked-crate check, which queries the crates.io index (cargo-audit 0.22.2 and later). |
-| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch` and `--db` (`-n`, `-d`): use `no_fetch` and `db_path`, which the staleness check and run record follow. |
+| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch` and `--db` (`-n`, `-d`): use `no_fetch` and `db_path`, which the staleness check and run record follow. `--deny` (`-D`) is refused too: use `deny`, which the counts and JUnit report follow. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit`. |
 
 ### `rust-security/audit_bin`

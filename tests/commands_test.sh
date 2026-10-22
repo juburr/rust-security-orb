@@ -307,9 +307,10 @@ EOF
 } > "${STUBS}/cargo-auditable"
 
 # cargo: --version, metadata (STUB_LOCK=stale fails --locked; the workspace
-# root is the working directory, the members STUB_MEMBERS, and the workspace's
-# and root package's metadata tables STUB_WORKSPACE_METADATA and
-# STUB_PACKAGE_METADATA), locate-project and auditable.
+# root is STUB_WORKSPACE_ROOT or else the manifest's directory, the members
+# STUB_MEMBERS, and the workspace's and root package's metadata tables
+# STUB_WORKSPACE_METADATA and STUB_PACKAGE_METADATA), locate-project and
+# auditable.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -326,7 +327,7 @@ case "$1" in
             if [[ "${prev}" == --manifest-path ]]; then cd "$(dirname "${a}")" || exit 101; fi
             prev=${a}
         done
-        root=$(pwd)
+        root=${STUB_WORKSPACE_ROOT:-$(pwd)}
         packages=""
         members=""
         for member in ${STUB_MEMBERS:-.}; do
@@ -766,6 +767,13 @@ for word in --no-fetch -n -qn --db --db=/elsewhere -d/elsewhere -qd; do
     check "naming the parameter to use" said "use the $([[ "${word}" == *d* ]] && echo db_path || echo no_fetch) parameter"
     check "before running cargo audit" call_count cargo-audit 0
 done
+for word in --deny --deny=unmaintained "-D unmaintained" -Dunsound -qDyanked; do
+    audit_case
+    run audit.sh "PARAM_EXTRA_ARGS=${word}"
+    check "refuses ${word} in extra_args, which the counts and JUnit report wouldn't follow" failed
+    check "naming the deny parameter" said "use the deny parameter"
+    check "before running cargo audit" call_count cargo-audit 0
+done
 for word in -q -cnever "--color never"; do
     audit_case
     run audit.sh "PARAM_EXTRA_ARGS=${word}"
@@ -1127,10 +1135,11 @@ check "and keeps that report" json_is "${CASE}/out/cargo-deny.audit.json" '.vuln
 begin "deny: run records"
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
-run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_RUN_RECORD=true
+echo "[workspace]" > "${CASE}/work/Cargo.toml"
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_RUN_RECORD=true "STUB_WORKSPACE_ROOT=${CASE}/work"
 RECORD="${CASE}/out/cargo-deny.run-record.json"
 check "records the deny.toml cargo deny finds above the manifest" json_is "${RECORD}" '.inputs[] | select(.role == "config") | .path' "${CASE}/work/deny.toml"
-check "and the lockfile" json_is "${RECORD}" '.inputs[] | select(.role == "lockfile") | .sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
+check "and the workspace's lockfile" json_is "${RECORD}" '.inputs[] | select(.role == "lockfile") | .sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
 check "records the database cargo deny reads" json_is "${RECORD}" .advisory_db.commit "$(git -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" log -1 --format=%H)"
 check "records every report" json_is "${RECORD}" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-deny.jsonl cargo-deny.sarif"
 deny_case
@@ -1147,7 +1156,24 @@ check "nor in its query or fragment" \
 check "which reach the run record nowhere" not_file_has "${CASE}/out/cargo-deny.run-record.json" "s3cret-token"
 check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "--manifest-path app/Cargo.toml check"
 check "and the workspace's manifests, which cargo deny reads through cargo metadata" \
-    json_is "${RECORD}" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "app/Cargo.toml"
+    json_is "${RECORD}" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "work/Cargo.toml app/Cargo.toml"
+deny_case
+echo "[workspace]" > "${CASE}/work/Cargo.toml"
+echo "# a member's own, which cargo ignores in a workspace" > "${CASE}/work/app/Cargo.lock"
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_RUN_RECORD=true "STUB_WORKSPACE_ROOT=${CASE}/work"
+check "records the workspace root's lockfile, not a member's own" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path] | join(" ")' "${CASE}/work/Cargo.lock"
+deny_case
+echo "# a member's own, which cargo ignores in a workspace" > "${CASE}/work/app/Cargo.lock"
+printf '{"workspace_root":"%s"}' "${CASE}/work" > "${CASE}/work/metadata.json"
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_METADATA_PATH=metadata.json PARAM_RUN_RECORD=true
+check "as named in metadata_path's file" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path] | join(" ")' "${CASE}/work/Cargo.lock"
+deny_case
+echo "# a member's own" > "${CASE}/work/app/Cargo.lock"
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_RUN_RECORD=true
+check "and a package's own lockfile when it is its own workspace" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path] | join(" ")' "${CASE}/work/app/Cargo.lock"
 deny_case
 mkdir -p "${CASE}/home/dbs"
 make_db "${CASE}/home/dbs/advisory-db-3157b0e258782691" 2
@@ -1198,6 +1224,39 @@ make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
 "${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://mirror.example.test/advisory-db"
 run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
 check "nor a mirror's copy without db-urls, when cargo deny reads RustSec's" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+# TOML sets the same key under its [table] header or dotted, quoted or not.
+for config in 'advisories.db-path = "~/dbs"' $'[advisories]\n"db-path" = \'~/dbs\'' $'[ "advisories" ] # the database\ndb-path = "~/dbs" # a copy'; do
+    deny_case
+    make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+    mkdir -p "${CASE}/home/dbs"
+    make_db "${CASE}/home/dbs/advisory-db-3157b0e258782691" 2
+    printf '%s\n' "${config}" > "${CASE}/work/deny.toml"
+    run deny.sh PARAM_RUN_RECORD=true
+    check "records the database in db-path written as ${config//$'\n'/ }" \
+        json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/dbs/advisory-db-3157b0e258782691"
+done
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
+"${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://mirror.example.test/advisory-db"
+printf 'advisories.db-urls = [\n  "https://mirror.example.test/advisory-db",\n]\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+check "and the db-urls database written as advisories.db-urls" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+printf 'advisories.db-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true
+check "rather than RustSec's copy, which cargo deny doesn't read then" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+for config in 'advisories = { db-path = "~/dbs" }' $'[advisories]\ndb-path = """~/dbs"""' $'[advisories]\ndb-path = \'\'\'~/dbs\'\'\'' \
+    $'[advisories]\ndb-path = "~/d\\u0062s"' $'[advisories]\ndb-urls = ["https://mirror.example.test/advisory\\u002ddb"]'; do
+    deny_case
+    make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+    printf '%s\n' "${config}" > "${CASE}/work/deny.toml"
+    run deny.sh PARAM_RUN_RECORD=true
+    check "names no database for settings it can't read exactly (${config//$'\n'/ })" \
+        json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+    check "and still runs cargo deny" succeeded
+done
 deny_case
 mkdir -p "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
 run deny.sh PARAM_RUN_RECORD=true
