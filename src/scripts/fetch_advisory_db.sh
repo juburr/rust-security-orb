@@ -119,9 +119,31 @@ fi
 # URLs stripped of credentials, and the rest reaches neither git here, nor
 # the archive, nor a later job. --git-dir keeps git from looking for another
 # repository in a parent directory to change.
-if [[ ! -d "${STAGED}/.git" ]]; then
+if [[ ! -d "${STAGED}/.git" || -L "${STAGED}/.git" ]]; then
     echo "ERROR: The advisory database is not a git checkout with its own .git directory, so its age can't be told." >&2
     echo "  Import a copy with its .git directory, such as the archive fetch_advisory_db writes." >&2
+    exit 1
+fi
+# The copy must also be self-contained: a symbolic link in .git could point
+# git's writes outside it, and a repository kept elsewhere (commondir, as in a
+# linked worktree) or objects borrowed from one (alternates, from git clone's
+# --reference or --shared) would leave an archive that can't be imported
+# without that repository.
+LINK=$(find "${STAGED}/.git" -type l -print -quit)
+if [[ -n "${LINK}" ]]; then
+    echo "ERROR: The advisory database's .git directory holds a symbolic link (${LINK#"${STAGED}/"}), which could point git" >&2
+    echo "  outside the copy. Import a copy without one, such as the archive fetch_advisory_db writes." >&2
+    exit 1
+fi
+if [[ -e "${STAGED}/.git/commondir" ]]; then
+    echo "ERROR: The advisory database keeps its repository elsewhere (.git/commondir), as a linked worktree does." >&2
+    echo "  Import a copy of the main checkout, such as the archive fetch_advisory_db writes." >&2
+    exit 1
+fi
+if [[ -e "${STAGED}/.git/objects/info/alternates" || -e "${STAGED}/.git/objects/info/http-alternates" ]]; then
+    echo "ERROR: The advisory database borrows objects from another repository (.git/objects/info/alternates), so a copy" >&2
+    echo "  of it isn't self-contained. Import a copy made without git clone's --reference or --shared, or run" >&2
+    echo "  git repack -a -d in it and delete that file first." >&2
     exit 1
 fi
 GIT_STAGED=(git --git-dir="${STAGED}/.git")
@@ -138,10 +160,14 @@ while IFS= read -r -d '' ENTRY; do
         for VALUE in ${VALUES[@]+"${VALUES[@]}"}; do
             "${GIT_STAGED[@]}" config --local --add "${KEY}" "$(rs_url_public "${VALUE}")"
         done
-    elif ! rs_match "${KEY}" '^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)|extensions\.[a-z0-9]+|remote\..+\.(fetch|tagopt)|branch\..+\.(remote|merge))$'; then
+    elif ! rs_match "${KEY}" '^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)|extensions\.(objectformat|refstorage)|remote\..+\.(fetch|tagopt)|branch\..+\.(remote|merge))$'; then
         "${GIT_STAGED[@]}" config --local --unset-all "${KEY}"
     fi
 done < <("${GIT_STAGED[@]}" config --local --null --list 2> /dev/null)
+# The other places git reads settings or commands from: per-worktree config
+# (which only extensions.worktreeConfig, now dropped, made git read), linked
+# worktrees' own config, sparse-checkout patterns and hooks.
+rm -rf "${STAGED}/.git/config.worktree" "${STAGED}/.git/worktrees" "${STAGED}/.git/info/sparse-checkout" "${STAGED}/.git/hooks"
 # git -C searches parent directories, so a copy without its own .git inside
 # another work tree would be dated by that repository.
 if [[ ! -e "${STAGED}/.git" ]] || ! COMMIT=$(git -C "${STAGED}" log -1 --format=%H 2> /dev/null) || [[ -z "${COMMIT}" ]]; then
@@ -162,8 +188,11 @@ if [[ -n "${IMPORT}" ]]; then
     fi
 fi
 # cargo-audit and cargo-deny scan the files as they are, and run records name
-# the commit, so the files must be exactly the commit's.
-if ! CHANGES=$(git -C "${STAGED}" status --porcelain --untracked-files=all --ignored 2> /dev/null); then
+# the commit, so the files must be exactly the commit's. The index is rebuilt
+# from the commit first: its skip-worktree entries (a sparse checkout's) and
+# assume-unchanged ones would hide missing or changed files from git status.
+if ! git -C "${STAGED}" read-tree HEAD 2> /dev/null \
+    || ! CHANGES=$(git -C "${STAGED}" status --porcelain --untracked-files=all --ignored 2> /dev/null); then
     echo "ERROR: Could not compare the advisory database's files with its commit ${COMMIT}." >&2
     exit 1
 fi

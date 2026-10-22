@@ -22,7 +22,10 @@ parameters:
     description: >
       Import a copy staged earlier instead of fetching: a directory holding the database's git
       checkout, or a .tar.gz such as archive writes, for example from the workspace. Nothing
-      is fetched then, so it works without network access. Environment variables are expanded.
+      is fetched then, so it works without network access. The copy must be self-contained
+      (no symbolic links or commondir in .git, no objects borrowed through git clone's
+      --reference or --shared), and its files exactly its newest commit's, sparse checkouts
+      and assume-unchanged files included. Environment variables are expanded.
   db_dir:
     type: string
     default: ""
@@ -38,7 +41,8 @@ parameters:
       Also write the database, git history included, to this .tar.gz, to persist to the
       workspace or store, so later jobs import this very copy. The copy's git config keeps
       only what a checkout needs, with credentials stripped from remote URLs, so an imported
-      copy's credentials and commands reach neither the archive nor the installed copy.
+      copy's credentials and commands (per-worktree config and hooks included) reach neither
+      the archive nor the installed copy.
       Environment variables are expanded.
   auth_header_env_var:
     type: string

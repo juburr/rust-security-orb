@@ -319,9 +319,10 @@ EOF
 
 # cargo: --version, metadata (STUB_LOCK=stale fails --locked; the workspace
 # root is STUB_WORKSPACE_ROOT or else the manifest's directory, the members
-# STUB_MEMBERS, and the workspace's and root package's metadata tables
-# STUB_WORKSPACE_METADATA and STUB_PACKAGE_METADATA), locate-project and
-# auditable.
+# STUB_MEMBERS, each named after its directory at version 0.1.0, and the
+# workspace's and root package's metadata tables STUB_WORKSPACE_METADATA and
+# STUB_PACKAGE_METADATA), pkgid (STUB_PKGIDS lists "name@version=URL path"
+# pairs), locate-project and auditable.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -346,12 +347,19 @@ case "$1" in
             id="path+file://${dir}#$(basename "${dir}")@0.1.0"
             metadata=null
             [[ "${dir}" == "${root}" ]] && metadata=${STUB_PACKAGE_METADATA:-null}
-            packages+="${packages:+,}{\"id\":\"${id}\",\"manifest_path\":\"${dir}/Cargo.toml\",\"metadata\":${metadata}}"
+            packages+="${packages:+,}{\"id\":\"${id}\",\"name\":\"$(basename "${dir}")\",\"version\":\"0.1.0\""
+            packages+=",\"manifest_path\":\"${dir}/Cargo.toml\",\"metadata\":${metadata}}"
             members+="${members:+,}\"${id}\""
         done
         printf '{"workspace_root":"%s","workspace_members":[%s],"packages":[%s],"metadata":%s}\n' \
             "${root}" "${members}" "${packages}" "${STUB_WORKSPACE_METADATA:-null}"
         exit 0 ;;
+    pkgid)
+        for pair in ${STUB_PKGIDS:-}; do
+            if [[ "${!#}" == "${pair%%=*}" ]]; then echo "path+file://${pair#*=}#${pair%%=*}"; exit 0; fi
+        done
+        echo "error: package ID specification \`${!#}\` did not match any packages" >&2
+        exit 101 ;;
     locate-project)
         manifest="$(pwd)/Cargo.toml"
         [[ "$2 $3 $4" == "--message-format plain --manifest-path" ]] && manifest=$(cd "$(dirname "$5")" && pwd)/${5##*/}
@@ -458,6 +466,41 @@ make_db() {
     (cd "${dir}" && "${REAL_GIT}" init -q && "${REAL_GIT}" add . \
         && GIT_COMMITTER_DATE="@${when}" GIT_AUTHOR_DATE="@${when}" \
             "${REAL_GIT}" -c user.name=t -c user.email=t@example.test commit -q -m db)
+}
+
+# A lockfile with the workspace's root package (work), a path dependency
+# outside the workspace (outside), a [patch] path (smallvec), a registry
+# package and an unused patch, which cargo pkgid doesn't know.
+path_lockfile() {
+    cat > "$1" << 'EOF'
+version = 4
+
+[[package]]
+name = "work"
+version = "0.1.0"
+dependencies = [
+ "outside",
+ "smallvec",
+]
+
+[[package]]
+name = "outside"
+version = "0.1.0"
+
+[[package]]
+name = "smallvec"
+version = "1.99.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[patch.unused]]
+name = "unused"
+version = "0.1.0"
+EOF
 }
 
 # --- fetch_advisory_db
@@ -631,6 +674,66 @@ echo "gitdir: ${CASE}/linked-gitdir" > "${CASE}/linked/.git"
 run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/linked"
 check "refuses a copy whose .git only points to another directory" failed
 check "saying it needs its own .git directory" said "not a git checkout with its own .git directory"
+new_case
+cp -a "${REMOTE}" "${CASE}/wtconfig"
+printf '#!/bin/sh\ntouch "%s"\n' "${CASE}/fsmonitor-ran" > "${CASE}/fsmonitor"
+chmod +x "${CASE}/fsmonitor"
+"${REAL_GIT}" -C "${CASE}/wtconfig" config core.repositoryformatversion 1
+"${REAL_GIT}" -C "${CASE}/wtconfig" config extensions.worktreeConfig true
+"${REAL_GIT}" -C "${CASE}/wtconfig" config --worktree core.fsmonitor "${CASE}/fsmonitor"
+printf '#!/bin/sh\ntouch "%s"\n' "${CASE}/hook-ran" > "${CASE}/wtconfig/.git/hooks/post-checkout"
+chmod +x "${CASE}/wtconfig/.git/hooks/post-checkout"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/wtconfig" "PARAM_ARCHIVE=${CASE}/out/advisory-db.tar.gz"
+DEST="${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+check "imports a copy with per-worktree config" succeeded
+check "without running the commands in it, such as a core.fsmonitor" absent "${CASE}/fsmonitor-ran"
+check "dropping that config" absent "${DEST}/.git/config.worktree"
+check "and the extension that reads it" test -z "$("${REAL_GIT}" -C "${DEST}" config --get extensions.worktreeconfig)"
+check "and the copy's hooks" absent "${DEST}/.git/hooks/post-checkout"
+mkdir -p "${CASE}/unpacked" && tar -xzf "${CASE}/out/advisory-db.tar.gz" -C "${CASE}/unpacked"
+check "so the archive carries none of them" test -z "$(find "${CASE}/unpacked/.git" -name config.worktree -o -name post-checkout)"
+new_case
+"${REAL_GIT}" clone -q --shared "${REMOTE}" "${CASE}/borrowing"
+"${REAL_GIT}" -C "${CASE}/borrowing" remote remove origin
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/borrowing"
+check "refuses a copy that borrows objects from another repository, whose archive couldn't be imported without it" failed
+check "saying so" said "borrows objects from another repository"
+check "leaving nothing behind" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+new_case
+"${REAL_GIT}" init -q "${CASE}/other"
+cp "${CASE}/other/.git/config" "${CASE}/other-config"
+cp -a "${REMOTE}" "${CASE}/common"
+echo "${CASE}/other/.git" > "${CASE}/common/.git/commondir"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/common"
+check "refuses a copy that keeps its repository elsewhere (commondir)" failed
+check "saying so" said "keeps its repository elsewhere"
+check "without changing that repository's config" cmp -s "${CASE}/other/.git/config" "${CASE}/other-config"
+new_case
+cp -a "${REMOTE}" "${CASE}/symlinked"
+mv "${CASE}/symlinked/.git/config" "${CASE}/outside-config"
+ln -s "${CASE}/outside-config" "${CASE}/symlinked/.git/config"
+"${REAL_GIT}" -C "${CASE}/symlinked" config http.proxy https://proxy.example.test
+cp "${CASE}/outside-config" "${CASE}/outside-config.before"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/symlinked"
+check "refuses a copy whose .git holds a symbolic link, which could point git's writes outside it" failed
+check "saying so" said "symbolic link"
+check "without changing the file it points to" cmp -s "${CASE}/outside-config" "${CASE}/outside-config.before"
+new_case
+cp -a "${REMOTE}" "${CASE}/sparse"
+mkdir -p "${CASE}/sparse/crates/hidden" && echo "# RUSTSEC-0000-0003" > "${CASE}/sparse/crates/hidden/RUSTSEC-0000-0003.md"
+"${REAL_GIT}" -C "${CASE}/sparse" add -A && "${REAL_GIT}" -C "${CASE}/sparse" -c user.name=t -c user.email=t@example.test commit -q -m hidden
+"${REAL_GIT}" -C "${CASE}/sparse" sparse-checkout set --no-cone /crates/smallvec/ 2> /dev/null
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/sparse"
+check "refuses a sparse checkout, missing files git status doesn't report" failed
+check "saying its files differ from its commit" said "files differ from its commit"
+check "naming the missing advisory" said "crates/hidden/RUSTSEC-0000-0003.md"
+new_case
+cp -a "${REMOTE}" "${CASE}/assumed"
+"${REAL_GIT}" -C "${CASE}/assumed" update-index --assume-unchanged crates/smallvec/RUSTSEC-2021-0003.md
+echo changed >> "${CASE}/assumed/crates/smallvec/RUSTSEC-2021-0003.md"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/assumed"
+check "refuses a copy with a changed file the index marks assume-unchanged" failed
+check "saying its files differ from its commit" said "files differ from its commit"
 for change in "rm crates/smallvec/RUSTSEC-2021-0003.md" "echo changed >> crates/smallvec/RUSTSEC-2021-0003.md" \
     "mkdir crates/x && echo extra > crates/x/RUSTSEC-0000-0001.md"; do
     new_case
@@ -1184,10 +1287,12 @@ run deny.sh PARAM_METADATA_PATH=missing.json
 check "a metadata_path that doesn't exist fails" failed
 deny_case
 echo '{}' > "${CASE}/work/metadata.json"
-run deny.sh PARAM_METADATA_PATH=metadata.json PARAM_RUN_RECORD=true
+path_lockfile "${CASE}/work/Cargo.lock"
+run deny.sh PARAM_METADATA_PATH=metadata.json PARAM_RUN_RECORD=true "STUB_PKGIDS=outside@0.1.0=${CASE}/outside"
 check "with metadata_path, the run record lists the metadata" \
     json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "metadata" or .role == "manifest") | .role] | join(" ")' metadata
 check "and cargo metadata doesn't run, since cargo deny reads no manifest" not_called_with cargo metadata
+check "nor does cargo pkgid, for path packages' manifests" not_called_with cargo pkgid
 deny_case
 run deny.sh PARAM_CHECKS=advisory
 check "checks refuses a check cargo deny doesn't have" failed
@@ -1694,6 +1799,28 @@ check "and the workspace's manifest" json_is "${CASE}/out/cargo-vet.run-record.j
 check "and the counts" json_is "${CASE}/out/cargo-vet.run-record.json" .counts.vetted_with_exemptions 1
 check "and the workspace's Cargo.lock, which cargo vet's graph comes from" \
     json_is "${CASE}/out/cargo-vet.run-record.json" '.inputs[] | select(.role == "lockfile") | .path' "${CASE}/work/Cargo.lock"
+vet_case
+path_lockfile "${CASE}/work/Cargo.lock"
+mkdir -p "${CASE}/out side" "${CASE}/patched"
+echo "[package]" > "${CASE}/work/Cargo.toml"
+echo "[package]" > "${CASE}/out side/Cargo.toml"
+echo "[package]" > "${CASE}/patched/Cargo.toml"
+run vet.sh PARAM_RUN_RECORD=true "STUB_PKGIDS=outside@0.1.0=${CASE}/out%20side smallvec@1.99.0=${CASE}/patched"
+check "and the manifests of the lockfile's path packages outside the workspace: path dependencies and [patch] paths" \
+    json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "manifest") | .path] | join(",")' \
+    "${CASE}/work/Cargo.toml,${CASE}/out side/Cargo.toml,${CASE}/patched/Cargo.toml"
+check "with their hashes" json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "manifest") | .sha256 | strings] | length' 3
+check "found by cargo pkgid from the lockfile, without the network" \
+    called cargo pkgid --offline --manifest-path "${CASE}/work/Cargo.toml" outside@0.1.0
+check "but not for the workspace's own packages" not_called_with cargo pkgid work@0.1.0
+check "nor registry packages" not_called_with cargo pkgid serde@1.0.0
+check "nor an unused patch" not_called_with cargo pkgid unused@0.1.0
+vet_case
+path_lockfile "${CASE}/work/Cargo.lock"
+run vet.sh PARAM_RUN_RECORD=true
+check "a path package cargo pkgid can't find is left out" succeeded
+check "of the record, which keeps the rest" \
+    json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "manifest") | .path] | join(",")' "${CASE}/work/Cargo.toml"
 for table in WORKSPACE PACKAGE; do
     vet_case
     mkdir -p "${CASE}/work/audit-store"

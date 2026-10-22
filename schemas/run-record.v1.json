@@ -82,7 +82,7 @@
       ]
     },
     "inputs": {
-      "description": "The files the result depends on, by role: lockfile, manifest (the workspace's Cargo.toml files), config, metadata, store or binary.",
+      "description": "The files the result depends on, by role: lockfile, manifest (the Cargo.toml files of the workspace and of path packages outside it), config, metadata, store or binary.",
       "type": "array",
       "items": {
         "type": "object",
