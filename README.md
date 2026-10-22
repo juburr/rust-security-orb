@@ -352,7 +352,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | `working_dir` | `.` | Directory to run in. |
 | `lockfile` | `Cargo.lock` | The lockfile to audit. It must exist: the step fails rather than let cargo audit generate one. |
 | `db_path` | *(empty)* | The advisory database. Defaults to the one `fetch_advisory_db` exported, or else cargo audit's own, `$CARGO_HOME/advisory-db`. |
-| `no_fetch` | `false` | Use the database without updating it. cargo audit checks a database's age only when it fetches, so `audit` then applies cargo audit's 90-day rule itself, as it does when `.cargo/audit.toml` sets `[database] fetch = false`. |
+| `no_fetch` | `false` | Use the database without updating it. cargo audit checks a database's age only when it fetches, so `audit` then applies cargo audit's 90-day rule itself, as it does when `.cargo/audit.toml` sets `[database] fetch = false` (or `database.fetch = false`; an inline `database = { ... }` table fails the step, since its settings would go unchecked). |
 | `allow_stale` | `false` | Accept a database whose newest commit is 90 days old or more. |
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |
@@ -438,7 +438,7 @@ Writes CycloneDX SBOMs of a workspace from Cargo's metadata with `cargo cycloned
 | `top_level` | `false` | List only direct dependencies. |
 | `locked` | `true` | Fail when `Cargo.lock` is missing or out of date. |
 | `offline` | `false` | Use only cargo's cache. |
-| `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. |
+| `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. `--manifest-path` is refused in `extra_args`: use `manifest_path`, whose workspace members this command collects the SBOMs from. |
 | `output_dir`, `report_name`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `sbom`. |
 
 ### `rust-security/vet`
@@ -452,7 +452,7 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 | `frozen` | `false` | Also keep cargo metadata off the network. |
 | `features`, `no_default_features`, `no_all_features` | | The feature set. cargo vet checks every feature unless `no_all_features` is true. |
 | `filter_graph` | *(empty)* | A `--filter-graph` expression, such as `exclude(eq(is_dev_only(true)))`. |
-| `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. |
+| `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. `--store-path` and `--manifest-path` are refused in `extra_args`: use `store_path` and `manifest_path`, which the run record follows. |
 | `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-vet`. |
 
 String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except `output_dir`, `report_name` and `install`'s `tools`, which CircleCI reads when it compiles the config, before the job's environment exists. In `extra_args` and the lists, that happens before the value is split, so quote a variable that may hold spaces.

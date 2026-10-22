@@ -70,7 +70,8 @@ case "${DESCRIBE}" in
 esac
 for word in ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}; do
     case "${word}" in
-        -f | --format | --format=* | --spec-version | --spec-version=* | --override-filename | --override-filename=*)
+        -f | --format | --format=* | --spec-version | --spec-version=* | --override-filename | --override-filename=* \
+            | --manifest-path | --manifest-path=*)
             echo "ERROR: extra_args can't set ${word}: use this command's parameters, which it needs to find the SBOMs." >&2
             exit 1
             ;;
@@ -154,6 +155,27 @@ if [[ "${RC}" -ne 0 ]]; then
 fi
 
 DEST="${RS_OUT%/}/${PARAM_REPORT_NAME}"
+# cdx_xml FILE: whether FILE looks like a whole CycloneDX XML document: after
+# its XML declaration and any comments, a bom element in the CycloneDX
+# namespace, and </bom> at the end. Without an XML parser, which the orb
+# doesn't require, this is the check that catches output cut short or that
+# isn't an SBOM.
+cdx_xml() {
+    local start end
+    start=$(head -c 65536 -- "$1" 2> /dev/null) || return 1
+    while true; do
+        start=${start#"${start%%[![:space:]]*}"}
+        case "${start}" in
+            '<?'*'?>'*) start=${start#*'?>'} ;;
+            '<!--'*'-->'*) start=${start#*'-->'} ;;
+            *) break ;;
+        esac
+    done
+    end=$(tail -c 1024 -- "$1" 2> /dev/null) || return 1
+    rs_match "${start}" '^<bom[[:space:]][^>]*xmlns="http://cyclonedx\.org/schema/bom/1\.[0-9]+"' \
+        && rs_match "${end}" '</bom>[[:space:]]*$'
+}
+
 # sbom_error [FILE]: stops the step for output cargo cyclonedx should not
 # have written, with an error run record that lists FILE too.
 sbom_error() {
@@ -180,7 +202,7 @@ for dir in "${MEMBER_DIRS[@]}"; do
             SUMMARY=$(jq -c --arg file "${relative}" --argjson components "$(jq '.components | length' "${file}")" \
                 '. + [{file: $file, components: $components}]' <<< "${SUMMARY}")
         else
-            if ! grep -q '<bom[[:space:]/>]' "${file}"; then
+            if ! cdx_xml "${file}"; then
                 echo "ERROR: ${relative} is not a CycloneDX XML document." >&2
                 sbom_error "${file}"
             fi

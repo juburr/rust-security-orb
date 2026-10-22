@@ -592,7 +592,7 @@ rs_deny_db() {
 # lowercased, without https's default port, and with an empty path written
 # as "/".
 rs_url_key() {
-    local url=${1,,} host path
+    local url=${1,,} host path port
     if [[ "${url}" != https://* ]]; then
         printf '%s\n' "${url}"
         return 0
@@ -600,7 +600,16 @@ rs_url_key() {
     host=${url#https://}
     host=${host%%/*}
     path=${url#https://"${host}"}
-    printf 'https://%s%s\n' "${host%:443}" "${path:-/}"
+    # The port is a number, so :0443 is :443, which is left out.
+    if rs_match "${host}" ':[0-9]+$'; then
+        port=${host##*:}
+        host=${host%:*}
+        port=${port#"${port%%[!0]*}"}
+        if [[ "${port:-0}" != 443 ]]; then
+            host="${host}:${port:-0}"
+        fi
+    fi
+    printf 'https://%s%s\n' "${host}" "${path:-/}"
 }
 
 # rs_audit_options: reads the cargo audit parameters the audit and audit_bin
@@ -799,14 +808,22 @@ rs_audit_config() {
     else
         return 0
     fi
-    # Prints "deny <kind>" for each kind in [output] deny, an array that can
-    # span lines, and "<key> <value>" for [database] path, fetch and stale.
+    # Prints "deny <kind>" for each kind in output.deny, an array that can
+    # span lines, "<key> <value>" for database.path, fetch and stale, and
+    # "inline <table>" for a database or output table written inline. Keys
+    # count by their full dotted name, so [database] fetch = false and
+    # database.fetch = false are the same setting, as in TOML.
     while IFS= read -r line; do
         case "${line}" in
             "deny "*) RS_CONFIG_DENIED+=("${line#deny }") ;;
             "path "*) RS_CONFIG_DB_PATH=${line#path } ;;
             "fetch "*) RS_CONFIG_DB_FETCH=${line#fetch } ;;
             "stale "*) RS_CONFIG_DB_STALE=${line#stale } ;;
+            "inline "*)
+                echo "ERROR: ${RS_AUDIT_CONFIG} sets ${line#inline } as an inline table, which this command can't read." >&2
+                echo "  Write it as a [${line#inline }] table, so its settings reach the staleness check and the run record." >&2
+                exit 1
+                ;;
         esac
     done < <(awk -v q="'" '
         function take(line) {
@@ -824,19 +841,37 @@ rs_audit_config() {
             sub(/[[:space:]]*(#.*)?$/, "", line)
             return line
         }
-        collecting { take($0); next }
-        /^[[:space:]]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[[:space:]]/, "", section); next }
-        section == "[output]" && !done && /^[[:space:]]*deny[[:space:]]*=/ {
-            line = $0
-            sub(/^[^=]*=/, "", line)
-            collecting = 1
-            take(line)
+        function name(key) {
+            gsub(/[[:space:]"]/, "", key)
+            gsub(q, "", key)
+            return key
         }
-        section == "[database]" && /^[[:space:]]*(path|fetch|stale)[[:space:]]*=/ {
-            key = $0
-            sub(/^[[:space:]]*/, "", key)
-            sub(/[[:space:]]*=.*/, "", key)
-            print key " " value($0)
+        collecting { take($0); next }
+        /^[[:space:]]*\[/ {
+            table = $0
+            sub(/#.*/, "", table)
+            if (table ~ /^[[:space:]]*\[\[/) {
+                # An array of tables holds none of these settings.
+                table = "[]"
+            } else {
+                sub(/^[[:space:]]*\[/, "", table)
+                sub(/\][[:space:]]*$/, "", table)
+                table = name(table)
+            }
+            next
+        }
+        index($0, "=") {
+            key = name(substr($0, 1, index($0, "=") - 1))
+            if (key !~ /^[A-Za-z0-9_.-]+$/) { next }
+            key = table == "" ? key : table "." key
+            if (key == "output.deny" && !done) {
+                collecting = 1
+                take(substr($0, index($0, "=") + 1))
+            } else if (key ~ /^database\.(path|fetch|stale)$/) {
+                print substr(key, 10) " " value($0)
+            } else if (key == "database" || key == "output") {
+                print "inline " key
+            }
         }
         END {
             gsub(q, "\"", buf)

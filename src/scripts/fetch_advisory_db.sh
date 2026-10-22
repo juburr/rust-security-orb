@@ -113,6 +113,17 @@ if [[ "${URL_PATH}/" =~ /(\.|\.\.|%2e|%2e%2e|\.%2e|%2e\.)/ ]]; then
     echo "ERROR: url's path must not have . or .. segments." >&2
     exit 1
 fi
+# The url crate reads the port as a number, so :0443 is https's default port,
+# which it leaves out, and :08080 is :8080.
+if [[ -n "${PORT}" ]]; then
+    PORT=${PORT#:}
+    PORT=${PORT#"${PORT%%[!0]*}"}
+    if [[ ${#PORT} -gt 5 ]] || (( 10#${PORT:-0} > 65535 )); then
+        echo "ERROR: url's port must be 65535 or less." >&2
+        exit 1
+    fi
+    PORT=":$((10#${PORT:-0}))"
+fi
 if [[ "${SCHEME}:${PORT}" == "https::443" ]]; then
     PORT=""
 fi

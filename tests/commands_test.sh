@@ -244,7 +244,9 @@ EOF
 # cargo-cyclonedx writes an SBOM beside every member's Cargo.toml (members
 # from STUB_MEMBERS, relative to the working directory); STUB_CDX=crash fails,
 # STUB_CDX=busy also writes other JSON and XML files meanwhile, STUB_CDX=bad
-# writes an SBOM that isn't one, and STUB_CDX=none writes nothing.
+# writes an SBOM that isn't one, STUB_CDX=truncated one cut short,
+# STUB_CDX=comment an XML file whose only bom is in a comment, and
+# STUB_CDX=none writes nothing.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -264,8 +266,12 @@ for member in ${STUB_MEMBERS:-.}; do
     elif [[ "${format}" == json ]]; then
         printf '{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"dep"}],"target":"%s","offline":"%s"}\n' \
             "${CARGO_BUILD_TARGET:-unset}" "${CARGO_NET_OFFLINE:-unset}" > "${member}/${name}.cdx.json"
+    elif [[ "${STUB_CDX:-}" == truncated ]]; then
+        printf '<?xml version="1.0" encoding="utf-8"?>\n<bom xmlns="http://cyclonedx.org/schema/bom/1.5" version="1">\n  <components>\n' > "${member}/${name}.cdx.xml"
+    elif [[ "${STUB_CDX:-}" == comment ]]; then
+        echo '<!-- <bom> --><x/>' > "${member}/${name}.cdx.xml"
     else
-        echo '<bom/>' > "${member}/${name}.cdx.xml"
+        printf '<?xml version="1.0" encoding="utf-8"?>\n<bom xmlns="http://cyclonedx.org/schema/bom/1.5" version="1">\n  <components />\n</bom>\n' > "${member}/${name}.cdx.xml"
     fi
 done
 EOF
@@ -449,10 +455,24 @@ done
 for spec in "https://github.com/RustSec/advisory-db:${DB_NAME}" \
     "https://github.com/rustsec/advisory-db.git:advisory-db.git-ec6cac7151e04d4b" \
     "https://github.com/rustsec/advisory-db/:-a4901529771e07b1" \
-    "HTTPS://GitHub.com:443/RustSec/advisory-db:${DB_NAME}"; do
+    "HTTPS://GitHub.com:443/RustSec/advisory-db:${DB_NAME}" \
+    "https://github.com:0443/rustsec/advisory-db:${DB_NAME}"; do
     new_case
     run fetch_advisory_db.sh "PARAM_URL=${spec%:*}"
     check "${spec%:*} goes in ${spec##*:}" exists "${CASE}/home/.cargo/advisory-dbs/${spec##*:}/crates"
+done
+new_case
+run fetch_advisory_db.sh "PARAM_URL=https://github.com:8080/rustsec/advisory-db"
+PORT_NAME=$(ls "${CASE}/home/.cargo/advisory-dbs")
+new_case
+run fetch_advisory_db.sh "PARAM_URL=https://github.com:08080/rustsec/advisory-db"
+check "a port with leading zeros is the same port, as the url crate reads it" exists "${CASE}/home/.cargo/advisory-dbs/${PORT_NAME}/crates"
+check "and another port another directory" test "${PORT_NAME}" != "${DB_NAME}"
+for port in 65536 0000065536; do
+    new_case
+    run fetch_advisory_db.sh "PARAM_URL=https://github.com:${port}/rustsec/advisory-db"
+    check "refuses port ${port}" said "ERROR: url's port must be 65535 or less."
+    check "before cloning" call_count git-clone 0
 done
 
 begin "fetch_advisory_db: fetching"
@@ -633,6 +653,10 @@ mkdir -p "${CASE}/work/.cargo"
 printf '[output]\ndeny = [\n  "unmaintained", # reviewed: these fail\n]\n' > "${CASE}/work/.cargo/audit.toml"
 run audit.sh STUB_AUDIT=vuln-warn PARAM_JUNIT=1 PARAM_RUN_RECORD=1
 check "with a vulnerability too, warnings .cargo/audit.toml denies still count as denied" said "1 vulnerabilities and 1 denied warnings"
+printf 'output.deny = ["unmaintained"]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh STUB_AUDIT=vuln-warn
+check "and so do those a dotted output.deny names" said "1 vulnerabilities and 1 denied warnings"
+printf '[output]\ndeny = ["unmaintained"]\n' > "${CASE}/work/.cargo/audit.toml"
 check "and fail in JUnit" file_has "${CASE}/out/junit/cargo-audit.xml" 'failures="2"'
 check "the run record names the config" json_is "${CASE}/out/cargo-audit.run-record.json" '.inputs[] | select(.role == "config") | .path' "${CASE}/work/.cargo/audit.toml"
 audit_case
@@ -771,6 +795,20 @@ printf '[database]\npath = "%s"\nfetch = false\nstale = true\n' "${CASE}/db" > "
 run audit.sh PARAM_RUN_RECORD=1
 check "unless it also allows stale databases" succeeded
 check "the run record names the database the config points to" json_is "${CASE}/out/cargo-audit.run-record.json" .advisory_db.path "${CASE}/db"
+for config in 'database.path = "%s"\ndatabase.fetch = false\n' '"database" . "path" = "%s"\n[ database ]\nfetch = false\n'; do
+    # shellcheck disable=SC2059 # the format is the config, with %s for the database
+    printf "${config}" "${CASE}/db" > "${CASE}/work/.cargo/audit.toml"
+    run audit.sh PARAM_RUN_RECORD=1
+    check "dotted and quoted keys are the same settings ($(head -n 1 "${CASE}/work/.cargo/audit.toml" | cut -c1-24)...)" failed
+    check "so the stale database still fails" said "newest commit is 120 days old"
+done
+audit_case
+mkdir -p "${CASE}/work/.cargo"
+printf 'database = { fetch = false }\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh
+check "an inline database table fails, rather than be ignored" failed
+check "saying how to write it" said "sets database as an inline table, which this command can't read."
+check "before running cargo audit" call_count cargo-audit 0
 audit_case
 make_db "${CASE}/home/.cargo/advisory-db" 1
 run audit.sh PARAM_NO_FETCH=1
@@ -1302,6 +1340,13 @@ run sbom.sh PARAM_FORMAT=xml PARAM_SPEC_VERSION=1.4 PARAM_DESCRIBE=binaries "PAR
 check "passes the options" called cargo-cyclonedx cyclonedx --format xml --spec-version 1.4 --describe binaries --features a,b \
     --no-default-features --target x86_64-unknown-linux-gnu --top-level
 check "moves XML SBOMs" exists "${CASE}/out/sbom/crates/a/a.cdx.xml"
+for mode in "truncated:cut short" "comment:only a comment"; do
+    sbom_case
+    run sbom.sh "STUB_CDX=${mode%%:*}" PARAM_FORMAT=xml PARAM_RUN_RECORD=true
+    check "refuses an XML SBOM that is ${mode#*:}" failed
+    check "naming it" said "ERROR: work.cdx.xml is not a CycloneDX XML document."
+    check "with an error run record" json_is "${CASE}/out/sbom.run-record.json" .outcome error
+done
 sbom_case
 run sbom.sh PARAM_TARGET=x86_64-unknown-linux-gnu CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
 check "target unsets CARGO_BUILD_TARGET, which would override it" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
@@ -1325,7 +1370,8 @@ run sbom.sh STUB_CDX=none PARAM_RUN_RECORD=true
 check "no SBOM at all fails" failed
 check "saying so" said "ERROR: cargo cyclonedx wrote no SBOM"
 check "with an error run record" json_is "${CASE}/out/sbom.run-record.json" .outcome error
-for bad in PARAM_FORMAT=spdx PARAM_SPEC_VERSION=1.6 PARAM_DESCRIBE=all PARAM_EXTRA_ARGS=--override-filename=x; do
+for bad in PARAM_FORMAT=spdx PARAM_SPEC_VERSION=1.6 PARAM_DESCRIBE=all PARAM_EXTRA_ARGS=--override-filename=x \
+    "PARAM_EXTRA_ARGS=--manifest-path other/Cargo.toml"; do
     sbom_case
     run sbom.sh "${bad}"
     check "refuses ${bad#PARAM_}" failed
@@ -1399,6 +1445,13 @@ check "passes the options after the subcommand, with --locked for frozen" \
 vet_case
 run vet.sh PARAM_EXTRA_ARGS=--output-format=human
 check "refuses --output-format in extra_args" failed
+for word in "--store-path=lenient" "--store-path lenient" "--manifest-path other/Cargo.toml"; do
+    vet_case
+    run vet.sh "PARAM_EXTRA_ARGS=${word}"
+    check "refuses ${word} in extra_args, which the run record wouldn't follow" failed
+    check "naming the parameter to use" said "use the $([[ "${word}" == --store* ]] && echo store_path || echo manifest_path) parameter"
+    check "before running cargo vet" not_called_with cargo-vet vet check
+done
 vet_case
 run vet.sh "PATH=$(path_without cargo)"
 check "needs cargo" failed
@@ -1437,6 +1490,9 @@ LIB_TEST 'unset NOPE; rs_expand_path "\$NOPE/x" || echo unset-fails; rs_expand_p
 check "and fails where cargo-deny fails" said "unset-fails"
 check "on malformed and unbalanced references too" said "malformed-fails"
 check "and unbalanced braces" said "unbalanced-fails"
+# shellcheck disable=SC2016 # expanded by the helper
+LIB_TEST 'for u in "HTTPS://Mirror.Example:0443" "https://mirror.example:08080/db" "https://mirror.example:0/db/"; do printf "<%s>" "$(rs_url_key "$u")"; done'
+check "rs_url_key normalizes URLs as cargo-deny names databases" said "<https://mirror.example/><https://mirror.example:8080/db><https://mirror.example:0/db/>"
 LIB_TEST 'rs_bool sarif yes'
 check "rs_bool refuses anything but true and false" said "ERROR: sarif must be true or false, not 'yes'."
 LIB_TEST "rs_words extra_args '--a \"b c\" '\\''d'\\'''; printf '<%s>' \"\${RS_WORDS[@]}\""

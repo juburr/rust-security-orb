@@ -49,6 +49,12 @@ for word in ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}; do
             echo "ERROR: extra_args can't set ${word}: vet writes the JSON report itself." >&2
             exit 1
             ;;
+        --store-path | --store-path=* | --manifest-path | --manifest-path=*)
+            parameter=${word#--}
+            parameter=${parameter%%=*}
+            echo "ERROR: extra_args can't set ${word%%=*}: use the ${parameter//-/_} parameter, which the run record follows." >&2
+            exit 1
+            ;;
     esac
 done
 

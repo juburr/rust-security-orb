@@ -55,6 +55,8 @@ parameters:
     default: ""
     description: >
       More cargo vet options, split like shell words; nothing in them is expanded or run.
+      --store-path and --manifest-path are refused: use store_path and manifest_path, which
+      the run record follows.
   output_dir:
     type: string
     default: /tmp/rust-security-reports
