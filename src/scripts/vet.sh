@@ -115,6 +115,7 @@ RS_INPUTS=()
 if [[ -n "${ROOT}" && -f "${ROOT}/Cargo.lock" ]]; then
     RS_INPUTS+=("lockfile:${ROOT}/Cargo.lock")
 fi
+rs_manifest_inputs "${METADATA}"
 for file in config.toml audits.toml imports.lock; do
     if [[ -f "${STORE}/${file}" ]]; then
         RS_INPUTS+=("store:${STORE}/${file}")

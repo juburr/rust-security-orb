@@ -126,6 +126,7 @@ RS_INPUTS=()
 if [[ -f "${ROOT}/Cargo.lock" ]]; then
     RS_INPUTS+=("lockfile:${ROOT}/Cargo.lock")
 fi
+rs_manifest_inputs "${METADATA}"
 if [[ "${LOCKED}" == true ]]; then
     if ! "${CARGO}" metadata --format-version 1 --locked ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"} > /dev/null 2> "${RS_BASE}.log"; then
         echo "ERROR: Cargo.lock is missing or out of date, so the SBOM would not describe the versions it pins. cargo says:" >&2

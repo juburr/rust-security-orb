@@ -140,6 +140,9 @@ RS_INPUTS=()
 rs_deny_inputs "${MANIFEST_PATH}" "${CONFIG_PATH}"
 if [[ -n "${METADATA_PATH}" ]]; then
     RS_INPUTS+=("metadata:${METADATA_PATH}")
+elif [[ "${RUN_RECORD}" == true ]] && command -v cargo > /dev/null 2>&1; then
+    # cargo deny reads the manifests through cargo metadata.
+    rs_manifest_inputs "$(cargo metadata --no-deps --format-version 1 ${MANIFEST_PATH:+--manifest-path "${MANIFEST_PATH}"} 2> /dev/null || true)"
 fi
 rs_deny_db
 RS_REPORTS=()

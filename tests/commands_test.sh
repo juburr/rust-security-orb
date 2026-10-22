@@ -321,6 +321,11 @@ case "$1" in
         if [[ " $* " == *" --locked "* && "${STUB_LOCK:-}" == stale ]]; then
             echo "error: the lock file Cargo.lock needs to be updated but --locked was passed to prevent this" >&2; exit 101
         fi
+        prev=""
+        for a in "$@"; do
+            if [[ "${prev}" == --manifest-path ]]; then cd "$(dirname "${a}")" || exit 101; fi
+            prev=${a}
+        done
         root=$(pwd)
         packages=""
         members=""
@@ -544,6 +549,18 @@ touch "${CASE}/staged/.git/FETCH_HEAD"
 run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/staged"
 check "imports a directory" exists "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}/crates"
 check "dropping its FETCH_HEAD, which cargo-deny would date it by" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}/.git/FETCH_HEAD"
+for change in "rm crates/smallvec/RUSTSEC-2021-0003.md" "echo changed >> crates/smallvec/RUSTSEC-2021-0003.md" \
+    "mkdir crates/x && echo extra > crates/x/RUSTSEC-0000-0001.md"; do
+    new_case
+    cp -a "${REMOTE}" "${CASE}/dirty"
+    mkdir -p "${CASE}/dirty/crates/keep" && echo "# RUSTSEC-0000-0002" > "${CASE}/dirty/crates/keep/RUSTSEC-0000-0002.md"
+    "${REAL_GIT}" -C "${CASE}/dirty" add -A && "${REAL_GIT}" -C "${CASE}/dirty" -c user.name=t -c user.email=t@example.test commit -q -m keep
+    (cd "${CASE}/dirty" && eval "${change}")
+    run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/dirty"
+    check "refuses a copy whose files differ from its commit (${change%% *})" failed
+    check "saying so" said "files differ from its commit"
+    check "leaving nothing behind" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+done
 new_case
 mkdir -p "${CASE}/plain/crates/x"
 echo "# RUSTSEC-0000-0000" > "${CASE}/plain/crates/x/RUSTSEC-0000-0000.md"
@@ -802,6 +819,15 @@ for config in 'database.path = "%s"\ndatabase.fetch = false\n' '"database" . "pa
     check "dotted and quoted keys are the same settings ($(head -n 1 "${CASE}/work/.cargo/audit.toml" | cut -c1-24)...)" failed
     check "so the stale database still fails" said "newest commit is 120 days old"
 done
+for value in '"""/srv/stale-db"""' "'''/srv/stale-db'''" '"/srv/stale\u002Ddb"'; do
+    audit_case
+    mkdir -p "${CASE}/work/.cargo"
+    printf '[database]\npath = %s\nfetch = false\nstale = false\n' "${value}" > "${CASE}/work/.cargo/audit.toml"
+    run audit.sh
+    check "a database path it can't read (${value}) fails" failed
+    check "saying how to write it" said "writes database.path as a multiline string or with escapes"
+    check "before running cargo audit" call_count cargo-audit 0
+done
 audit_case
 mkdir -p "${CASE}/work/.cargo"
 printf 'database = { fetch = false }\n' > "${CASE}/work/.cargo/audit.toml"
@@ -1025,6 +1051,12 @@ deny_case
 run deny.sh PARAM_METADATA_PATH=missing.json
 check "a metadata_path that doesn't exist fails" failed
 deny_case
+echo '{}' > "${CASE}/work/metadata.json"
+run deny.sh PARAM_METADATA_PATH=metadata.json PARAM_RUN_RECORD=true
+check "with metadata_path, the run record lists the metadata" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "metadata" or .role == "manifest") | .role] | join(" ")' metadata
+check "and cargo metadata doesn't run, since cargo deny reads no manifest" not_called_with cargo metadata
+deny_case
 run deny.sh PARAM_CHECKS=advisory
 check "checks refuses a check cargo deny doesn't have" failed
 check "saying which it takes" said "checks takes advisories, bans, licenses, sources and all"
@@ -1095,6 +1127,8 @@ check "nor in its query or fragment" \
     json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.url "https://mirror.example.test/advisory-db"
 check "which reach the run record nowhere" not_file_has "${CASE}/out/cargo-deny.run-record.json" "s3cret-token"
 check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "--manifest-path app/Cargo.toml check"
+check "and the workspace's manifests, which cargo deny reads through cargo metadata" \
+    json_is "${RECORD}" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "app/Cargo.toml"
 deny_case
 mkdir -p "${CASE}/home/dbs"
 make_db "${CASE}/home/dbs/advisory-db-3157b0e258782691" 2
@@ -1119,7 +1153,7 @@ make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
 printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
 run deny.sh PARAM_RUN_RECORD=true
 check "and the RustSec default's copy when deny.toml names other db-urls" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
-for urls in '["https://mirror.example.test/advisory-db"]' $'[\n  "https://other.example.test/db", # first\n  \'https://mirror.example.test/advisory-db\',\n]'; do
+for urls in '["https://mirror.example.test/advisory-db"]' $'[\n  # the mirror\n  \'https://mirror.example.test/advisory-db\',\n]'; do
     deny_case
     make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
     "${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://Mirror.Example.Test:443/advisory-db"
@@ -1134,6 +1168,12 @@ make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
 printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
 run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
 check "but not its copy of another URL, which cargo deny doesn't read" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
+"${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://mirror.example.test/advisory-db"
+printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db", "https://other.example.test/db"]\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+check "nor any one database when db-urls names several, all of which cargo deny reads" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
 "${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://mirror.example.test/advisory-db"
@@ -1159,6 +1199,7 @@ check "writes the JSON inventory" json_is "${CASE}/out/licenses.json" 'keys | le
 check "writes the TSV inventory" file_has "${CASE}/out/licenses.tsv" $'smallvec@1.6.0\tX\tX'
 check "prints each crate's licences" said "smallvec 1.6.0: MIT, Apache-2.0"
 check "counts them in the run record" json_is "${CASE}/out/licenses.run-record.json" '.counts | "\(.crates) \(.licenses)"' "2 2"
+check "and lists the workspace's manifest" json_is "${CASE}/out/licenses.run-record.json" '[.inputs[] | select(.role == "manifest") | .path] | join(" ")' "${CASE}/work/Cargo.toml"
 check "records the deny.toml cargo deny finds, which can clarify licences" \
     json_is "${CASE}/out/licenses.run-record.json" '.inputs[] | select(.role == "config") | .path' "${CASE}/work/deny.toml"
 deny_case
@@ -1317,6 +1358,8 @@ check "and out of output_dir" absent "${CASE}/out/sbom/crates/a/old.cdx.json"
 check "says how many components each has" said "crates/a/a.cdx.json: 1 components"
 check "says how many it wrote" said "Wrote 2 SBOMs to ${CASE}/out/sbom."
 check "records them in the run record" json_is "${CASE}/out/sbom.run-record.json" '.reports | length' 2
+check "with the workspace's manifests, which shape them" \
+    json_is "${CASE}/out/sbom.run-record.json" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "work/Cargo.toml a/Cargo.toml"
 check "leaves CARGO_BUILD_TARGET alone without target" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
 sbom_case
 run sbom.sh STUB_CDX=busy
@@ -1399,6 +1442,7 @@ check "runs cargo-vet with the job's cargo, writing JSON" called cargo-vet vet c
 check "writes the report" json_is "${CASE}/out/cargo-vet.json" .conclusion success
 check "says it passed" said "Passed: cargo vet: success."
 check "records the store's files" json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "store")] | length' 2
+check "and the workspace's manifest" json_is "${CASE}/out/cargo-vet.run-record.json" '[.inputs[] | select(.role == "manifest") | .path] | join(" ")' "${CASE}/work/Cargo.toml"
 check "and the counts" json_is "${CASE}/out/cargo-vet.run-record.json" .counts.vetted_with_exemptions 1
 check "and the workspace's Cargo.lock, which cargo vet's graph comes from" \
     json_is "${CASE}/out/cargo-vet.run-record.json" '.inputs[] | select(.role == "lockfile") | .path' "${CASE}/work/Cargo.lock"

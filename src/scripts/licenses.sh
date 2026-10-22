@@ -74,6 +74,9 @@ if [[ -n "${METADATA_PATH}" ]]; then
     fi
     ROOT_ARGS+=(--metadata-path "${METADATA_PATH}")
     RS_INPUTS+=("metadata:${METADATA_PATH}")
+elif [[ "${RUN_RECORD}" == true ]] && command -v cargo > /dev/null 2>&1; then
+    # cargo deny reads the manifests through cargo metadata.
+    rs_manifest_inputs "$(cargo metadata --no-deps --format-version 1 ${MANIFEST_PATH:+--manifest-path "${MANIFEST_PATH}"} 2> /dev/null || true)"
 fi
 rs_list features "${PARAM_FEATURES}"
 if [[ ${#RS_LIST[@]} -gt 0 ]]; then

@@ -204,6 +204,18 @@ if [[ ! -e "${STAGED}/.git" ]] || ! COMMIT=$(git -C "${STAGED}" log -1 --format=
     echo "  such as the archive fetch_advisory_db writes." >&2
     exit 1
 fi
+# cargo-audit and cargo-deny scan the files as they are, and run records name
+# the commit, so the files must be exactly the commit's.
+if ! CHANGES=$(git -C "${STAGED}" status --porcelain --untracked-files=all --ignored 2> /dev/null); then
+    echo "ERROR: Could not compare the advisory database's files with its commit ${COMMIT}." >&2
+    exit 1
+fi
+if [[ -n "${CHANGES}" ]]; then
+    echo "ERROR: The advisory database's files differ from its commit ${COMMIT}, so a run record naming that commit" >&2
+    echo "  would not describe what was scanned. Import a clean copy, such as the archive fetch_advisory_db writes. The first changes:" >&2
+    sed -n '1,10s/^/  /p' <<< "${CHANGES}" >&2
+    exit 1
+fi
 COMMITTED=$(git -C "${STAGED}" log -1 --format=%ct)
 # A commit dated in the future would never look stale to either tool. A day
 # covers clock skew.

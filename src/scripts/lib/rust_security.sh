@@ -449,6 +449,20 @@ rs_tool_json() {
         '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end), install: $install}'
 }
 
+# rs_manifest_inputs METADATA: adds the workspace's manifests to RS_INPUTS,
+# from the output of cargo metadata --no-deps: the workspace root's Cargo.toml
+# and every member's. Their features, package metadata and workspace
+# inheritance shape what the tools report, besides the lockfile.
+rs_manifest_inputs() {
+    local manifest
+    while IFS= read -r manifest; do
+        if [[ -n "${manifest}" ]]; then
+            RS_INPUTS+=("manifest:${manifest}")
+        fi
+    done < <(jq -r '[(.workspace_root + "/Cargo.toml"),
+        (.workspace_members as $m | .packages[] | select(.id as $id | $m | index($id)) | .manifest_path)] | unique[]' <<< "$1" 2> /dev/null)
+}
+
 # rs_deny_inputs MANIFEST_PATH CONFIG_PATH: adds the files cargo-deny reads to
 # RS_INPUTS, found the way it finds them: the config from CONFIG_PATH, or else
 # the first deny.toml, .deny.toml or .cargo/deny.toml in the manifest's
@@ -578,6 +592,10 @@ rs_deny_db() {
         if [[ -d "${db_path}/advisory-db-3157b0e258782691" ]]; then
             RS_DB="${db_path}/advisory-db-3157b0e258782691"
         fi
+    elif [[ ${#urls[@]} -gt 1 ]]; then
+        # cargo-deny reads every one, and a run record names one database,
+        # so it names none rather than only part of what was read.
+        return 0
     elif [[ -n "${RUSTSEC_ADVISORY_DB:-}" && "${RUSTSEC_ADVISORY_DB%/*}" == "${db_path}" && -e "${RUSTSEC_ADVISORY_DB}/.git" ]]; then
         origin=$(git -C "${RUSTSEC_ADVISORY_DB}" remote get-url origin 2> /dev/null) || origin=""
         for url in ${urls[@]+"${urls[@]}"}; do
@@ -809,8 +827,9 @@ rs_audit_config() {
         return 0
     fi
     # Prints "deny <kind>" for each kind in output.deny, an array that can
-    # span lines, "<key> <value>" for database.path, fetch and stale, and
-    # "inline <table>" for a database or output table written inline. Keys
+    # span lines, "<key> <value>" for database.path, fetch and stale,
+    # "unreadable <key>" for one of those it can't read, and "inline <table>"
+    # for a database or output table written inline. Keys
     # count by their full dotted name, so [database] fetch = false and
     # database.fetch = false are the same setting, as in TOML.
     while IFS= read -r line; do
@@ -819,6 +838,11 @@ rs_audit_config() {
             "path "*) RS_CONFIG_DB_PATH=${line#path } ;;
             "fetch "*) RS_CONFIG_DB_FETCH=${line#fetch } ;;
             "stale "*) RS_CONFIG_DB_STALE=${line#stale } ;;
+            "unreadable "*)
+                echo "ERROR: ${RS_AUDIT_CONFIG} writes ${line#unreadable } as a multiline string or with escapes, which this command can't read." >&2
+                echo "  Write it as a plain \"...\" or '...' string, so it reaches the staleness check and the run record." >&2
+                exit 1
+                ;;
             "inline "*)
                 echo "ERROR: ${RS_AUDIT_CONFIG} sets ${line#inline } as an inline table, which this command can't read." >&2
                 echo "  Write it as a [${line#inline }] table, so its settings reach the staleness check and the run record." >&2
@@ -868,7 +892,15 @@ rs_audit_config() {
                 collecting = 1
                 take(substr($0, index($0, "=") + 1))
             } else if (key ~ /^database\.(path|fetch|stale)$/) {
-                print substr(key, 10) " " value($0)
+                # A multiline string, or a basic string with escapes, would
+                # need a TOML parser to read.
+                rest = substr($0, index($0, "=") + 1)
+                sub(/^[[:space:]]*/, "", rest)
+                if (substr(rest, 1, 3) == "\"\"\"" || substr(rest, 1, 3) == q q q || (substr(rest, 1, 1) == "\"" && index(rest, "\\"))) {
+                    print "unreadable " key
+                } else {
+                    print substr(key, 10) " " value($0)
+                }
             } else if (key == "database" || key == "output") {
                 print "inline " key
             }

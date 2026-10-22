@@ -297,7 +297,7 @@ Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a f
 
 ### Keep Evidence for an Assessor
 
-`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well), on what (the lockfile's and configs' SHA-256, the advisory database's URL, commit and commit time, the arguments, which carry the feature set, target and workspace selection), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
+`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well), on what (the SHA-256 of the lockfile, the configs and the workspace's `Cargo.toml` files, the advisory database's URL, commit and commit time, the arguments, which carry the feature set, target and workspace selection), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
 
 ### Inventory Licences for Legal Review
 
@@ -338,7 +338,7 @@ Fetches the RustSec advisory database (a shallow git clone), or imports a copy s
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `url` | `https://github.com/RustSec/advisory-db` | The database's git repository, or an internal mirror of it, over `https`, with a path of plain ASCII and no `.` or `..` segments. Use the URL `deny.toml`'s `db-urls` names, if it names one: cargo-deny's directory is named after it. A database whose newest commit is dated in the future fails the step, since neither tool could tell it is stale. |
-| `import` | *(empty)* | Import instead of fetching: a directory holding the database's git checkout, or a `.tar.gz` that `archive` wrote. Needs no network access. |
+| `import` | *(empty)* | Import instead of fetching: a directory holding the database's git checkout, or a `.tar.gz` that `archive` wrote. Needs no network access. Its files must be exactly its newest commit's, since run records name that commit. |
 | `db_dir` | `$CARGO_HOME/advisory-dbs` | Where to put the database, under its URL-derived name. cargo-deny reads another directory only if `deny.toml`'s `db-path` names it. |
 | `archive` | *(empty)* | Also write the database, git history included, to this `.tar.gz`, to persist to the workspace or store. |
 | `auth_header_env_var` | *(empty)* | *Name* of the environment variable holding an `Authorization` header value (`Bearer <token>` or `Basic <base64>`) for a private mirror. It reaches git through its environment, never its command line, and is never printed. |
