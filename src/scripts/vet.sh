@@ -112,7 +112,9 @@ if [[ -z "${STORE}" ]]; then
 fi
 STORE=${STORE:-${ROOT:-.}/supply-chain}
 RS_INPUTS=()
-if [[ -n "${ROOT}" && -f "${ROOT}/Cargo.lock" ]]; then
+# Even before it exists: without locked, cargo vet's cargo metadata can write
+# it, and the run record hashes inputs when it is written.
+if [[ -n "${ROOT}" ]]; then
     RS_INPUTS+=("lockfile:${ROOT}/Cargo.lock")
 fi
 rs_manifest_inputs "${METADATA}"

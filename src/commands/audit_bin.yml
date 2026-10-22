@@ -76,8 +76,8 @@ parameters:
     description: >
       More cargo audit options, split like shell words; nothing in them is expanded or run.
       --json and --format are refused, since this command writes the reports, and so are
-      --no-fetch and --db (-n, -d): use no_fetch and db_path, which the staleness check
-      and run record follow. --deny (-D) is refused too: use deny, which the counts and
+      --no-fetch, --db and --stale (-n, -d): use no_fetch, db_path and allow_stale, which
+      the staleness check and run record follow. --deny (-D) is refused too: use deny, which the counts and
       JUnit report follow.
   output_dir:
     type: string

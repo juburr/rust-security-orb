@@ -123,9 +123,9 @@ fi
 ROOT=$(jq -r '.workspace_root' <<< "${METADATA}")
 mapfile -t MEMBER_DIRS < <(jq -r '.workspace_members as $m | .packages[] | select(.id as $id | $m | index($id)) | .manifest_path' <<< "${METADATA}" | sed 's|/[^/]*$||')
 RS_INPUTS=()
-if [[ -f "${ROOT}/Cargo.lock" ]]; then
-    RS_INPUTS+=("lockfile:${ROOT}/Cargo.lock")
-fi
+# Even before it exists: with locked false, cargo cyclonedx can write it, and
+# the run record hashes inputs when it is written.
+RS_INPUTS+=("lockfile:${ROOT}/Cargo.lock")
 rs_manifest_inputs "${METADATA}"
 if [[ "${LOCKED}" == true ]]; then
     if ! "${CARGO}" metadata --format-version 1 --locked ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"} > /dev/null 2> "${RS_BASE}.log"; then

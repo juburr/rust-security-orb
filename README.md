@@ -340,7 +340,7 @@ Fetches the RustSec advisory database (a shallow git clone), or imports a copy s
 | `url` | `https://github.com/RustSec/advisory-db` | The database's git repository, or an internal mirror of it, over `https`, with a path of plain ASCII and no `.` or `..` segments, and a host that is a name or an IPv4 address written as four decimal numbers. Use the URL `deny.toml`'s `db-urls` names, if it names one: cargo-deny's directory is named after it. A database whose newest commit is dated in the future fails the step, since neither tool could tell it is stale. |
 | `import` | *(empty)* | Import instead of fetching: a directory holding the database's git checkout, or a `.tar.gz` that `archive` wrote. Needs no network access. Its files must be exactly its newest commit's, since run records name that commit, and a copy cloned over https must be a copy of `url`, since cargo-deny reads it as `url`'s database. |
 | `db_dir` | `$CARGO_HOME/advisory-dbs` | Where to put the database, under its URL-derived name. cargo-deny reads another directory only if `deny.toml`'s `db-path` names it. |
-| `archive` | *(empty)* | Also write the database, git history included, to this `.tar.gz`, to persist to the workspace or store. |
+| `archive` | *(empty)* | Also write the database, git history included, to this `.tar.gz`, to persist to the workspace or store. Credentials in an imported copy's git config (in a remote URL, an `http.extraHeader` or a `url.*.insteadOf`) are removed first, from the archive and the installed copy alike. |
 | `auth_header_env_var` | *(empty)* | *Name* of the environment variable holding an `Authorization` header value (`Bearer <token>` or `Basic <base64>`) for a private mirror. It reaches git through its environment, never its command line, and is never printed. |
 
 ### `rust-security/audit`
@@ -357,7 +357,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |
 | `no_yanked` | `false` | Skip the yanked-crate check, which queries the crates.io index (cargo-audit 0.22.2 and later). |
-| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch` and `--db` (`-n`, `-d`): use `no_fetch` and `db_path`, which the staleness check and run record follow. `--deny` (`-D`) is refused too: use `deny`, which the counts and JUnit report follow. |
+| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch`, `--db` and `--stale` (`-n`, `-d`): use `no_fetch`, `db_path` and `allow_stale`, which the staleness check and run record follow. `--deny` (`-D`) is refused too: use `deny`, which the counts and JUnit report follow. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit`. |
 
 ### `rust-security/audit_bin`
@@ -389,7 +389,7 @@ Runs `cargo deny check` against the project's `deny.toml`: advisories, bans, lic
 | `allow`, `warn`, `deny` | *(empty)* | Diagnostic codes or levels to allow, warn on or deny, separated by commas or spaces. Prefer `deny.toml`, where a reason can go with them. |
 | `require_ignore_reasons` | `false` | Fail when an advisory or yanked crate ignored in `deny.toml` has no reason. |
 | `audit_compatible_output` | `false` | Also write the advisories in cargo audit's JSON format, to `<report_name>.audit.json`. |
-| `working_dir`, `extra_args` | | As for `audit`. `--format` is refused in `extra_args`. |
+| `working_dir`, `extra_args` | | As for `audit`. `--format` is refused in `extra_args`, and so is `--audit-compatible-output`: use `audit_compatible_output`, which keeps that report. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-deny`. |
 
 ### `rust-security/licenses`

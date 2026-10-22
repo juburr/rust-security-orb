@@ -33,113 +33,11 @@ DB_DIR=$(rs_subst "${PARAM_DB_DIR}")
 ARCHIVE=$(rs_subst "${PARAM_ARCHIVE}")
 AUTH_ENV_VAR=${PARAM_AUTH_HEADER_ENV_VAR}
 
-# rs_xxh64 SEED STRING: prints the XXH64 hash of the ASCII STRING, as 16 hex
-# digits. Bash arithmetic is 64-bit and wraps like the unsigned arithmetic
-# XXH64 uses; only right shifts need masking, since bash's are arithmetic.
-rs_xxh64() {
-    local seed=$1 s=$2 len=${#2} i=0 v1 v2 v3 v4 h k
-    local -a b=()
-    local p1=$((0x9E3779B185EBCA87)) p2=$((0xC2B2AE3D27D4EB4F)) p3=$((0x165667B19E3779F9))
-    local p4=$((0x85EBCA77C2B2AE63)) p5=$((0x27D4EB2F165667C5))
-    for ((i = 0; i < len; i++)); do
-        printf -v k '%d' "'${s:i:1}"
-        b+=("${k}")
-    done
-    rotl() { echo $((($1 << $2) | (($1 >> (64 - $2)) & ((1 << $2) - 1)))); }
-    u64() { local j v=0; for ((j = 7; j >= 0; j--)); do v=$(((v << 8) | b[$1 + j])); done; echo "${v}"; }
-    u32() { local j v=0; for ((j = 3; j >= 0; j--)); do v=$(((v << 8) | b[$1 + j])); done; echo "${v}"; }
-    xround() { local acc=$(($1 + $2 * p2)); acc=$(rotl "${acc}" 31); echo $((acc * p1)); }
-    merge() { local val; val=$(xround 0 "$2"); echo $(((($1 ^ val) * p1) + p4)); }
-    i=0
-    if ((len >= 32)); then
-        v1=$((seed + p1 + p2))
-        v2=$((seed + p2))
-        v3=${seed}
-        v4=$((seed - p1))
-        while ((i + 32 <= len)); do
-            v1=$(xround "${v1}" "$(u64 "${i}")")
-            v2=$(xround "${v2}" "$(u64 $((i + 8)))")
-            v3=$(xround "${v3}" "$(u64 $((i + 16)))")
-            v4=$(xround "${v4}" "$(u64 $((i + 24)))")
-            i=$((i + 32))
-        done
-        h=$(($(rotl "${v1}" 1) + $(rotl "${v2}" 7) + $(rotl "${v3}" 12) + $(rotl "${v4}" 18)))
-        h=$(merge "${h}" "${v1}")
-        h=$(merge "${h}" "${v2}")
-        h=$(merge "${h}" "${v3}")
-        h=$(merge "${h}" "${v4}")
-    else
-        h=$((seed + p5))
-    fi
-    h=$((h + len))
-    while ((i + 8 <= len)); do
-        k=$(xround 0 "$(u64 "${i}")")
-        h=$(($(rotl $((h ^ k)) 27) * p1 + p4))
-        i=$((i + 8))
-    done
-    if ((i + 4 <= len)); then
-        h=$(($(rotl $((h ^ ($(u32 "${i}") * p1))) 23) * p2 + p3))
-        i=$((i + 4))
-    fi
-    while ((i < len)); do
-        h=$(($(rotl $((h ^ (b[i] * p5))) 11) * p1))
-        i=$((i + 1))
-    done
-    h=$(((h ^ ((h >> 33) & ((1 << 31) - 1))) * p2))
-    h=$(((h ^ ((h >> 29) & ((1 << 35) - 1))) * p3))
-    h=$((h ^ ((h >> 32) & ((1 << 32) - 1))))
-    printf '%016x\n' "${h}"
-}
-
-# The URL as cargo-deny sees it: lowercased, then normalized the way the url
-# crate does for the URLs a database is served from (the default port
-# dropped, an empty path written as "/").
-CANONICAL=${URL,,}
-# Only https: over plain http, anyone on the network path could serve a
-# database with advisories left out, and see the Authorization header. The
-# path is limited to characters the url crate leaves as they are, without .
-# or .. segments, which it would resolve: otherwise its directory name would
-# not be the one cargo-deny looks for.
-URL_RE='^(https)://([a-z0-9.-]+)(:[0-9]+)?(/[a-z0-9._~%/+:@!$&()*,;=-]*)?$'
-if ! rs_match "${CANONICAL}" "${URL_RE}"; then
-    echo "ERROR: url must be an https URL with a host and a path of plain ASCII, and no user, query or fragment." >&2
+if ! rs_db_name "${URL}"; then
+    echo "ERROR: ${RS_URL_ERROR}" >&2
     exit 1
 fi
-SCHEME=${BASH_REMATCH[1]}
-HOST=${BASH_REMATCH[2]}
-PORT=${BASH_REMATCH[3]}
-URL_PATH=${BASH_REMATCH[4]:-/}
-if [[ "${URL_PATH}/" =~ /(\.|\.\.|%2e|%2e%2e|\.%2e|%2e\.)/ ]]; then
-    echo "ERROR: url's path must not have . or .. segments." >&2
-    exit 1
-fi
-# The url crate reads a host whose last label is a number (decimal, or hex
-# with 0x) as an IPv4 address, and writes it as four decimal numbers, so
-# 127.1 is 127.0.0.1. Only that form keeps the directory name cargo-deny
-# computes.
-LABEL=${HOST%.}
-LABEL=${LABEL##*.}
-OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
-if rs_match "${LABEL}" '^([0-9]+|0x[0-9a-f]*)$' && ! rs_match "${HOST}" "^${OCTET}(\\.${OCTET}){3}\$"; then
-    echo "ERROR: url's host must be a name, or an IPv4 address written as four decimal numbers from 0 to 255, such as 192.0.2.10." >&2
-    exit 1
-fi
-# The url crate reads the port as a number, so :0443 is https's default port,
-# which it leaves out, and :08080 is :8080.
-if [[ -n "${PORT}" ]]; then
-    PORT=${PORT#:}
-    PORT=${PORT#"${PORT%%[!0]*}"}
-    if [[ ${#PORT} -gt 5 ]] || (( 10#${PORT:-0} > 65535 )); then
-        echo "ERROR: url's port must be 65535 or less." >&2
-        exit 1
-    fi
-    PORT=":$((10#${PORT:-0}))"
-fi
-if [[ "${SCHEME}:${PORT}" == "https::443" ]]; then
-    PORT=""
-fi
-CANONICAL="${SCHEME}://${HOST}${PORT}${URL_PATH}"
-NAME="${URL_PATH##*/}-$(rs_xxh64 $((0xca80de71)) "${CANONICAL}")"
+NAME=${RS_DB_NAME}
 
 # shellcheck disable=SC2088 # matches a literal ~/ the shell didn't expand
 if [[ -z "${DB_DIR}" ]]; then
@@ -226,8 +124,7 @@ fi
 # can be compared; a local path or ssh remote says nothing about the URL.
 if [[ -n "${IMPORT}" ]]; then
     ORIGIN=$(git -C "${STAGED}" remote get-url origin 2> /dev/null || true)
-    ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#' <<< "${ORIGIN}")
-    ORIGIN=${ORIGIN%%[?#]*}
+    ORIGIN=$(rs_url_public "${ORIGIN}")
     if [[ "${ORIGIN,,}" == https://* && "$(rs_url_key "${ORIGIN}")" != "$(rs_url_key "${URL}")" ]]; then
         echo "ERROR: The imported database is a copy of ${ORIGIN}, not of url (${URL}), and cargo-deny would read it as url's." >&2
         echo "  Set url to ${ORIGIN} (and deny.toml's db-urls to it, if it names a database), or import a copy of ${URL}." >&2
@@ -254,6 +151,20 @@ if ((COMMITTED - $(date +%s) > 86400)); then
     echo "  so cargo-audit and cargo-deny could never tell it is stale. Check the clock of whatever made the copy." >&2
     exit 1
 fi
+# An imported copy's git config can hold credentials: in a remote's URL
+# (user:token@ or a query), an http.extraHeader, or a url.*.insteadOf base.
+# None of them may reach the archive or a later job, so remote URLs lose
+# them and the others go; reading the database needs none.
+while IFS= read -r KEY; do
+    mapfile -t VALUES < <(git -C "${STAGED}" config --local --get-all "${KEY}")
+    git -C "${STAGED}" config --local --unset-all "${KEY}"
+    for VALUE in ${VALUES[@]+"${VALUES[@]}"}; do
+        git -C "${STAGED}" config --local --add "${KEY}" "$(rs_url_public "${VALUE}")"
+    done
+done < <(git -C "${STAGED}" config --local --get-regexp '^remote\..*\.(push)?url$' 2> /dev/null | awk '{ print $1 }' | sort -u)
+while IFS= read -r KEY; do
+    git -C "${STAGED}" config --local --unset-all "${KEY}"
+done < <(git -C "${STAGED}" config --local --get-regexp '^(http\..*extraheader|url\..*\.(push)?insteadof)$' 2> /dev/null | awk '{ print $1 }' | sort -u)
 rm -f "${STAGED}/.git/FETCH_HEAD"
 touch -d "@${COMMITTED}" "${STAGED}/.git/HEAD"
 

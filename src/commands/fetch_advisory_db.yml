@@ -36,8 +36,9 @@ parameters:
     default: ""
     description: >
       Also write the database, git history included, to this .tar.gz, to persist to the
-      workspace or store, so later jobs import this very copy. Environment variables are
-      expanded.
+      workspace or store, so later jobs import this very copy. Credentials in an imported
+      copy's git config (in a remote URL, an http.extraHeader or a url.*.insteadOf) are
+      removed first. Environment variables are expanded.
   auth_header_env_var:
     type: string
     default: ""

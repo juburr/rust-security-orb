@@ -126,7 +126,8 @@ parameters:
     default: ""
     description: >
       More cargo deny check options, split like shell words; nothing in them is expanded or
-      run. --format is refused, since this command writes the reports.
+      run. --format is refused, since this command writes the reports, and so is
+      --audit-compatible-output: use audit_compatible_output, which keeps that report.
   output_dir:
     type: string
     default: /tmp/rust-security-reports

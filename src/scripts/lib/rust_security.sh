@@ -206,7 +206,7 @@ rs_tool() {
 rs_tool_verified() {
     local record sha
     record="$(dirname "$2")/.$1.install.json"
-    sha=$(sha512sum "$2" 2> /dev/null | awk '{ print $1 }') || sha=""
+    sha=$(sha512sum -- "$2" 2> /dev/null | awk '{ print $1 }') || sha=""
     if [[ -z "${sha}" || ! -f "${record}" ]] || ! grep -qF "\"binary_sha512\":\"${sha}\"" "${record}"; then
         echo "WARN: $2 is not the $1 this orb's install command verified against its checksum table." >&2
         echo "WARN: Install $1 with the install command, and put its install_path first on the PATH, to run a verified one." >&2
@@ -260,7 +260,7 @@ rs_list() {
 
 # rs_sha256 FILE: prints FILE's SHA-256.
 rs_sha256() {
-    sha256sum "$1" | awk '{ print $1 }'
+    sha256sum -- "$1" | awk '{ print $1 }'
 }
 
 # rs_db_fresh DB_DIR ALLOW_STALE: applies cargo-audit's own rule, a database
@@ -391,8 +391,7 @@ rs_run_record() {
         # A remote URL can carry credentials (https://user:token@host/... or
         # ?access_token=...), which must not reach a stored artifact.
         url=$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)
-        url=$(sed -E 's|^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@|\1|' <<< "${url}")
-        url=${url%%[?#]*}
+        url=$(rs_url_public "${url}")
         db_json=$(jq -cn --arg path "${RS_DB}" \
             --arg url "${url}" \
             --arg commit "$(git -C "${RS_DB}" log -1 --format=%H 2> /dev/null || true)" \
@@ -442,7 +441,7 @@ rs_tool_json() {
     if [[ -n "$1" && -f "$1" ]]; then
         # Without sha512sum the record says so with a null SHA-512, as rs_tool
         # only warns.
-        sha=$(sha512sum "$1" 2> /dev/null | awk '{ print $1 }') || sha=""
+        sha=$(sha512sum -- "$1" 2> /dev/null | awk '{ print $1 }') || sha=""
         entry="$(dirname "$1")/.${1##*/}.install.json"
         # shellcheck disable=SC2016 # jq program, not shell
         if [[ -f "${entry}" ]] && rs_json_is "${entry}" '.binary_sha512 == $sha' --arg sha "${sha}"; then
@@ -484,10 +483,10 @@ rs_deny_inputs() {
         RS_INPUTS+=("config:${RS_DENY_CONFIG}")
     fi
     if [[ -n "${3:-}" ]]; then
+        # Even before it exists: cargo can write it during the run, and the
+        # run record hashes inputs when it is written.
         lockfile="$3/Cargo.lock"
-        if [[ -f "${lockfile}" ]]; then
-            RS_INPUTS+=("lockfile:${lockfile}")
-        fi
+        RS_INPUTS+=("lockfile:${lockfile}")
     fi
     dir=$(cd "$(dirname "${1:-./Cargo.toml}")" 2> /dev/null && pwd) || dir=""
     while [[ -n "${dir}" && ( -z "${RS_DENY_CONFIG}" || -z "${exceptions}" || -z "${lockfile}" ) ]]; do
@@ -632,13 +631,15 @@ RS_TOML_AWK='
 
 # rs_deny_db: sets RS_DB, for the run record, to the advisory database
 # cargo-deny reads: in the advisories.db-path of RS_DENY_CONFIG, or else
-# $CARGO_HOME/advisory-dbs, the copy fetch_advisory_db exported
-# (RUSTSEC_ADVISORY_DB) if it is there, or else the RustSec default's
-# directory when the config names no db-urls. Empty when it can't tell, such
-# as for a relative db-path, one that cargo-deny couldn't expand either, or
-# settings written in a form the reader can't take exactly.
+# $CARGO_HOME/advisory-dbs, the directory cargo-deny names after the URL in
+# advisories.db-urls, or after RustSec's when there is none (rs_db_name),
+# whether fetch_advisory_db staged it or cargo-deny cloned it. Empty when it
+# can't tell, such as for a relative db-path, one that cargo-deny couldn't
+# expand either, a URL rs_db_name can't name, several databases (a run
+# record names one), or settings written in a form the reader can't take
+# exactly.
 rs_deny_db() {
-    local settings db_path="" has_urls=false origin url
+    local settings db_path="" url name=""
     local -a urls=()
     RS_DB=""
     if [[ -n "${RS_DENY_CONFIG:-}" && -f "${RS_DENY_CONFIG}" ]]; then
@@ -687,10 +688,7 @@ rs_deny_db() {
         if grep -qx unreadable <<< "${settings}"; then
             return 0
         fi
-        if grep -qx urls <<< "${settings}"; then
-            has_urls=true
-            mapfile -t urls < <(sed -n 's/^url=//p' <<< "${settings}")
-        fi
+        mapfile -t urls < <(sed -n 's/^url=//p' <<< "${settings}")
         db_path=$(sed -n 's/^path=//p' <<< "${settings}" | head -n 1)
     fi
     if [[ -z "${db_path}" ]]; then
@@ -702,26 +700,142 @@ rs_deny_db() {
         return 0
     fi
     db_path=${db_path%/}
-    # Without db-urls, cargo-deny reads RustSec's database. With them, it
-    # reads each URL's database, in a directory named after the URL, so
-    # fetch_advisory_db's copy is one of them only if it was cloned from one
-    # of those URLs.
-    if [[ "${has_urls}" == false ]]; then
-        if [[ -d "${db_path}/advisory-db-3157b0e258782691" ]]; then
-            RS_DB="${db_path}/advisory-db-3157b0e258782691"
-        fi
-    elif [[ ${#urls[@]} -gt 1 ]]; then
-        # cargo-deny reads every one, and a run record names one database,
-        # so it names none rather than only part of what was read.
-        return 0
-    elif [[ -n "${RUSTSEC_ADVISORY_DB:-}" && "${RUSTSEC_ADVISORY_DB%/*}" == "${db_path}" && -e "${RUSTSEC_ADVISORY_DB}/.git" ]]; then
-        origin=$(git -C "${RUSTSEC_ADVISORY_DB}" remote get-url origin 2> /dev/null) || origin=""
-        for url in ${urls[@]+"${urls[@]}"}; do
-            if [[ -n "${origin}" && "$(rs_url_key "${url}")" == "$(rs_url_key "${origin}")" ]]; then
-                RS_DB=${RUSTSEC_ADVISORY_DB}
-            fi
-        done
+    # cargo-deny reads RustSec's database when db-urls is unset or empty,
+    # and each URL's (duplicates once) otherwise.
+    if [[ ${#urls[@]} -eq 0 ]]; then
+        urls=(https://github.com/RustSec/advisory-db)
     fi
+    for url in "${urls[@]}"; do
+        if ! rs_db_name "${url}" || [[ -n "${name}" && "${RS_DB_NAME}" != "${name}" ]]; then
+            return 0
+        fi
+        name=${RS_DB_NAME}
+    done
+    if [[ -d "${db_path}/${name}" ]]; then
+        RS_DB="${db_path}/${name}"
+    fi
+}
+
+# rs_xxh64 SEED STRING: prints the XXH64 hash of the ASCII STRING, as 16 hex
+# digits. Bash arithmetic is 64-bit and wraps like the unsigned arithmetic
+# XXH64 uses; only right shifts need masking, since bash's are arithmetic.
+rs_xxh64() {
+    local seed=$1 s=$2 len=${#2} i=0 v1 v2 v3 v4 h k
+    local -a b=()
+    local p1=$((0x9E3779B185EBCA87)) p2=$((0xC2B2AE3D27D4EB4F)) p3=$((0x165667B19E3779F9))
+    local p4=$((0x85EBCA77C2B2AE63)) p5=$((0x27D4EB2F165667C5))
+    for ((i = 0; i < len; i++)); do
+        printf -v k '%d' "'${s:i:1}"
+        b+=("${k}")
+    done
+    rotl() { echo $((($1 << $2) | (($1 >> (64 - $2)) & ((1 << $2) - 1)))); }
+    u64() { local j v=0; for ((j = 7; j >= 0; j--)); do v=$(((v << 8) | b[$1 + j])); done; echo "${v}"; }
+    u32() { local j v=0; for ((j = 3; j >= 0; j--)); do v=$(((v << 8) | b[$1 + j])); done; echo "${v}"; }
+    xround() { local acc=$(($1 + $2 * p2)); acc=$(rotl "${acc}" 31); echo $((acc * p1)); }
+    merge() { local val; val=$(xround 0 "$2"); echo $(((($1 ^ val) * p1) + p4)); }
+    i=0
+    if ((len >= 32)); then
+        v1=$((seed + p1 + p2))
+        v2=$((seed + p2))
+        v3=${seed}
+        v4=$((seed - p1))
+        while ((i + 32 <= len)); do
+            v1=$(xround "${v1}" "$(u64 "${i}")")
+            v2=$(xround "${v2}" "$(u64 $((i + 8)))")
+            v3=$(xround "${v3}" "$(u64 $((i + 16)))")
+            v4=$(xround "${v4}" "$(u64 $((i + 24)))")
+            i=$((i + 32))
+        done
+        h=$(($(rotl "${v1}" 1) + $(rotl "${v2}" 7) + $(rotl "${v3}" 12) + $(rotl "${v4}" 18)))
+        h=$(merge "${h}" "${v1}")
+        h=$(merge "${h}" "${v2}")
+        h=$(merge "${h}" "${v3}")
+        h=$(merge "${h}" "${v4}")
+    else
+        h=$((seed + p5))
+    fi
+    h=$((h + len))
+    while ((i + 8 <= len)); do
+        k=$(xround 0 "$(u64 "${i}")")
+        h=$(($(rotl $((h ^ k)) 27) * p1 + p4))
+        i=$((i + 8))
+    done
+    if ((i + 4 <= len)); then
+        h=$(($(rotl $((h ^ ($(u32 "${i}") * p1))) 23) * p2 + p3))
+        i=$((i + 4))
+    fi
+    while ((i < len)); do
+        h=$(($(rotl $((h ^ (b[i] * p5))) 11) * p1))
+        i=$((i + 1))
+    done
+    h=$(((h ^ ((h >> 33) & ((1 << 31) - 1))) * p2))
+    h=$(((h ^ ((h >> 29) & ((1 << 35) - 1))) * p3))
+    h=$((h ^ ((h >> 32) & ((1 << 32) - 1))))
+    printf '%016x\n' "${h}"
+}
+
+# rs_db_name URL: sets RS_DB_NAME to the directory cargo-deny keeps the
+# advisory database cloned from URL in, <last path segment>-<hash>, and
+# returns 0; or sets RS_URL_ERROR to why it can't tell, and returns 1. The
+# hash is rs_xxh64's, with seed 0xca80de71, of the URL as cargo-deny sees it:
+# lowercased, then normalized the way the url crate does for the URLs a
+# database is served from (the default port dropped, an empty path written
+# as "/"). Only https: over plain http, anyone on the network path could
+# serve a database with advisories left out, and see an Authorization
+# header. The path is limited to characters the url crate leaves as they
+# are, without . or .. segments, which it would resolve: otherwise the name
+# would not be the one cargo-deny looks for.
+# shellcheck disable=SC2034 # RS_URL_ERROR is read by the caller
+rs_db_name() {
+    local url=${1,,} scheme host port path label
+    local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+    RS_DB_NAME=""
+    RS_URL_ERROR=""
+    if ! rs_match "${url}" '^(https)://([a-z0-9.-]+)(:[0-9]+)?(/[a-z0-9._~%/+:@!$&()*,;=-]*)?$'; then
+        RS_URL_ERROR="url must be an https URL with a host and a path of plain ASCII, and no user, query or fragment."
+        return 1
+    fi
+    scheme=${BASH_REMATCH[1]}
+    host=${BASH_REMATCH[2]}
+    port=${BASH_REMATCH[3]}
+    path=${BASH_REMATCH[4]:-/}
+    if [[ "${path}/" =~ /(\.|\.\.|%2e|%2e%2e|\.%2e|%2e\.)/ ]]; then
+        RS_URL_ERROR="url's path must not have . or .. segments."
+        return 1
+    fi
+    # The url crate reads a host whose last label is a number (decimal, or
+    # hex with 0x) as an IPv4 address, and writes it as four decimal
+    # numbers, so 127.1 is 127.0.0.1. Only that form keeps the name.
+    label=${host%.}
+    label=${label##*.}
+    if rs_match "${label}" '^([0-9]+|0x[0-9a-f]*)$' && ! rs_match "${host}" "^${octet}(\\.${octet}){3}\$"; then
+        RS_URL_ERROR="url's host must be a name, or an IPv4 address written as four decimal numbers from 0 to 255, such as 192.0.2.10."
+        return 1
+    fi
+    # The url crate reads the port as a number, so :0443 is https's default
+    # port, which it leaves out, and :08080 is :8080.
+    if [[ -n "${port}" ]]; then
+        port=${port#:}
+        port=${port#"${port%%[!0]*}"}
+        if [[ ${#port} -gt 5 ]] || (( 10#${port:-0} > 65535 )); then
+            RS_URL_ERROR="url's port must be 65535 or less."
+            return 1
+        fi
+        port=":$((10#${port:-0}))"
+    fi
+    if [[ "${scheme}:${port}" == "https::443" ]]; then
+        port=""
+    fi
+    RS_DB_NAME="${path##*/}-$(rs_xxh64 $((0xca80de71)) "${scheme}://${host}${port}${path}")"
+}
+
+# rs_url_public URL: prints URL without its userinfo, query and fragment,
+# which can hold credentials (https://user:token@host/... or
+# ?access_token=...).
+rs_url_public() {
+    local url
+    url=$(sed -E 's|^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@|\1|' <<< "$1")
+    printf '%s\n' "${url%%[?#]*}"
 }
 
 # rs_url_key URL: URL as cargo-deny names a database's directory after it:
@@ -835,11 +949,13 @@ rs_audit_extra_args() {
                 echo "ERROR: extra_args can't set ${word}: this command writes the JSON and SARIF reports itself." >&2
                 exit 1
                 ;;
-            # The database and whether it is fetched decide the staleness
-            # check and the database the run record names; the denied kinds
-            # decide which warnings the counts and JUnit report as failures.
+            # The database, whether it is fetched and whether a stale one is
+            # accepted decide the staleness check and the database the run
+            # record names; the denied kinds decide which warnings the counts
+            # and JUnit report as failures.
             --no-fetch) parameter=no_fetch ;;
             --db | --db=*) parameter=db_path ;;
+            --stale) parameter=allow_stale ;;
             --deny | --deny=*) parameter=deny ;;
             --*) ;;
             # Short options can be grouped, as in -qn. q, h and V take no

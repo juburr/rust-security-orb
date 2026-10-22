@@ -199,6 +199,9 @@ zero='{"errors":0,"warnings":0,"notes":0,"helps":0}'
 adv=${zero} bans=${zero} rc=0
 # STUB_DENY_FETCH_FROM/TO: the JSON pass fetches a database, as cargo deny
 # does unless offline.
+# STUB_DENY_LOCK: the JSON pass writes that Cargo.lock, as cargo does when
+# there is none and it isn't --locked.
+if [[ -n "${STUB_DENY_LOCK:-}" && "${format}" == json ]]; then echo "# written by cargo" > "${STUB_DENY_LOCK}"; fi
 if [[ -n "${STUB_DENY_FETCH_TO:-}" && "${format}" == json ]]; then
     mkdir -p "$(dirname "${STUB_DENY_FETCH_TO}")" && cp -a "${STUB_DENY_FETCH_FROM}" "${STUB_DENY_FETCH_TO}"
 fi
@@ -464,10 +467,12 @@ export FAKE_REMOTE="${REMOTE}"
 DEFAULTS=(PARAM_URL=https://github.com/RustSec/advisory-db PARAM_IMPORT= PARAM_DB_DIR= PARAM_ARCHIVE=
     PARAM_AUTH_HEADER_ENV_VAR=)
 DB_NAME=advisory-db-3157b0e258782691
+# The directory cargo-deny names after the test mirror's URL.
+MIRROR_NAME=$(bash -c 'eval "${SCRIPT_RUST_SECURITY_LIB}"; rs_db_name https://mirror.example.test/advisory-db; echo "${RS_DB_NAME}"')
 
 begin "fetch_advisory_db: names the directory as cargo-deny does"
 # rs_xxh64 against the reference XXH64 test vectors.
-XXH=$(sed -n '/^rs_xxh64() {$/,/^}$/p' "${SCRIPTS}/fetch_advisory_db.sh")
+XXH=$(sed -n '/^rs_xxh64() {$/,/^}$/p' "${SCRIPTS}/lib/rust_security.sh")
 for vector in ":0:ef46db3751d8e999" "a:0:d24ec4f1a98c6e5b" "abc:0:44bc2cf5ad770999" \
     "Nobody inspects the spammish repetition:0:fbcea83c8a378bf1"; do
     input=${vector%%:*}
@@ -598,6 +603,19 @@ cp -a "${REMOTE}" "${CASE}/local"
 "${REAL_GIT}" -C "${CASE}/local" remote add origin "/srv/advisory-db"
 run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/local"
 check "and a copy whose origin is a local path, which says nothing about the URL" succeeded
+new_case
+cp -a "${REMOTE}" "${CASE}/withcreds"
+"${REAL_GIT}" -C "${CASE}/withcreds" remote add origin "https://ci:s3cret-token@github.com/RustSec/advisory-db?access_token=s3cret-token"
+"${REAL_GIT}" -C "${CASE}/withcreds" config http.https://github.com/.extraheader "AUTHORIZATION: basic s3cret-token"
+"${REAL_GIT}" -C "${CASE}/withcreds" config url.https://ci:s3cret-token@mirror.example.test/.insteadOf https://mirror.example.test/
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/withcreds" "PARAM_ARCHIVE=${CASE}/out/advisory-db.tar.gz"
+check "imports a copy whose git config holds credentials" succeeded
+check "keeping its remote without them" \
+    test "$("${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" config --get remote.origin.url)" = "https://github.com/RustSec/advisory-db"
+check "and dropping its http.extraHeader and insteadOf" not_file_has "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}/.git/config" "s3cret-token"
+mkdir -p "${CASE}/unpacked" && tar -xzf "${CASE}/out/advisory-db.tar.gz" -C "${CASE}/unpacked"
+check "so the archive holds none of them" test -z "$(grep -rl s3cret-token "${CASE}/unpacked/.git" 2> /dev/null)"
+check "nor the log" not_said "s3cret-token"
 for change in "rm crates/smallvec/RUSTSEC-2021-0003.md" "echo changed >> crates/smallvec/RUSTSEC-2021-0003.md" \
     "mkdir crates/x && echo extra > crates/x/RUSTSEC-0000-0001.md"; do
     new_case
@@ -796,6 +814,15 @@ for word in --no-fetch -n -qn --db --db=/elsewhere -d/elsewhere -qd; do
     check "naming the parameter to use" said "use the $([[ "${word}" == *d* ]] && echo db_path || echo no_fetch) parameter"
     check "before running cargo audit" call_count cargo-audit 0
 done
+audit_case
+run audit.sh PARAM_EXTRA_ARGS=--stale
+check "refuses --stale in extra_args, which the staleness check wouldn't follow" failed
+check "naming the allow_stale parameter" said "use the allow_stale parameter"
+audit_case
+cp "${CASE}/work/Cargo.lock" "${CASE}/work/-b"
+run audit.sh PARAM_LOCKFILE=-b PARAM_RUN_RECORD=true
+check "hashes a lockfile whose name starts with a dash as a file" \
+    json_is "${CASE}/out/cargo-audit.run-record.json" '.inputs[] | select(.role == "lockfile") | .sha256' "$(sha256sum -- "${CASE}/work/-b" | awk '{ print $1 }')"
 for word in --deny --deny=unmaintained "-D unmaintained" -Dunsound -qDyanked; do
     audit_case
     run audit.sh "PARAM_EXTRA_ARGS=${word}"
@@ -1143,6 +1170,10 @@ deny_case
 run deny.sh PARAM_CHECKS=advisory
 check "checks refuses a check cargo deny doesn't have" failed
 check "saying which it takes" said "checks takes advisories, bans, licenses, sources and all"
+deny_case
+run deny.sh PARAM_EXTRA_ARGS=--audit-compatible-output
+check "refuses --audit-compatible-output in extra_args, whose report it would not keep" failed
+check "naming the audit_compatible_output parameter" said "use the audit_compatible_output parameter"
 for word in --format=sarif -fjson; do
     deny_case
     run deny.sh "PARAM_EXTRA_ARGS=${word}"
@@ -1231,6 +1262,13 @@ run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_RUN_RECORD=true
 check "and a package's own lockfile when it is its own workspace" \
     json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path] | join(" ")' "${CASE}/work/app/Cargo.lock"
 deny_case
+echo "[workspace]" > "${CASE}/work/Cargo.toml"
+rm "${CASE}/work/Cargo.lock"
+run deny.sh PARAM_RUN_RECORD=true "STUB_WORKSPACE_ROOT=${CASE}/work" "STUB_DENY_LOCK=${CASE}/work/Cargo.lock"
+check "records a lockfile cargo deny wrote during the check" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '.inputs[] | select(.role == "lockfile") | "\(.path) \(.sha256)"' \
+    "${CASE}/work/Cargo.lock $(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
+deny_case
 mkdir -p "${CASE}/work/.cargo"
 echo "exceptions = []" > "${CASE}/work/.cargo/deny.exceptions.toml"
 run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_CONFIG_PATH=deny.toml PARAM_RUN_RECORD=true
@@ -1266,14 +1304,15 @@ make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
 printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
 run deny.sh PARAM_RUN_RECORD=true
 check "and the RustSec default's copy when deny.toml names other db-urls" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
-for urls in '["https://mirror.example.test/advisory-db"]' $'[\n  # the mirror\n  \'https://mirror.example.test/advisory-db\',\n]'; do
+for urls in '["https://mirror.example.test/advisory-db"]' $'[\n  # the mirror\n  \'https://Mirror.Example.Test:443/advisory-db\',\n]' \
+    '["https://mirror.example.test/advisory-db", "https://mirror.example.test/advisory-db"]'; do
     deny_case
-    make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
-    "${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://Mirror.Example.Test:443/advisory-db"
+    make_db "${CASE}/home/.cargo/advisory-dbs/${MIRROR_NAME}" 2
+    "${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/${MIRROR_NAME}" remote add origin "https://mirror.example.test/advisory-db"
     printf '[advisories]\ndb-urls = %s\n' "${urls}" > "${CASE}/work/deny.toml"
-    run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+    run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/${MIRROR_NAME}"
     check "records fetch_advisory_db's copy of a URL db-urls names (${urls//$'\n'/ })" \
-        json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+        json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/${MIRROR_NAME}"
 done
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
@@ -1304,12 +1343,17 @@ for config in 'advisories.db-path = "~/dbs"' $'[advisories]\n"db-path" = \'~/dbs
         json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/dbs/advisory-db-3157b0e258782691"
 done
 deny_case
-make_db "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" 2
-"${REAL_GIT}" -C "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef" remote add origin "https://mirror.example.test/advisory-db"
+make_db "${CASE}/fetched" 2
+"${REAL_GIT}" -C "${CASE}/fetched" remote add origin "https://mirror.example.test/advisory-db"
 printf 'advisories.db-urls = [\n  "https://mirror.example.test/advisory-db",\n]\n' > "${CASE}/work/deny.toml"
-run deny.sh PARAM_RUN_RECORD=true "RUSTSEC_ADVISORY_DB=${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
-check "and the db-urls database written as advisories.db-urls" \
-    json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/advisory-db-0123456789abcdef"
+run deny.sh PARAM_RUN_RECORD=true "STUB_DENY_FETCH_FROM=${CASE}/fetched" "STUB_DENY_FETCH_TO=${CASE}/home/.cargo/advisory-dbs/${MIRROR_NAME}"
+check "and the db-urls database written as advisories.db-urls, which cargo deny cloned itself" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db.path "${CASE}/home/.cargo/advisory-dbs/${MIRROR_NAME}"
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${MIRROR_NAME}" 2
+printf '[advisories]\ndb-urls = ["ssh://git@mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true
+check "and names no database for a db-urls URL it can't name as cargo deny does" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
 printf 'advisories.db-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
@@ -1515,6 +1559,11 @@ check "records them in the run record" json_is "${CASE}/out/sbom.run-record.json
 check "with the workspace's manifests, which shape them" \
     json_is "${CASE}/out/sbom.run-record.json" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "work/Cargo.toml a/Cargo.toml"
 check "leaves CARGO_BUILD_TARGET alone without target" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
+sbom_case
+rm "${CASE}/work/Cargo.lock"
+run sbom.sh PARAM_LOCKED=false PARAM_RUN_RECORD=true
+check "names the workspace's lockfile even when there is none, with a null hash" \
+    json_is "${CASE}/out/sbom.run-record.json" '.inputs[] | select(.role == "lockfile") | "\(.path) \(.sha256)"' "${CASE}/work/Cargo.lock null"
 sbom_case
 echo '{"bomFormat":"CycloneDX","components":[]}' > "${CASE}/work/crates/a/just-written.cdx.json"
 run sbom.sh

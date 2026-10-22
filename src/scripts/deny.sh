@@ -51,6 +51,10 @@ for word in ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}; do
             echo "ERROR: extra_args can't set ${word}: deny writes the JSON and SARIF reports itself." >&2
             exit 1
             ;;
+        --audit-compatible-output)
+            echo "ERROR: extra_args can't set ${word}: use the audit_compatible_output parameter, which keeps the report it writes." >&2
+            exit 1
+            ;;
     esac
 done
 
