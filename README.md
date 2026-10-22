@@ -297,7 +297,7 @@ Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a f
 
 ### Keep Evidence for an Assessor
 
-`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, the advisory database's URL, commit and commit time, the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
+`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
 
 ### Inventory Licences for Legal Review
 
@@ -357,7 +357,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |
 | `no_yanked` | `false` | Skip the yanked-crate check, which queries the crates.io index (cargo-audit 0.22.2 and later). |
-| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch`, `--db` and `--stale` (`-n`, `-d`): use `no_fetch`, `db_path` and `allow_stale`, which the staleness check and run record follow. `--deny` (`-D`) is refused too: use `deny`, which the counts and JUnit report follow. |
+| `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch`, `--db` and `--stale` (`-n`, `-d`): use `no_fetch`, `db_path` and `allow_stale`, which the staleness check and run record follow. `--deny` (`-D`) is refused too: use `deny`, which the counts and JUnit report follow. Only options and their values are taken: cargo audit would read any other word as a subcommand, such as `bin`, or its argument, and audit something else. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit`. |
 
 ### `rust-security/audit_bin`
@@ -389,7 +389,7 @@ Runs `cargo deny check` against the project's `deny.toml`: advisories, bans, lic
 | `allow`, `warn`, `deny` | *(empty)* | Diagnostic codes or levels to allow, warn on or deny, separated by commas or spaces. Prefer `deny.toml`, where a reason can go with them. |
 | `require_ignore_reasons` | `false` | Fail when an advisory or yanked crate ignored in `deny.toml` has no reason. |
 | `audit_compatible_output` | `false` | Also write the advisories in cargo audit's JSON format, to `<report_name>.audit.json`. |
-| `working_dir`, `extra_args` | | As for `audit`. `--format` is refused in `extra_args`, and so is `--audit-compatible-output`: use `audit_compatible_output`, which keeps that report. |
+| `working_dir`, `extra_args` | | As for `audit`. `--format` is refused in `extra_args`, and so is `--audit-compatible-output`: use `audit_compatible_output`, which keeps that report. `extra_args` takes only options and their values, since cargo deny would read any other word as a check to run: use `checks`. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-deny`. |
 
 ### `rust-security/licenses`
@@ -434,7 +434,7 @@ Writes CycloneDX SBOMs of a workspace from Cargo's metadata with `cargo cycloned
 | `spec_version` | `1.5` | CycloneDX `1.3`, `1.4` or `1.5`. |
 | `describe` | `crate` | `crate`, `binaries` or `all-cargo-targets`. |
 | `features`, `all_features`, `no_default_features` | | The feature set to describe. |
-| `target` | *(empty)* | The target triple to describe, or `all`. Defaults to the host's; a `CARGO_BUILD_TARGET` in the environment is ignored when this is set. |
+| `target` | *(empty)* | The target triple to describe, or `all`. Defaults to the job's `CARGO_BUILD_TARGET`, which cargo cyclonedx would use, passed as `--target` so the run record names it, or else the host's. A `CARGO_BUILD_TARGET` is ignored when this is set. |
 | `top_level` | `false` | List only direct dependencies. |
 | `locked` | `true` | Fail when `Cargo.lock` is missing or out of date. |
 | `offline` | `false` | Use only cargo's cache. |

@@ -953,6 +953,16 @@ for word in -q -cnever "--color never"; do
     run audit.sh "PARAM_EXTRA_ARGS=${word}"
     check "takes ${word}" succeeded
 done
+for words in "bin target/release/app" help "--ignore RUSTSEC-2020-0071 bin app" "-qc never bin app" "-- x" -; do
+    audit_case
+    run audit.sh "PARAM_EXTRA_ARGS=${words}"
+    check "refuses '${words}' in extra_args, which would make cargo audit check something other than the lockfile" failed
+    check "saying so" said "cargo audit would read"
+    check "before running cargo audit" call_count cargo-audit 0
+done
+audit_case
+run audit.sh "PARAM_EXTRA_ARGS=--ignore RUSTSEC-2020-0071 -qc never --target-os linux -fCargo.lock"
+check "but takes option values that aren't options" succeeded
 audit_case
 # shellcheck disable=SC2016 # expanded by the script
 run audit.sh 'PARAM_LOCKFILE=${LOCK_NAME}' LOCK_NAME=Cargo.lock
@@ -972,6 +982,30 @@ check "no_fetch with a fresh database succeeds" succeeded
 check "passing --no-fetch once" called cargo-audit audit --file Cargo.lock --db "${CASE}/db" --no-fetch --json
 check "and once to the SARIF pass" called cargo-audit audit --file Cargo.lock --db "${CASE}/db" --no-fetch --format sarif
 check "saying how old it is" said "(10 days old)"
+audit_case
+make_db "${CASE}/db" 10
+printf '#!/bin/sh\ntouch "%s"\n' "${CASE}/fsmonitor-ran" > "${CASE}/fsmonitor"
+chmod +x "${CASE}/fsmonitor"
+"${REAL_GIT}" -C "${CASE}/db" config core.fsmonitor "${CASE}/fsmonitor"
+run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1 PARAM_RUN_RECORD=1
+check "the run record says when the database's files are exactly its commit's" \
+    json_is "${CASE}/out/cargo-audit.run-record.json" .advisory_db.files_match_commit true
+check "without running commands from the database's git config" absent "${CASE}/fsmonitor-ran"
+for change in "rm crates/smallvec/RUSTSEC-2021-0003.md" "echo changed >> crates/smallvec/RUSTSEC-2021-0003.md" \
+    "echo extra > crates/smallvec/RUSTSEC-0000-0009.md" skip-worktree assume-unchanged; do
+    audit_case
+    make_db "${CASE}/db" 10
+    ADVISORY=crates/smallvec/RUSTSEC-2021-0003.md
+    case "${change}" in
+        skip-worktree) "${REAL_GIT}" -C "${CASE}/db" update-index --skip-worktree "${ADVISORY}" && rm "${CASE}/db/${ADVISORY}" ;;
+        assume-unchanged) "${REAL_GIT}" -C "${CASE}/db" update-index --assume-unchanged "${ADVISORY}" && echo changed >> "${CASE}/db/${ADVISORY}" ;;
+        *) (cd "${CASE}/db" && eval "${change}") ;;
+    esac
+    run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1 PARAM_RUN_RECORD=1
+    check "and when they differ (${change%% *}), so its commit doesn't identify what was scanned" \
+        json_is "${CASE}/out/cargo-audit.run-record.json" .advisory_db.files_match_commit false
+    check "with a warning" said "WARN: The advisory database's files in ${CASE}/db differ from its newest commit"
+done
 audit_case
 make_db "${CASE}/db" 120
 run audit.sh "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=1
@@ -1117,6 +1151,10 @@ bin_case() {
 }
 
 begin "audit_bin"
+bin_case
+run audit_bin.sh PARAM_BINARIES=app "PARAM_EXTRA_ARGS=bin target/release/tool"
+check "refuses a binary in extra_args, which cargo audit bin would audit and the report credit to another" failed
+check "before running cargo audit" call_count cargo-audit 0
 bin_case
 mkdir -p "${CASE}/work/x" "${CASE}/work/a" "${CASE}/work/b"
 for f in x/app-2 a/app b/app; do echo AUDITABLE > "${CASE}/work/${f}"; done
@@ -1305,6 +1343,18 @@ for word in --format=sarif -fjson; do
     deny_case
     run deny.sh "PARAM_EXTRA_ARGS=${word}"
     check "refuses ${word} in extra_args" failed
+done
+for words in advisories "--allow unmaintained advisories" "-A unmaintained sources" "-sg graphs licenses" "-- bans"; do
+    deny_case
+    run deny.sh PARAM_CHECKS=bans "PARAM_EXTRA_ARGS=${words}"
+    check "refuses '${words}' in extra_args, which would run a check checks doesn't name" failed
+    check "naming the checks parameter" said "use the checks parameter"
+    check "before running cargo deny" not_called_with cargo-deny check
+done
+for words in "--allow unmaintained" "-A unmaintained -s" "--graph graphs --hide-inclusion-graph" -Wunmaintained "--feature-depth 2"; do
+    deny_case
+    run deny.sh "PARAM_EXTRA_ARGS=${words}"
+    check "takes '${words}'" succeeded
 done
 
 begin "deny: ignored advisories"
@@ -1740,6 +1790,13 @@ done
 sbom_case
 run sbom.sh PARAM_TARGET=x86_64-unknown-linux-gnu CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
 check "target unsets CARGO_BUILD_TARGET, which would override it" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
+sbom_case
+run sbom.sh CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu PARAM_RUN_RECORD=true
+check "without target, describes the job's CARGO_BUILD_TARGET, as cargo cyclonedx would" \
+    called_with cargo-cyclonedx --target aarch64-unknown-linux-gnu
+check "passing it as --target, so the run record's arguments name it" \
+    json_is "${CASE}/out/sbom.run-record.json" '.arguments | index("aarch64-unknown-linux-gnu") != null' true
+check "and saying so" said "CARGO_BUILD_TARGET"
 sbom_case
 run sbom.sh PARAM_OFFLINE=true PARAM_MANIFEST_PATH=Cargo.toml
 check "offline keeps cargo metadata off the network" called cargo metadata --format-version 1 --locked --manifest-path Cargo.toml --offline

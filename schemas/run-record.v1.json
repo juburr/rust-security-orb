@@ -76,7 +76,11 @@
             "path": { "type": "string" },
             "url": { "type": ["string", "null"] },
             "commit": { "description": "The newest commit; null when the directory has no git history.", "type": ["string", "null"] },
-            "commit_time": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/timestamp" }] }
+            "commit_time": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/timestamp" }] },
+            "files_match_commit": {
+              "description": "Whether the database's files are exactly its newest commit's, none missing, changed or added; when false, commit doesn't identify what was scanned. null when it can't be told, such as without git history.",
+              "type": ["boolean", "null"]
+            }
           }
         }
       ]

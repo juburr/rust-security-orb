@@ -100,6 +100,13 @@ if [[ "${NO_DEFAULT_FEATURES}" == true ]]; then
     RS_ARGS+=(--no-default-features)
 fi
 ENV_ARGS=(env)
+# cargo cyclonedx describes the job's CARGO_BUILD_TARGET when there is no
+# --target, so that target is passed as --target, which the run record's
+# arguments show.
+if [[ -z "${TARGET}" && -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    TARGET=${CARGO_BUILD_TARGET}
+    echo "target is empty, so the SBOMs describe the job's CARGO_BUILD_TARGET, ${TARGET}, as cargo cyclonedx would."
+fi
 if [[ -n "${TARGET}" ]]; then
     RS_ARGS+=(--target "${TARGET}")
     # cargo cyclonedx lets CARGO_BUILD_TARGET override --target.

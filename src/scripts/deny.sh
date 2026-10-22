@@ -45,7 +45,13 @@ rs_require_jq
 rs_tool cargo-deny
 RS_TOOL_VERSION=$("${RS_TOOL}" --version 2> /dev/null || true)
 
+VALUE=false
 for word in ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}; do
+    # The value of the option before it.
+    if [[ "${VALUE}" == true ]]; then
+        VALUE=false
+        continue
+    fi
     case "${word}" in
         -f | --format | --format=* | -f?*)
             echo "ERROR: extra_args can't set ${word}: deny writes the JSON and SARIF reports itself." >&2
@@ -54,6 +60,30 @@ for word in ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}; do
         --audit-compatible-output)
             echo "ERROR: extra_args can't set ${word}: use the audit_compatible_output parameter, which keeps the report it writes." >&2
             exit 1
+            ;;
+        --graph | --warn | --allow | --deny | --feature-depth) VALUE=true ;;
+        # extra_args goes after "check", whose only other arguments are the
+        # checks to run, which decide whether the run record names an
+        # advisory database.
+        -- | [!-]* | -)
+            echo "ERROR: extra_args can't hold ${word}: cargo deny would read it as a check to run, which the run record" >&2
+            echo "  wouldn't follow. To choose the checks, use the checks parameter." >&2
+            exit 1
+            ;;
+        --*) ;;
+        # Short options can be grouped, as in -sA: s and h take no value; any
+        # other option's value is the rest of the word, or else the next word.
+        -?*)
+            FLAGS=${word#-}
+            while [[ "${FLAGS}" == [sh]* ]]; do
+                FLAGS=${FLAGS:1}
+            done
+            if [[ "${FLAGS}" == f* ]]; then
+                echo "ERROR: extra_args can't set ${word}: deny writes the JSON and SARIF reports itself." >&2
+                exit 1
+            elif [[ ${#FLAGS} -eq 1 ]]; then
+                VALUE=true
+            fi
             ;;
     esac
 done

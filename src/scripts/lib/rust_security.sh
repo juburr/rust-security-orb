@@ -366,7 +366,7 @@ rs_gate() {
 # OUTCOME is passed, findings, findings-reported (findings with report_only)
 # or error.
 rs_run_record() {
-    local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url
+    local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url match
     rs_path_manifest_inputs
     for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
         role=${entry%%:*}
@@ -389,18 +389,27 @@ rs_run_record() {
         others=$(jq -c --argjson tool "$(rs_tool_json "${path}" "")" '. + [$tool]' <<< "${others}")
     done
     if [[ -n "${RS_DB:-}" && ! -e "${RS_DB}/.git" ]]; then
-        db_json=$(jq -cn --arg path "${RS_DB}" '{path: $path, url: null, commit: null, commit_time: null}')
+        db_json=$(jq -cn --arg path "${RS_DB}" '{path: $path, url: null, commit: null, commit_time: null, files_match_commit: null}')
     elif [[ -n "${RS_DB:-}" ]]; then
         # A remote URL can carry credentials (https://user:token@host/... or
         # ?access_token=...), which must not reach a stored artifact.
         url=$(git -C "${RS_DB}" remote get-url origin 2> /dev/null || true)
         url=$(rs_url_public "${url}")
+        # A database passed through db_path, or one already in place, can
+        # differ from its commit, which then doesn't identify what the tool
+        # scanned.
+        match=$(rs_db_files_match "${RS_DB}")
+        if [[ "${match}" == false ]]; then
+            echo "WARN: The advisory database's files in ${RS_DB} differ from its newest commit, so that commit doesn't" >&2
+            echo "WARN: identify what was scanned. The run record says files_match_commit: false." >&2
+        fi
         db_json=$(jq -cn --arg path "${RS_DB}" \
             --arg url "${url}" \
             --arg commit "$(git -C "${RS_DB}" log -1 --format=%H 2> /dev/null || true)" \
             --arg time "$(git -C "${RS_DB}" log -1 --format=%cI 2> /dev/null || true)" \
+            --argjson match "${match}" \
             '{path: $path, url: (if $url == "" then null else $url end), commit: (if $commit == "" then null else $commit end),
-                commit_time: (if $time == "" then null else $time end)}')
+                commit_time: (if $time == "" then null else $time end), files_match_commit: $match}')
     fi
     # NUL-separated, so arguments that start with "-" never reach jq's own
     # option parsing. A URL among them, such as cargo audit's --url from
@@ -467,6 +476,39 @@ rs_manifest_inputs() {
         fi
     done < <(jq -r '[(.workspace_root + "/Cargo.toml"),
         (.workspace_members as $m | .packages[] | select(.id as $id | $m | index($id)) | .manifest_path)] | unique[]' <<< "$1" 2> /dev/null)
+}
+
+# rs_db_files_match DIR: prints true when the files in the git checkout DIR
+# are exactly its newest commit's, none missing, changed or added, false when
+# they aren't, and null when git can't tell. It hashes the files itself rather
+# than ask git status, which an index's skip-worktree (sparse) and
+# assume-unchanged entries mislead, and with --no-filters, so nothing the
+# repository's config names runs.
+rs_db_files_match() {
+    local committed files sums present i
+    local -a paths=() hashes=()
+    if ! committed=$(git -C "$1" -c core.quotePath=false ls-tree -r --full-tree HEAD 2> /dev/null \
+        | awk -F '\t' '{ split($1, f, " "); print f[3] " " $2 }' | LC_ALL=C sort) \
+        || ! files=$(cd "$1" && find . -path ./.git -prune -o ! -type d -print | sed 's|^\./||'); then
+        echo null
+        return 0
+    fi
+    if [[ -n "${files}" ]]; then
+        if ! sums=$(cd "$1" && git hash-object --no-filters --stdin-paths <<< "${files}" 2> /dev/null); then
+            echo null
+            return 0
+        fi
+        mapfile -t paths <<< "${files}"
+        mapfile -t hashes <<< "${sums}"
+    fi
+    present=$(for ((i = 0; i < ${#paths[@]}; i++)); do
+        printf '%s %s\n' "${hashes[i]:-}" "${paths[i]}"
+    done | LC_ALL=C sort)
+    if [[ "${committed}" == "${present}" ]]; then
+        echo true
+    else
+        echo false
+    fi
 }
 
 # rs_path_manifest_inputs: when RS_INPUTS lists manifests, adds those of the
@@ -1001,15 +1043,21 @@ rs_audit_options() {
 }
 
 # rs_audit_extra_args: sets RS_EXTRA to the extra_args words, refusing the
-# options that would change the report format these commands write, and
-# those the parameters must set because the command reads them too.
+# options that would change the report format these commands write, those
+# the parameters must set because the command reads them too, and words
+# cargo audit would read as a subcommand or its argument.
 rs_audit_extra_args() {
-    local word extra flags parameter
+    local word extra flags parameter value=false
     extra=$(rs_subst "${PARAM_EXTRA_ARGS}")
     rs_words extra_args "${extra}"
     RS_EXTRA=(${RS_WORDS[@]+"${RS_WORDS[@]}"})
     for word in ${RS_EXTRA[@]+"${RS_EXTRA[@]}"}; do
         parameter=""
+        # The value of the option before it.
+        if [[ "${value}" == true ]]; then
+            value=false
+            continue
+        fi
         case "${word}" in
             --json | --format | --format=*)
                 echo "ERROR: extra_args can't set ${word}: this command writes the JSON and SARIF reports itself." >&2
@@ -1023,9 +1071,20 @@ rs_audit_extra_args() {
             --db | --db=*) parameter=db_path ;;
             --stale) parameter=allow_stale ;;
             --deny | --deny=*) parameter=deny ;;
+            --color | --file | --ignore | --target-arch | --target-os | --url) value=true ;;
+            # cargo audit takes no other arguments than options: a word that
+            # is neither an option nor an option's value is a subcommand
+            # (bin, which audits binaries instead of the lockfile), or after
+            # one, or after --, its argument.
+            -- | [!-]* | -)
+                echo "ERROR: extra_args can't hold ${word}: cargo audit would read it as a subcommand, such as bin, or as its argument," >&2
+                echo "  and audit something other than what this command records. audit checks the lockfile, and audit_bin the binaries it names." >&2
+                exit 1
+                ;;
             --*) ;;
             # Short options can be grouped, as in -qn. q, h and V take no
-            # value; any other option's value is the rest of the word.
+            # value; any other option's value is the rest of the word, or
+            # else the next word.
             -?*)
                 flags=${word#-}
                 while [[ -n "${flags}" && -z "${parameter}" ]]; do
@@ -1034,7 +1093,12 @@ rs_audit_extra_args() {
                         d) parameter=db_path ;;
                         D) parameter=deny ;;
                         q | h | V) flags=${flags:1} ;;
-                        *) flags="" ;;
+                        *)
+                            if [[ -z "${flags:1}" ]]; then
+                                value=true
+                            fi
+                            flags=""
+                            ;;
                     esac
                 done
                 ;;

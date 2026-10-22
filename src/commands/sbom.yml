@@ -50,7 +50,9 @@ parameters:
     default: ""
     description: >
       Describe the dependencies of this target triple, or all for every target. Defaults to
-      the host's. A CARGO_BUILD_TARGET in the environment is ignored when this is set.
+      the job's CARGO_BUILD_TARGET, which cargo cyclonedx would use, passed as --target so
+      the run record names it, or else the host's. A CARGO_BUILD_TARGET in the environment
+      is ignored when this is set.
   top_level:
     type: boolean
     default: false
