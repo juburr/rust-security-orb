@@ -290,7 +290,8 @@ jobs:
   # The auditable round trip: binaries built with cargo auditable keep their dependency list through
   # strip, verify_auditable reads it back and turns it into a CycloneDX SBOM, and audit_bin finds the
   # same advisory as audit in the binary that links smallvec and none in the one built without it.
-  # A binary built without cargo auditable fails verify_auditable.
+  # A binary built without cargo auditable fails verify_auditable. An auditable alias in cargo's
+  # config, which "cargo auditable" would run in place of cargo-auditable, must not stop the build.
   auditable-test:
     docker:
       - image: cimg/rust:1.99
@@ -299,6 +300,11 @@ jobs:
       - rust-security-orb/install:
           tools: cargo-audit cargo-auditable rust-audit-info auditable2cdx
       - rust-security-orb/fetch_advisory_db
+      - run:
+          name: Set An auditable Alias That Prints Help
+          command: |
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '[alias]\nauditable = "help"\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - rust-security-orb/auditable_build:
           working_dir: *fixture
           extra_args: --release --locked

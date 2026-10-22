@@ -312,9 +312,17 @@ printf '{"bomFormat":"CycloneDX","specVersion":"1.3","metadata":{"component":{"n
 EOF
 } > "${STUBS}/auditable2cdx"
 
+# cargo-auditable: runs as cargo runs it, with "auditable" first and CARGO set
+# (STUB_BUILD=fail fails the build).
 {
     echo '#!/usr/bin/env bash'
-    echo 'echo "cargo-auditable stand-in: should be invoked through Cargo"; exit 1'
+    record
+    cat << 'EOF'
+if [[ "${1:-}" != auditable || -z "${CARGO:-}" ]]; then echo "cargo-auditable stand-in: not run as cargo runs it" >&2; exit 1; fi
+echo "cargo-auditable stand-in: building with ${CARGO}"
+[[ "${STUB_BUILD:-}" == fail ]] && { echo "error: could not compile" >&2; exit 101; }
+echo "built"
+EOF
 } > "${STUBS}/cargo-auditable"
 
 # cargo: --version, metadata (STUB_LOCK=stale fails --locked; the workspace
@@ -323,14 +331,15 @@ EOF
 # STUB_LICENSE_FILE as the license-file of each but the root package, and the
 # workspace's and root package's metadata tables STUB_WORKSPACE_METADATA and
 # STUB_PACKAGE_METADATA), pkgid (STUB_PKGIDS lists "name@version=URL path"
-# pairs), locate-project and auditable.
+# pairs), locate-project, and auditable, which prints help, as cargo does when
+# a .cargo/config.toml sets [alias] auditable = "help".
 {
     echo '#!/usr/bin/env bash'
     record
     cat << 'EOF'
 case "$1" in
     --version) echo "cargo 1.99.0 (stand-in)"; exit 0 ;;
-    auditable) [[ "${STUB_BUILD:-}" == fail ]] && { echo "error: could not compile" >&2; exit 101; }; echo "built"; exit 0 ;;
+    auditable) echo "Rust's package manager (help)"; exit 0 ;;
     metadata)
         if [[ " $* " == *" --locked "* && "${STUB_LOCK:-}" == stale ]]; then
             echo "error: the lock file Cargo.lock needs to be updated but --locked was passed to prevent this" >&2; exit 101
@@ -1694,12 +1703,14 @@ begin "auditable_build"
 new_case
 run auditable_build.sh 'PARAM_EXTRA_ARGS=--release --locked --features "a b"'
 check "succeeds" succeeded
-check "builds with cargo auditable, passing extra_args" called cargo auditable build --release --locked --features "a b"
+check "builds with cargo-auditable, passing extra_args" called cargo-auditable auditable build --release --locked --features "a b"
+check "with CARGO naming cargo" said "cargo-auditable stand-in: building with ${STUBS}/cargo"
+check "not through cargo, where an auditable alias would run instead" not_called_with cargo auditable
 check "says what it built with" said "with cargo 1.99.0 (stand-in) and ${STUBS}/cargo-auditable"
 check "without a warning" not_said "WARN:"
 new_case
 run auditable_build.sh PARAM_SUBCOMMAND=install 'PARAM_EXTRA_ARGS=--path . --root /tmp/x'
-check "runs install" called cargo auditable install --path . --root /tmp/x
+check "runs install" called cargo-auditable auditable install --path . --root /tmp/x
 new_case
 run auditable_build.sh STUB_BUILD=fail
 check "a failed build fails" failed
@@ -1710,10 +1721,11 @@ check "refuses another subcommand" failed
 check "before building" call_count cargo 0
 new_case
 mkdir -p "${CASE}/home/.cargo/bin"
-printf '#!/bin/sh\nexit 0\n' > "${CASE}/home/.cargo/bin/cargo-auditable"
+printf '#!/bin/sh\necho "another cargo-auditable"\n' > "${CASE}/home/.cargo/bin/cargo-auditable"
 chmod +x "${CASE}/home/.cargo/bin/cargo-auditable"
 run auditable_build.sh
-check "warns when cargo would run another cargo-auditable" said "WARN: cargo will run ${CASE}/home/.cargo/bin/cargo-auditable"
+check "runs the cargo-auditable on the PATH, not one in \$CARGO_HOME/bin" called cargo-auditable auditable build
+check "only that one" not_said "another cargo-auditable"
 new_case
 run auditable_build.sh "PATH=$(path_without cargo-auditable)"
 check "needs cargo-auditable" failed

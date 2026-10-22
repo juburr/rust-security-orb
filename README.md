@@ -405,7 +405,7 @@ Writes a licence inventory of every crate in the graph with `cargo deny list`, a
 
 ### `rust-security/auditable_build`
 
-Runs `cargo auditable build` (or `install`, or `rustc`), which builds as cargo does and embeds each binary's resolved dependency list. It decides no build options: `extra_args` passes them all to cargo. Warns when cargo would run a different `cargo-auditable` than the one on the `PATH`, as it does when `$CARGO_HOME/bin` holds one and isn't on the `PATH`.
+Runs `cargo auditable build` (or `install`, or `rustc`), which builds as cargo does and embeds each binary's resolved dependency list. It decides no build options: `extra_args` passes them all to cargo. It runs the `cargo-auditable` on the `PATH` directly, as cargo would, so neither an `auditable` alias in a `.cargo/config.toml` nor another `cargo-auditable` in `$CARGO_HOME/bin` can take its place.
 
 | Parameter | Default | Description |
 | --- | --- | --- |

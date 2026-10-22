@@ -31,16 +31,10 @@ case "${SUBCOMMAND}" in
         ;;
 esac
 
-# cargo runs the first cargo-auditable on the PATH for "cargo auditable", and
-# puts $CARGO_HOME/bin first when it isn't on the PATH, so say which one runs.
-FOUND=${RS_TOOL}
-CARGO_BIN="${CARGO_HOME:-${HOME:-}/.cargo}/bin"
-if [[ ":${PATH}:" != *":${CARGO_BIN}:"* && -x "${CARGO_BIN}/cargo-auditable" ]]; then
-    FOUND="${CARGO_BIN}/cargo-auditable"
-fi
-if [[ ! "${FOUND}" -ef "${RS_TOOL}" ]]; then
-    echo "WARN: cargo will run ${FOUND}, not ${RS_TOOL}, since cargo searches \$CARGO_HOME/bin first when it isn't on the PATH." >&2
-fi
-echo "Running cargo auditable ${SUBCOMMAND} ${EXTRA_ARG_LIST[*]-} with $("${CARGO}" --version) and ${FOUND}..."
-"${CARGO}" auditable "${SUBCOMMAND}" ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}
+# cargo would run an auditable alias from any config it reads in place of
+# cargo-auditable, and searches $CARGO_HOME/bin before the PATH when it isn't
+# on it. So the verified binary runs directly, as cargo runs it: with
+# "auditable" first and CARGO naming cargo.
+echo "Running cargo auditable ${SUBCOMMAND} ${EXTRA_ARG_LIST[*]-} with $("${CARGO}" --version) and ${RS_TOOL}..."
+CARGO=${CARGO} "${RS_TOOL}" auditable "${SUBCOMMAND}" ${EXTRA_ARG_LIST[@]+"${EXTRA_ARG_LIST[@]}"}
 echo "Built with cargo auditable: the binaries carry their dependency list. Check the shipped files with verify_auditable."
