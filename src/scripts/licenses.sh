@@ -117,7 +117,9 @@ for format in "${FORMATS[@]}"; do
 done
 rm -f "${RS_BASE}.log"
 
-if [[ -f "${RS_BASE}.json" ]]; then
+# The formats asked for decide, not the files there: an earlier run can have
+# left a JSON inventory in output_dir.
+if [[ " ${FORMATS[*]} " == *" json "* ]]; then
     if [[ "${LAYOUT}" == crate ]]; then
         # shellcheck disable=SC2016 # jq program, not shell
         COUNTS=$(jq -c '{crates: length, licenses: ([.[].licenses[]] | unique | length),
@@ -129,6 +131,24 @@ if [[ -f "${RS_BASE}.json" ]]; then
     fi
     # shellcheck disable=SC2034 # read by rs_run_record
     RS_COUNTS=${COUNTS}
+else
+    # cargo deny writes the same TSV for either layout: a crate column, one
+    # column per licence, then an Unlicensed column when a crate has none,
+    # and a row per crate with an X under each of its licences. The counts
+    # are the ones the layout's JSON gives.
+    # shellcheck disable=SC2034 # read by rs_run_record
+    RS_COUNTS=$(awk -F '\t' -v layout="${LAYOUT}" '
+        NR == 1 { licenses = NF - 1; if (NF > 1 && $NF == "Unlicensed") licenses--; next }
+        {
+            crates++
+            found = 0
+            for (i = 2; i <= licenses + 1; i++) if ($i == "X") found = 1
+            if (!found) unlicensed++
+        }
+        END {
+            if (layout == "crate") printf "{\"crates\":%d,", crates; else printf "{"
+            printf "\"licenses\":%d,\"unlicensed\":%d}\n", licenses, unlicensed
+        }' "${RS_BASE}.tsv")
 fi
 if [[ "${RUN_RECORD}" == true ]]; then
     rs_run_record "${RS_BASE}.run-record.json" licenses passed 0 "${STARTED}"

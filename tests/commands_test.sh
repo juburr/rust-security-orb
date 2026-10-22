@@ -179,10 +179,19 @@ prev=""
 for a in "$@"; do [[ "${prev}" == --format ]] && format=${a}; prev=${a}; done
 if [[ "${args}" == *" list "* ]]; then
     if [[ "${mode}" == crash ]]; then echo "error: list failed" >&2; exit 3; fi
+    # STUB_UNLICENSED adds a crate without a licence, which the TSV marks in an
+    # Unlicensed column, as cargo deny does only when there is one.
+    lonely_list="" lonely_crate="" lonely_column="" lonely_row=""
+    if [[ -n "${STUB_UNLICENSED:-}" ]]; then
+        lonely_list='"lonely 0.1.0 path+file:///lonely"'
+        lonely_crate=',"lonely 0.1.0 path+file:///lonely":{"licenses":[]}'
+        lonely_column=$'\tUnlicensed'
+        lonely_row=$'lonely@0.1.0\t\t\tX\n'
+    fi
     case "${format}:${args}" in
-        json:*" --layout license "*) echo '{"licenses":[["Apache-2.0",["smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index"]],["MIT",["app 0.1.0 path+file:///app","smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index"]]],"unlicensed":[]}' ;;
-        json:*) echo '{"smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index":{"licenses":["MIT","Apache-2.0"]},"app 0.1.0 path+file:///app":{"licenses":["MIT"]}}' ;;
-        tsv:*) printf 'crate\tApache-2.0\tMIT\nsmallvec@1.6.0\tX\tX\napp@0.1.0\t\tX\n' ;;
+        json:*" --layout license "*) echo '{"licenses":[["Apache-2.0",["smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index"]],["MIT",["app 0.1.0 path+file:///app","smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index"]]],"unlicensed":['"${lonely_list}"']}' ;;
+        json:*) echo '{"smallvec 1.6.0 registry+https://github.com/rust-lang/crates.io-index":{"licenses":["MIT","Apache-2.0"]},"app 0.1.0 path+file:///app":{"licenses":["MIT"]}'"${lonely_crate}"'}' ;;
+        tsv:*) printf 'crate\tApache-2.0\tMIT%s\nsmallvec@1.6.0\tX\tX\napp@0.1.0\t\tX\n%s' "${lonely_column}" "${lonely_row}" ;;
     esac
     exit 0
 fi
@@ -758,6 +767,32 @@ run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/common"
 check "refuses a copy that keeps its repository elsewhere (commondir)" failed
 check "saying so" said "keeps its repository elsewhere"
 check "without changing that repository's config" cmp -s "${CASE}/other/.git/config" "${CASE}/other-config"
+for ignore in all none; do
+    new_case
+    make_db "${CASE}/sub"
+    cp -a "${REMOTE}" "${CASE}/withsub"
+    "${REAL_GIT}" -C "${CASE}/withsub" -c protocol.file.allow=always submodule add -q "${CASE}/sub" crates/sub
+    "${REAL_GIT}" -C "${CASE}/withsub" config -f .gitmodules submodule.crates/sub.ignore "${ignore}"
+    "${REAL_GIT}" -C "${CASE}/withsub" add -A
+    "${REAL_GIT}" -C "${CASE}/withsub" -c user.name=t -c user.email=t@example.test commit -q -m sub
+    printf '#!/bin/sh\ntouch "%s"\n' "${CASE}/fsmonitor-ran" > "${CASE}/fsmonitor"
+    chmod +x "${CASE}/fsmonitor"
+    "${REAL_GIT}" -C "${CASE}/withsub/crates/sub" config core.fsmonitor "${CASE}/fsmonitor"
+    echo "changed" >> "${CASE}/withsub/crates/sub/crates/smallvec/RUSTSEC-2021-0003.md"
+    run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/withsub"
+    check "refuses a copy with a submodule (ignore = ${ignore}), whose changed advisories git status needn't show" failed
+    check "saying so" said "has a git repository inside it (crates/sub/.git)"
+    check "without running the submodule's commands, such as its core.fsmonitor" absent "${CASE}/fsmonitor-ran"
+    check "leaving nothing behind" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+done
+new_case
+cp -a "${REMOTE}" "${CASE}/gitlink"
+"${REAL_GIT}" -C "${CASE}/gitlink" update-index --add --cacheinfo "160000,$("${REAL_GIT}" -C "${REMOTE}" rev-parse HEAD),crates/sub"
+"${REAL_GIT}" -C "${CASE}/gitlink" -c user.name=t -c user.email=t@example.test commit -q -m gitlink
+mkdir "${CASE}/gitlink/crates/sub"
+run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/gitlink"
+check "refuses a commit with a submodule, even one that isn't checked out" failed
+check "saying so" said "has a submodule at crates/sub"
 new_case
 cp -a "${REMOTE}" "${CASE}/symlinked"
 mv "${CASE}/symlinked/.git/config" "${CASE}/outside-config"
@@ -1676,6 +1711,22 @@ check "layout license lists crates per licence, with the graph options first" \
     called cargo-deny --manifest-path app/Cargo.toml --features a,b --target aarch64-unknown-linux-gnu --offline list --layout license --format json
 check "prints each licence's crates" said "MIT: 2 crates"
 check "writes only the formats asked for" absent "${CASE}/out/licenses.tsv"
+for unlicensed in "" 1; do
+    for layout in crate license; do
+        deny_case
+        run licenses.sh PARAM_RUN_RECORD=true "PARAM_LAYOUT=${layout}" PARAM_FORMATS=json "STUB_UNLICENSED=${unlicensed}"
+        JSON_COUNTS=$(jq -c .counts "${CASE}/out/licenses.run-record.json")
+        deny_case
+        run licenses.sh PARAM_RUN_RECORD=true "PARAM_LAYOUT=${layout}" PARAM_FORMATS=tsv "STUB_UNLICENSED=${unlicensed}"
+        check "with formats tsv alone, the run record counts what JSON would (layout ${layout}${unlicensed:+, an unlicensed crate}: ${JSON_COUNTS})" \
+            json_is "${CASE}/out/licenses.run-record.json" '.counts | tojson' "${JSON_COUNTS}"
+    done
+done
+deny_case
+run licenses.sh PARAM_FORMATS=json STUB_UNLICENSED=1
+run licenses.sh PARAM_RUN_RECORD=true PARAM_FORMATS=tsv
+check "counts this run's inventory, not a JSON one an earlier run left in output_dir" \
+    json_is "${CASE}/out/licenses.run-record.json" .counts.unlicensed 0
 deny_case
 run licenses.sh STUB_DENY=crash PARAM_RUN_RECORD=true
 check "a failing cargo deny list fails" failed
@@ -1842,6 +1893,16 @@ check "records them in the run record" json_is "${CASE}/out/sbom.run-record.json
 check "with the workspace's manifests, which shape them" \
     json_is "${CASE}/out/sbom.run-record.json" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' "work/Cargo.toml a/Cargo.toml"
 check "leaves CARGO_BUILD_TARGET alone without target" json_is "${CASE}/out/sbom/work.cdx.json" .target unset
+sbom_case
+echo '{"bomFormat":"CycloneDX","stale":true}' > "${CASE}/work/crates/a/ahead.cdx.json"
+echo '{"bomFormat":"CycloneDX","stale":true}' > "${CASE}/work/crates/a/a.cdx.json"
+touch -d 'now + 1 hour' "${CASE}/work/crates/a/ahead.cdx.json" "${CASE}/work/crates/a/a.cdx.json"
+run sbom.sh PARAM_RUN_RECORD=true
+check "an SBOM dated in the future that cargo cyclonedx didn't write stays where it was" exists "${CASE}/work/crates/a/ahead.cdx.json"
+check "out of output_dir" absent "${CASE}/out/sbom/crates/a/ahead.cdx.json"
+check "and out of the counts" json_is "${CASE}/out/sbom.run-record.json" .counts.sboms 2
+check "with a warning" said "WARN: crates/a/ahead.cdx.json is dated in the future, and cargo cyclonedx didn't write it"
+check "while one it rewrote is taken" json_is "${CASE}/out/sbom/crates/a/a.cdx.json" '.stale // false' false
 sbom_case
 mkdir -p "${CASE}/work/legal"
 for file in LICENSE-MIT legal/terms.txt crates/a/COPYING crates/a/NOTICE; do echo "${file}" > "${CASE}/work/${file}"; done

@@ -151,6 +151,15 @@ touch "${MARKER}"
 while [[ "$(date +%s)" -le "$(date -r "${MARKER}" +%s)" ]]; do
     sleep 0.1
 done
+# An SBOM already newer than the marker is dated in the future, as one
+# restored from a cache made where the clock ran ahead can be. It is cargo
+# cyclonedx's only if its time changes.
+declare -A AHEAD=()
+for dir in "${MEMBER_DIRS[@]}"; do
+    while IFS= read -r -d '' file; do
+        AHEAD["${file}"]=$(stat -c %y -- "${file}")
+    done < <(find "${dir}" -maxdepth 1 -type f -newer "${MARKER}" -name "*.cdx.${FORMAT}" -print0)
+done
 echo "Writing CycloneDX ${SPEC_VERSION} SBOMs (${DESCRIBE}) with ${RS_TOOL_VERSION:-cargo-cyclonedx}..."
 RC=0
 "${ENV_ARGS[@]}" "${RS_TOOL}" "${RS_ARGS[@]}" > "${RS_BASE}.log" 2>&1 || RC=$?
@@ -203,6 +212,10 @@ SUMMARY="[]"
 for dir in "${MEMBER_DIRS[@]}"; do
     while IFS= read -r -d '' file; do
         relative=${file#"${ROOT%/}/"}
+        if [[ -n "${AHEAD[${file}]+set}" && "$(stat -c %y -- "${file}")" == "${AHEAD[${file}]}" ]]; then
+            echo "WARN: ${relative} is dated in the future, and cargo cyclonedx didn't write it, so it stays where it is." >&2
+            continue
+        fi
         mkdir -p "$(dirname "${DEST}/${relative}")"
         mv -f "${file}" "${DEST}/${relative}"
         file="${DEST}/${relative}"

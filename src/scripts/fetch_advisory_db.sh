@@ -169,6 +169,17 @@ if [[ -e "${STAGED}/.git/objects/info/alternates" || -e "${STAGED}/.git/objects/
     echo "  git repack -a -d in it and delete that file first." >&2
     exit 1
 fi
+# A repository inside the copy, such as a submodule's checkout, has files the
+# copy's commit doesn't hold, and its own config, which git status reads and
+# runs commands from (core.fsmonitor), or which can hide its changes
+# (submodule.<name>.ignore).
+NESTED=$(cd "${STAGED}" && find . -path ./.git -prune -o -name .git -print -quit)
+if [[ -n "${NESTED}" ]]; then
+    echo "ERROR: The advisory database has a git repository inside it (${NESTED#./}), such as a submodule's checkout: its" >&2
+    echo "  files aren't the commit's, and git would run commands from its config. Use a copy without one, such as the" >&2
+    echo "  archive fetch_advisory_db writes." >&2
+    exit 1
+fi
 GIT_STAGED=(git --git-dir="${STAGED}/.git")
 declare -A SEEN=()
 while IFS= read -r -d '' ENTRY; do
@@ -189,13 +200,26 @@ while IFS= read -r -d '' ENTRY; do
 done < <("${GIT_STAGED[@]}" config --local --null --list 2> /dev/null)
 # The other places git reads settings or commands from: per-worktree config
 # (which only extensions.worktreeConfig, now dropped, made git read), linked
-# worktrees' own config, sparse-checkout patterns and hooks.
-rm -rf "${STAGED}/.git/config.worktree" "${STAGED}/.git/worktrees" "${STAGED}/.git/info/sparse-checkout" "${STAGED}/.git/hooks"
+# worktrees' and submodules' own config, sparse-checkout patterns and hooks.
+rm -rf "${STAGED}/.git/config.worktree" "${STAGED}/.git/worktrees" "${STAGED}/.git/modules" "${STAGED}/.git/info/sparse-checkout" \
+    "${STAGED}/.git/hooks"
 # git -C searches parent directories, so a copy without its own .git inside
 # another work tree would be dated by that repository.
 if [[ ! -e "${STAGED}/.git" ]] || ! COMMIT=$(git -C "${STAGED}" log -1 --format=%H 2> /dev/null) || [[ -z "${COMMIT}" ]]; then
     echo "ERROR: The advisory database is not a git checkout, so its age can't be told. Import a copy with its .git directory," >&2
     echo "  such as the archive fetch_advisory_db writes." >&2
+    exit 1
+fi
+# A submodule in the commit stands for another repository's files, which the
+# commit doesn't identify, even when it isn't checked out.
+if ! TREE=$(git -C "${STAGED}" ls-tree -r --full-tree HEAD 2> /dev/null); then
+    echo "ERROR: Could not list the files of the advisory database's commit ${COMMIT}." >&2
+    exit 1
+fi
+GITLINK=$(awk -F '\t' '$1 ~ /^160000 / { print $2; exit }' <<< "${TREE}")
+if [[ -n "${GITLINK}" ]]; then
+    echo "ERROR: The advisory database's commit ${COMMIT} has a submodule at ${GITLINK}, whose files are another" >&2
+    echo "  repository's, so the commit doesn't identify what the tools would scan. Use a copy without submodules." >&2
     exit 1
 fi
 # cargo-deny names a database's directory after its URL, so an imported copy
