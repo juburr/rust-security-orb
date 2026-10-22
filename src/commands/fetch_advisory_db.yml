@@ -23,7 +23,7 @@ parameters:
       Import a copy staged earlier instead of fetching: a directory holding the database's git
       checkout, or a .tar.gz such as archive writes, for example from the workspace. Nothing
       is fetched then, so it works without network access. The copy must be self-contained
-      (no symbolic links or commondir in .git, no objects borrowed through git clone's
+      (no symbolic links anywhere in it, no commondir, no objects borrowed through git clone's
       --reference or --shared), and its files exactly its newest commit's, sparse checkouts
       and assume-unchanged files included. Environment variables are expanded.
   db_dir:

@@ -712,6 +712,16 @@ check "and the extension that reads it" test -z "$("${REAL_GIT}" -C "${DEST}" co
 check "and the copy's hooks" absent "${DEST}/.git/hooks/post-checkout"
 mkdir -p "${CASE}/unpacked" && tar -xzf "${CASE}/out/advisory-db.tar.gz" -C "${CASE}/unpacked"
 check "so the archive carries none of them" test -z "$(find "${CASE}/unpacked/.git" -name config.worktree -o -name post-checkout)"
+for target in /etc/hostname /etc; do
+    new_case
+    cp -a "${REMOTE}" "${CASE}/linking"
+    ln -s "${target}" "${CASE}/linking/crates/smallvec/RUSTSEC-0000-0009.md"
+    "${REAL_GIT}" -C "${CASE}/linking" add -A && "${REAL_GIT}" -C "${CASE}/linking" -c user.name=t -c user.email=t@example.test commit -q -m link
+    run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/linking"
+    check "refuses a copy with a committed symbolic link (to ${target}), which the tools would follow out of the copy" failed
+    check "saying so" said "symbolic link (crates/smallvec/RUSTSEC-0000-0009.md)"
+    check "leaving nothing behind" absent "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}"
+done
 new_case
 "${REAL_GIT}" clone -q --shared "${REMOTE}" "${CASE}/borrowing"
 "${REAL_GIT}" -C "${CASE}/borrowing" remote remove origin
@@ -1180,6 +1190,10 @@ bin_case() {
 }
 
 begin "audit_bin"
+bin_case
+echo AUDITABLE > "${CASE}/work/target/release/my app"
+run audit_bin.sh "PARAM_BINARIES=target/release/my*"
+check "a pattern's matches keep their spaces" called cargo-audit audit --json bin "target/release/my app"
 bin_case
 echo AUDITABLE > "${CASE}/work/-app"
 run audit_bin.sh PARAM_BINARIES=-app
@@ -2035,6 +2049,14 @@ check "a committed symbolic link matches its commit, hashed as a link" said true
 ln -sfn /etc/hostname "${CASE}/linked/crates/smallvec/latest.md"
 db_match "${CASE}/linked"
 check "and one pointed elsewhere doesn't" said false
+for target in /etc/hostname /etc ../../.git/config; do
+    rm -rf "${CASE}/outward"
+    make_db "${CASE}/outward" 1
+    ln -s "${target}" "${CASE}/outward/crates/smallvec/outward.md"
+    "${REAL_GIT}" -C "${CASE}/outward" add -A && "${REAL_GIT}" -C "${CASE}/outward" -c user.name=t -c user.email=t@example.test commit -q -m outward
+    db_match "${CASE}/outward"
+    check "a committed link to ${target}, whose contents no commit holds, is a difference" said false
+done
 # shellcheck disable=SC2016 # expanded by the helpers
 LIB_TEST 'rs_list features "a, b,,c  \${X}"; printf "<%s>" "${RS_LIST[@]}"' X=d
 check "rs_list splits on commas and spaces" said "<a><b><c>"

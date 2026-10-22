@@ -489,9 +489,11 @@ rs_manifest_inputs() {
 # repository's config names runs. It opens regular files only: a symbolic
 # link is hashed as its target's path, as git commits it, and a FIFO, socket
 # or device, which no commit holds and which could block forever, is a
-# difference.
+# difference. So is a link that resolves outside the checkout or into its
+# .git, even a committed one: the tools follow it to contents no commit
+# holds.
 rs_db_files_match() {
-    local committed files links other sums entry target i
+    local committed files links other sums entry target root resolved i
     local -a paths=() hashes=() lines=()
     if ! committed=$(git -C "$1" -c core.quotePath=false ls-tree -r --full-tree HEAD 2> /dev/null \
         | awk -F '\t' '{ split($1, f, " "); print f[3] " " $2 }' | LC_ALL=C sort) \
@@ -517,7 +519,16 @@ rs_db_files_match() {
         done
     fi
     if [[ -n "${links}" ]]; then
+        if ! root=$(cd "$1" && pwd -P); then
+            echo null
+            return 0
+        fi
         while IFS= read -r entry; do
+            if ! resolved=$(cd "$1" && readlink -f "./${entry}") \
+                || [[ "${resolved}" != "${root}/"* || "${resolved}" == "${root}/.git" || "${resolved}" == "${root}/.git/"* ]]; then
+                echo false
+                return 0
+            fi
             if ! target=$(cd "$1" && readlink "./${entry}") \
                 || ! sums=$(printf '%s' "${target}" | git -C "$1" hash-object --stdin 2> /dev/null); then
                 echo null
