@@ -1,0 +1,132 @@
+description: >
+  Checks with cargo vet that every third-party crate is covered by an audit, an imported audit or
+  an exemption in the project's supply-chain store, and writes cargo-vet's JSON report. Fails when
+  vetting fails, unless report_only is true, and always when cargo vet can't run (no store, a
+  malformed one). Needs cargo and cargo-vet (in the install command's tools).
+parameters:
+  working_dir:
+    type: string
+    default: .
+    description: Directory to run cargo vet in.
+  manifest_path:
+    type: string
+    default: ""
+    description: The Cargo.toml to vet (--manifest-path). Environment variables are expanded.
+  store_path:
+    type: string
+    default: ""
+    description: >
+      The supply-chain store (--store-path). Defaults, as cargo vet does, to the store path in Cargo.toml's
+      [package.metadata.vet] or [workspace.metadata.vet], or else supply-chain in the workspace root.
+      Environment variables are expanded.
+  locked:
+    type: boolean
+    default: true
+    description: >
+      Use the imports recorded in imports.lock rather than fetching them (--locked), so cargo
+      vet makes no network requests of its own and never rewrites the store. Turn it off to
+      fetch the imports config.toml names, whose hosts then need network access. A check
+      that then fails used imported audits cargo vet doesn't write to imports.lock, so the
+      run record can't hash them, and the step warns.
+  frozen:
+    type: boolean
+    default: false
+    description: >
+      Also keep cargo metadata off the network (--frozen), which needs cargo's cache warm.
+  features:
+    type: string
+    default: ""
+    description: >
+      Features to enable, separated by commas or spaces. cargo vet checks every feature unless
+      no_all_features is true.
+  no_all_features:
+    type: boolean
+    default: false
+    description: Don't enable every feature (--no-all-features).
+  no_default_features:
+    type: boolean
+    default: false
+    description: Disable the default features (--no-default-features).
+  filter_graph:
+    type: string
+    default: ""
+    description: >
+      Filter the dependency graph (--filter-graph), such as "exclude(eq(is_dev_only(true)))".
+  extra_args:
+    type: string
+    default: ""
+    description: >
+      More cargo vet options, split like shell words; nothing in them is expanded or run.
+      --store-path and --manifest-path are refused, and so is --manifest-path passed to cargo
+      with --cargo-arg: use store_path and manifest_path, which the run record follows.
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory to write the reports into. Environment variables are not
+      expanded, since the path is also passed to store_artifacts and store_test_results.
+  report_name:
+    type: string
+    default: cargo-vet
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+  junit:
+    type: boolean
+    default: false
+    description: >
+      Also write JUnit XML, one test case per unvetted crate or violation, to
+      output_dir/junit, and show it in CircleCI's Tests tab.
+  report_only:
+    type: boolean
+    default: false
+    description: >
+      Report findings without failing the step, to adopt the check gradually. A tool that
+      can't complete still fails it.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts
+      and every report's SHA-256.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir as job artifacts under rust-security-reports/, including when the step
+      fails.
+steps:
+  - run:
+      name: cargo vet
+      working_directory: << parameters.working_dir >>
+      environment:
+        PARAM_EXTRA_ARGS: << parameters.extra_args >>
+        PARAM_FEATURES: << parameters.features >>
+        PARAM_FILTER_GRAPH: << parameters.filter_graph >>
+        PARAM_FROZEN: << parameters.frozen >>
+        PARAM_JUNIT: << parameters.junit >>
+        PARAM_LOCKED: << parameters.locked >>
+        PARAM_MANIFEST_PATH: << parameters.manifest_path >>
+        PARAM_NO_ALL_FEATURES: << parameters.no_all_features >>
+        PARAM_NO_DEFAULT_FEATURES: << parameters.no_default_features >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_REPORT_ONLY: << parameters.report_only >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        PARAM_STORE_PATH: << parameters.store_path >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/vet.sh) >>
+  - when:
+      condition: << parameters.junit >>
+      steps:
+        - store_test_results:
+            path: << parameters.output_dir >>/junit/<< parameters.report_name >>.xml
+            when: always
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always

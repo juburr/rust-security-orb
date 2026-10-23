@@ -1,0 +1,80 @@
+description: >
+  Checks that each binary carries the dependency list cargo auditable embeds, and that it decodes,
+  by reading it back with rust-audit-info, and fails when one doesn't: stripping with llvm-strip
+  or --strip-section-headers, packers and other post-link steps can remove it without a word.
+  Writes each binary's decoded list as JSON and, with cyclonedx, an SBOM. Needs rust-audit-info
+  (in the install command's tools).
+parameters:
+  working_dir:
+    type: string
+    default: .
+    description: Directory to run in; binaries are relative to it.
+  binaries:
+    type: string
+    description: >
+      The binaries to check, separated by spaces or commas; shell patterns are expanded. Name
+      the final artifacts, after stripping and packaging, which can remove the data.
+      Environment variables are expanded.
+  cyclonedx:
+    type: boolean
+    default: false
+    description: >
+      Also write a CycloneDX SBOM of each binary, made from its embedded dependency list by
+      auditable2cdx (in the install command's tools), to <report_name>-<binary>.cdx.json.
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory to write the reports into. Environment variables are not
+      expanded, since the path is also passed to store_artifacts and store_test_results.
+  report_name:
+    type: string
+    default: auditable
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+  junit:
+    type: boolean
+    default: false
+    description: >
+      Also write JUnit XML, one test case per binary, to output_dir/junit, and show it in
+      CircleCI's Tests tab.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts
+      and every report's SHA-256.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir as job artifacts under rust-security-reports/, including when the step
+      fails.
+steps:
+  - run:
+      name: Verify cargo-auditable data
+      working_directory: << parameters.working_dir >>
+      environment:
+        PARAM_BINARIES: << parameters.binaries >>
+        PARAM_CYCLONEDX: << parameters.cyclonedx >>
+        PARAM_JUNIT: << parameters.junit >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/verify_auditable.sh) >>
+  - when:
+      condition: << parameters.junit >>
+      steps:
+        - store_test_results:
+            path: << parameters.output_dir >>/junit/<< parameters.report_name >>.xml
+            when: always
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always

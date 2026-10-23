@@ -1,0 +1,10 @@
+version: 2.1
+
+description: >
+  Verified installs of the cargo security tools (cargo-audit, cargo-deny, cargo-auditable, cargo-cyclonedx, cargo-vet)
+  and commands that run them the way their authors intend: RustSec advisory scans of lockfiles and shipped binaries,
+  licence, ban and source policy, auditable release builds and SBOMs, with SARIF, JSON and JUnit reports.
+
+display:
+  home_url: "https://github.com/juburr/rust-security-orb"
+  source_url: "https://github.com/juburr/rust-security-orb"

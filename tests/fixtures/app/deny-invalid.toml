@@ -1,0 +1,5 @@
+# A config cargo-deny refuses (allow must be a list), for the test that a
+# cargo deny that can't run fails the step even with report_only.
+
+[licenses]
+allow = "MIT"

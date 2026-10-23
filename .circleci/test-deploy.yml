@@ -1,0 +1,625 @@
+version: 2.1
+orbs:
+  # Your orb will be automatically injected here during the pipeline.
+  # Reference your orb's jobs and commands below as they will exist when built.
+  orb-tools: circleci/orb-tools@12.5
+  # The orb definition is intentionally not included here. It will be injected into the pipeline.
+  rust-security-orb: {}
+
+# Use this tag to ensure test jobs always run,
+# even though the downstream publish job will only run on release tags.
+filters: &filters
+  tags:
+    only: /.*/
+
+# Filter for release tags.
+release-filters: &release-filters
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^v[0-9]+\.[0-9]+\.[0-9]+$/
+
+# The fixture is a workspace whose default feature links smallvec 1.6.0, which RUSTSEC-2021-0003
+# affects, and whose backend-a and backend-b features must never be combined.
+fixture: &fixture tests/fixtures/app
+
+jobs:
+  # Installs every tool on amd64: the four release binaries and the three crates built from source.
+  # Each reports the install command's default version, and leaves an install record that names the
+  # method, the verified asset and the installed binary. A second install takes the verified
+  # download from the cache.
+  install-test:
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - rust-security-orb/install:
+          tools: cargo-audit cargo-deny cargo-auditable cargo-cyclonedx cargo-vet rust-audit-info auditable2cdx
+      - run:
+          name: Verify Install
+          command: |
+            default() { yq ".parameters.${1//-/_}_version.default" src/commands/install.yml; }
+            [[ "$(cargo-audit --version)" == "cargo-audit $(default cargo-audit)" ]]
+            [[ "$(cargo-deny --version)" == "cargo-deny $(default cargo-deny)" ]]
+            [[ "$(cargo cyclonedx --version)" == *" $(default cargo-cyclonedx)" ]]
+            [[ "$(cargo-vet --version)" == "cargo-vet $(default cargo-vet)" ]]
+            for tool in cargo-audit cargo-deny cargo-auditable cargo-cyclonedx cargo-vet rust-audit-info auditable2cdx; do
+              binary=$(command -v "${tool}")
+              record="$(dirname "${binary}")/.${tool}.install.json"
+              jq -c . "${record}"
+              case "${tool}" in
+                cargo-vet | rust-audit-info | auditable2cdx) method=source-built ;;
+                *) method=prebuilt ;;
+              esac
+              jq -e --arg version "$(default "${tool}")" --arg method "${method}" --arg sha "$(sha512sum "${binary}" | awk '{ print $1 }')" \
+                '.version == $version and .method == $method and .verify_checksums == "strict"
+                  and (.asset_sha512 | length) == 128 and .binary_sha512 == $sha' "${record}" > /dev/null
+            done
+      - run:
+          name: Verify A Second Install Uses The Cache
+          command: |
+            for tool in cargo-audit cargo-deny cargo-auditable cargo-cyclonedx rust-audit-info; do
+              version=$(yq ".parameters.${tool//-/_}_version.default" src/commands/install.yml)
+              PARAM_VERSION="${version}" PARAM_VERIFY_CHECKSUMS=strict PARAM_INSTALL_PATH="${HOME}/bin" PARAM_CACHING=true \
+                PARAM_DOWNLOAD_BASE_URL="" bash "src/install/${tool}/install.sh" 2>&1 | tee "/tmp/${tool}-second-install.log"
+              grep -q "from the cache." "/tmp/${tool}-second-install.log"
+              if grep -q "^Downloading" "/tmp/${tool}-second-install.log"; then
+                echo "FAIL: the second install of ${tool} downloaded it again."
+                exit 1
+              fi
+            done
+  # Runs the install scripts under the verify_checksums default declared in install.yml against
+  # real releases that have no checksum in the tables (a missing release cannot explain a failure),
+  # and against a download_base_url mirror: a local HTTPS server serving first the real cargo-deny
+  # release and then a tampered copy, which must be rejected.
+  checksum-test:
+    docker:
+      - image: cimg/python:3.13
+    environment:
+      UNLISTED_DENY: 0.19.4
+      UNLISTED_AUDIT_INFO: 0.5.3
+    steps:
+      - checkout
+      - run:
+          name: Unlisted Versions Fail Closed By Default
+          command: |
+            REPO_DIR=$(pwd)
+            DEFAULT_MODE=$(yq '.parameters.verify_checksums.default' src/commands/install.yml)
+            echo "verify_checksums default: ${DEFAULT_MODE}"
+            for spec in "cargo-deny:${UNLISTED_DENY}" "rust-audit-info:${UNLISTED_AUDIT_INFO}"; do
+              tool=${spec%%:*}
+              version=${spec#*:}
+              cd "$(mktemp -d)" && mkdir bin
+              if HOME="$(pwd)" PARAM_INSTALL_PATH="$(pwd)/bin" PARAM_VERIFY_CHECKSUMS="${DEFAULT_MODE}" PARAM_VERSION="${version}" \
+                  PARAM_CACHING=true PARAM_DOWNLOAD_BASE_URL="" bash "${REPO_DIR}/src/install/${tool}/install.sh"; then
+                echo "FAIL: install succeeded for unlisted ${tool} ${version} under the default."
+                exit 1
+              fi
+              if [[ -n "$(ls -A bin)" || -n "$(ls -A | grep -vx bin)" ]]; then
+                echo "FAIL: install downloaded or installed ${tool} before rejecting the unlisted version."
+                ls -laR
+                exit 1
+              fi
+              echo "PASS: unlisted ${tool} ${version} failed closed before download."
+            done
+      - run:
+          name: known_versions Opt-Out Installs Unlisted Version
+          command: |
+            REPO_DIR=$(pwd)
+            cd "$(mktemp -d)" && mkdir bin
+            PARAM_INSTALL_PATH="$(pwd)/bin" PARAM_VERIFY_CHECKSUMS=known_versions PARAM_VERSION="${UNLISTED_DENY}" \
+              PARAM_CACHING=false PARAM_DOWNLOAD_BASE_URL="" bash "${REPO_DIR}/src/install/cargo-deny/install.sh" 2>&1 | tee install.log
+            grep -q "has no checksum for cargo-deny ${UNLISTED_DENY}" install.log
+            grep -q "UNVERIFIED" install.log
+            [[ "$(bin/cargo-deny --version)" == "cargo-deny ${UNLISTED_DENY}" ]]
+      - run:
+          name: A Mirror Serving A Tampered Release Is Rejected
+          command: |
+            REPO_DIR=$(pwd)
+            VERSION=$(yq '.parameters.version.default' src/commands/install_cargo_deny.yml)
+            ASSET="cargo-deny-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+            MIRROR=$(mktemp -d)
+            DIR="${MIRROR}/www/EmbarkStudios/cargo-deny/releases/download/${VERSION}"
+            mkdir -p "${DIR}"
+            curl --fail --silent --show-error --location --proto '=https' --output "${DIR}/${ASSET}" \
+              "https://github.com/EmbarkStudios/cargo-deny/releases/download/${VERSION}/${ASSET}"
+            openssl req -x509 -newkey rsa:2048 -nodes -keyout "${MIRROR}/key.pem" -out "${MIRROR}/cert.pem" -days 1 \
+              -subj /CN=localhost -addext subjectAltName=DNS:localhost 2> /dev/null
+            cat > "${MIRROR}/serve.py" \<< 'EOF'
+            import functools, http.server, ssl, sys
+            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
+            server = http.server.HTTPServer(("127.0.0.1", 8443), handler)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(sys.argv[2], sys.argv[3])
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            server.serve_forever()
+            EOF
+            python3 "${MIRROR}/serve.py" "${MIRROR}/www" "${MIRROR}/cert.pem" "${MIRROR}/key.pem" > "${MIRROR}/serve.log" 2>&1 &
+            SERVER=$!
+            trap 'kill "${SERVER}"' EXIT
+            sleep 2
+            install_from_mirror() {
+              rm -rf "${MIRROR}/bin" && mkdir "${MIRROR}/bin"
+              CURL_CA_BUNDLE="${MIRROR}/cert.pem" PARAM_INSTALL_PATH="${MIRROR}/bin" PARAM_VERIFY_CHECKSUMS=strict \
+                PARAM_VERSION="${VERSION}" PARAM_CACHING=false PARAM_DOWNLOAD_BASE_URL=https://localhost:8443 \
+                bash "${REPO_DIR}/src/install/cargo-deny/install.sh"
+            }
+            install_from_mirror 2>&1 | tee "${MIRROR}/good.log"
+            grep -q "Downloading https://localhost:8443/EmbarkStudios/cargo-deny/releases/download/${VERSION}/${ASSET}" "${MIRROR}/good.log"
+            [[ "$("${MIRROR}/bin/cargo-deny" --version)" == "cargo-deny ${VERSION}" ]]
+            printf 'tampered' >> "${DIR}/${ASSET}"
+            if install_from_mirror > "${MIRROR}/bad.log" 2>&1; then
+              cat "${MIRROR}/bad.log"
+              echo "FAIL: a tampered release from the mirror was installed."
+              exit 1
+            fi
+            cat "${MIRROR}/bad.log"
+            grep -q "download was rejected and not installed" "${MIRROR}/bad.log"
+            [[ ! -e "${MIRROR}/bin/cargo-deny" ]]
+            echo "PASS: the tampered release was rejected."
+      - run:
+          name: install Refuses A Tool It Doesn't Know
+          command: |
+            if PARAM_TOOLS="cargo-audit cargo-audt" bash src/scripts/install_tools.sh; then
+              echo "FAIL: install accepted a misspelled tool."
+              exit 1
+            fi
+  # Installs every tool on an Arm machine: native release binaries, and the crates built there.
+  arm64-test:
+    docker:
+      - image: cimg/rust:1.99
+    resource_class: arm.medium
+    steps:
+      - checkout
+      - rust-security-orb/install:
+          tools: cargo-audit cargo-deny cargo-auditable cargo-cyclonedx cargo-vet rust-audit-info auditable2cdx
+      - run:
+          name: Verify arm64 Install
+          command: |
+            if [[ "$(uname -m)" != "aarch64" ]]; then
+              echo "FAIL: expected an aarch64 machine, got $(uname -m)."
+              exit 1
+            fi
+            for tool in cargo-audit cargo-deny cargo-auditable cargo-cyclonedx cargo-vet rust-audit-info auditable2cdx; do
+              machine=$(readelf --file-header "$(command -v "${tool}")" | awk -F: '/Machine:/ { gsub(/^ +/, "", $2); print $2 }')
+              echo "${tool}: ${machine}"
+              if [[ "${machine}" != AArch64 ]]; then
+                echo "FAIL: ${tool} is not an arm64 build."
+                exit 1
+              fi
+            done
+            cargo-audit --version
+            cargo-deny --version
+      - rust-security-orb/fetch_advisory_db
+      - rust-security-orb/audit:
+          working_dir: *fixture
+          no_fetch: true
+          report_only: true
+          output_dir: /tmp/reports/arm64
+      - run:
+          name: Verify The Audit Found The Advisory
+          command: jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' /tmp/reports/arm64/cargo-audit.json
+  # Detection: audit and deny fail on the fixture's advisory by default, pass with report_only while
+  # still reporting it, and fail even with report_only when the tool can't run. Also deny's
+  # require_ignore_reasons and the licence inventory, and the advisory database archive and cargo
+  # metadata the offline test uses.
+  detection-test:
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - rust-security-orb/install
+      - rust-security-orb/fetch_advisory_db:
+          archive: /tmp/workspace/advisory-db.tar.gz
+      - run:
+          name: Write The Fixture's cargo metadata
+          working_directory: *fixture
+          command: cargo metadata --format-version 1 --locked > /tmp/workspace/metadata.json
+      - rust-security-orb/audit:
+          working_dir: *fixture
+          no_fetch: true
+          report_only: true
+          junit: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/detection
+      - rust-security-orb/deny:
+          working_dir: *fixture
+          report_only: true
+          junit: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/detection
+      - run:
+          name: Verify report_only Reported The Advisory
+          command: |
+            cd /tmp/workspace/reports/detection
+            jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' cargo-audit.json
+            jq -e '[.runs[].results[].ruleId] | index("RUSTSEC-2021-0003")' cargo-audit.sarif
+            grep -q 'name="RUSTSEC-2021-0003 smallvec 1.6.0"><failure' junit/cargo-audit.xml
+            jq -e '.outcome == "findings-reported" and .counts.vulnerabilities == 1' cargo-audit.run-record.json
+            jq -s -e 'any(.[]; .type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
+            jq -e '[.runs[].results[].partialFingerprints["cargo-deny/advisory-id"]] | index("RUSTSEC-2021-0003")' cargo-deny.sarif
+            grep -q 'name="RUSTSEC-2021-0003 smallvec 1.6.0"><failure' junit/cargo-deny.xml
+            jq -e '.outcome == "findings-reported" and .counts.advisories.errors == 1 and .advisory_db.commit != null' cargo-deny.run-record.json
+      - run:
+          name: Verify audit And deny Fail By Default
+          command: |
+            expect_failure() {
+              local says=$1
+              shift
+              if bash tests/run_command.sh "$@" > /tmp/run.log 2>&1; then
+                cat /tmp/run.log
+                echo "FAIL: $* passed."
+                exit 1
+              fi
+              cat /tmp/run.log
+              grep -qF -- "${says}" /tmp/run.log
+            }
+            expect_failure "ERROR: cargo audit found 1 vulnerabilities" audit working_dir=tests/fixtures/app no_fetch=true
+            expect_failure "ERROR: cargo deny failed: advisories." deny working_dir=tests/fixtures/app
+            # A tool that can't run fails the step even with report_only.
+            expect_failure "ERROR: cargo audit did not complete" audit working_dir=tests/fixtures/app no_fetch=true \
+              lockfile=Cargo.toml report_only=true
+            expect_failure "ERROR: cargo audit found no packages in deny.toml" audit working_dir=tests/fixtures/app no_fetch=true \
+              lockfile=deny.toml report_only=true
+            expect_failure "ERROR: cargo deny did not complete" deny working_dir=tests/fixtures/app \
+              config_path=deny-invalid.toml report_only=true
+            expect_failure "ERROR: config_path missing.toml does not exist" deny working_dir=tests/fixtures/app \
+              config_path=missing.toml report_only=true
+            # An advisory ignored without a reason passes, unless require_ignore_reasons is true.
+            bash tests/run_command.sh deny working_dir=tests/fixtures/app config_path=deny-ignore-bare.toml
+            expect_failure "ignored advisories have no reason in deny.toml (require_ignore_reasons)" deny \
+              working_dir=tests/fixtures/app config_path=deny-ignore-bare.toml require_ignore_reasons=true
+            bash tests/run_command.sh deny working_dir=tests/fixtures/app config_path=deny-ignore-reason.toml require_ignore_reasons=true
+      - rust-security-orb/licenses:
+          working_dir: *fixture
+          all_features: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/detection
+      - run:
+          name: Verify The Licence Inventory Lists Every Crate
+          working_directory: *fixture
+          command: |
+            cargo metadata --format-version 1 --locked --all-features | jq -r '.packages[] | "\(.name) \(.version)"' | sort > /tmp/crates.txt
+            cat /tmp/crates.txt
+            [[ "$(wc -l < /tmp/crates.txt)" -eq 4 ]]
+            jq -r 'keys[] | split(" ")[:2] | join(" ")' /tmp/workspace/reports/detection/licenses.json | sort | diff /tmp/crates.txt -
+            tail -n +2 /tmp/workspace/reports/detection/licenses.tsv | cut -f 1 | tr '@' ' ' | sort | diff /tmp/crates.txt -
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [advisory-db.tar.gz, metadata.json, reports/detection]
+  # The auditable round trip: binaries built with cargo auditable keep their dependency list through
+  # strip, verify_auditable reads it back and turns it into a CycloneDX SBOM, and audit_bin finds the
+  # same advisory as audit in the binary that links smallvec and none in the one built without it.
+  # A binary built without cargo auditable fails verify_auditable. An auditable alias in cargo's
+  # config, which "cargo auditable" would run in place of cargo-auditable, must not stop the build.
+  auditable-test:
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - rust-security-orb/install:
+          tools: cargo-audit cargo-auditable rust-audit-info auditable2cdx
+      - rust-security-orb/fetch_advisory_db
+      - run:
+          name: Set An auditable Alias That Prints Help
+          command: |
+            mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+            printf '[alias]\nauditable = "help"\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+      - rust-security-orb/auditable_build:
+          working_dir: *fixture
+          extra_args: --release --locked
+      - run:
+          name: Strip And Keep The Default Build
+          working_directory: *fixture
+          command: |
+            mkdir -p /tmp/workspace/dist
+            cp target/release/rso-fixture /tmp/workspace/dist/rso-fixture-vulnerable
+            strip /tmp/workspace/dist/rso-fixture-vulnerable
+      - rust-security-orb/auditable_build:
+          working_dir: *fixture
+          extra_args: --release --locked --no-default-features
+      - run:
+          name: Strip And Keep The Build Without smallvec, And Build One Without cargo auditable
+          working_directory: *fixture
+          command: |
+            cp target/release/rso-fixture /tmp/workspace/dist/rso-fixture-clean
+            strip /tmp/workspace/dist/rso-fixture-clean
+            cargo build --release --locked --target-dir target/plain
+            cp target/plain/release/rso-fixture /tmp/rso-fixture-plain
+      - rust-security-orb/verify_auditable:
+          binaries: /tmp/workspace/dist/rso-fixture-vulnerable /tmp/workspace/dist/rso-fixture-clean
+          cyclonedx: true
+          junit: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/auditable
+      - rust-security-orb/audit:
+          working_dir: *fixture
+          no_fetch: true
+          report_only: true
+          output_dir: /tmp/workspace/reports/auditable
+      - rust-security-orb/audit_bin:
+          binaries: /tmp/workspace/dist/rso-fixture-vulnerable
+          require_auditable: true
+          no_fetch: true
+          report_only: true
+          junit: true
+          run_record: true
+          report_name: audit-bin-vulnerable
+          output_dir: /tmp/workspace/reports/auditable
+      # Passes at the default gate: the binary built without the feature doesn't link smallvec.
+      - rust-security-orb/audit_bin:
+          binaries: /tmp/workspace/dist/rso-fixture-clean
+          require_auditable: true
+          no_fetch: true
+          report_name: audit-bin-clean
+          output_dir: /tmp/workspace/reports/auditable
+      - run:
+          name: Verify The Round Trip
+          command: |
+            R=/tmp/workspace/reports/auditable
+            components() { jq -r '[.components[]?.name] | sort | join(" ")' "$1"; }
+            [[ "$(components "${R}/auditable-rso-fixture-vulnerable.cdx.json")" == *smallvec* ]]
+            [[ "$(components "${R}/auditable-rso-fixture-clean.cdx.json")" != *smallvec* ]]
+            ids() { jq -r '[.vulnerabilities.list[].advisory.id] | sort | join(" ")' "$1"; }
+            echo "audit: $(ids "${R}/cargo-audit.json"); audit_bin: $(ids "${R}/audit-bin-vulnerable-rso-fixture-vulnerable.json")"
+            [[ "$(ids "${R}/cargo-audit.json")" == "RUSTSEC-2021-0003" ]]
+            [[ "$(ids "${R}/audit-bin-vulnerable-rso-fixture-vulnerable.json")" == "$(ids "${R}/cargo-audit.json")" ]]
+            [[ "$(ids "${R}/audit-bin-clean-rso-fixture-clean.json")" == "" ]]
+            if bash tests/run_command.sh verify_auditable binaries=/tmp/rso-fixture-plain > /tmp/run.log 2>&1; then
+              cat /tmp/run.log
+              echo "FAIL: verify_auditable passed a binary built without cargo auditable."
+              exit 1
+            fi
+            cat /tmp/run.log
+            grep -q "carry no cargo-auditable data that decodes: /tmp/rso-fixture-plain" /tmp/run.log
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [dist, reports/auditable]
+  # Bans per configuration: with the config for one backend, a build of that backend passes the bans
+  # check, and the other backend, or both, fail it. The workflow runs it for each backend.
+  bans-test:
+    parameters:
+      backend:
+        type: enum
+        enum: ["a", "b"]
+        description: The backend whose configuration to check.
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - rust-security-orb/install:
+          tools: cargo-deny
+      - rust-security-orb/deny:
+          working_dir: *fixture
+          checks: bans
+          config_path: deny-backend-<< parameters.backend >>.toml
+          no_default_features: true
+          features: backend-<< parameters.backend >>
+          junit: true
+          run_record: true
+          report_name: bans-<< parameters.backend >>
+          output_dir: /tmp/workspace/reports/bans-<< parameters.backend >>
+      - run:
+          name: Verify The Other Backend Fails The Bans Check
+          command: |
+            case "<< parameters.backend >>" in
+              a) OTHER=backend-b ;;
+              b) OTHER=backend-a ;;
+            esac
+            for features in "${OTHER}" "backend-a,backend-b"; do
+              if bash tests/run_command.sh deny working_dir=tests/fixtures/app checks=bans \
+                  config_path=deny-backend-<< parameters.backend >>.toml no_default_features=true features="${features}" > /tmp/run.log 2>&1; then
+                cat /tmp/run.log
+                echo "FAIL: the bans check passed with ${features}."
+                exit 1
+              fi
+              cat /tmp/run.log
+              grep -q "ERROR: cargo deny failed: bans." /tmp/run.log
+            done
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [reports/bans-<< parameters.backend >>]
+  # Offline: on a machine with no Rust toolchain, after the tools are installed, github.com and
+  # crates.io stop resolving. audit, deny, licenses and audit_bin then run against the advisory
+  # database detection-test archived, the cargo metadata it wrote and the binaries auditable-test
+  # built. A database 90 days old fails unless allow_stale is true.
+  offline-test:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - rust-security-orb/install:
+          tools: cargo-audit cargo-deny
+      - run:
+          name: Block github.com And crates.io
+          command: |
+            for host in github.com api.github.com codeload.github.com objects.githubusercontent.com \
+                release-assets.githubusercontent.com raw.githubusercontent.com crates.io index.crates.io static.crates.io; do
+              echo "127.0.0.1 ${host}" | sudo tee -a /etc/hosts > /dev/null
+            done
+            for url in https://github.com https://index.crates.io/config.json https://static.crates.io; do
+              if curl --silent --max-time 10 --output /dev/null "${url}"; then
+                echo "FAIL: ${url} is still reachable."
+                exit 1
+              fi
+            done
+            command -v cargo || echo "There is no cargo on this machine: the commands run without a Rust toolchain."
+      - rust-security-orb/fetch_advisory_db:
+          import: /tmp/workspace/advisory-db.tar.gz
+      - rust-security-orb/audit:
+          working_dir: *fixture
+          no_fetch: true
+          no_yanked: true
+          report_only: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/offline
+      - rust-security-orb/deny:
+          working_dir: *fixture
+          offline: true
+          metadata_path: /tmp/workspace/metadata.json
+          report_only: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/offline
+      - rust-security-orb/licenses:
+          working_dir: *fixture
+          offline: true
+          metadata_path: /tmp/workspace/metadata.json
+          output_dir: /tmp/workspace/reports/offline
+      - rust-security-orb/audit_bin:
+          binaries: /tmp/workspace/dist/rso-fixture-vulnerable
+          no_fetch: true
+          report_only: true
+          output_dir: /tmp/workspace/reports/offline
+      - run:
+          name: Verify Each Command Found The Advisory Offline
+          command: |
+            cd /tmp/workspace/reports/offline
+            jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' cargo-audit.json
+            jq -s -e 'any(.[]; .type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
+            jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' cargo-audit-bin-rso-fixture-vulnerable.json
+            jq -e 'keys | map(startswith("smallvec 1.6.0")) | any' licenses.json
+      - run:
+          name: Verify A Stale Database Fails Unless Allowed
+          command: |
+            # The same advisories, with their newest commit 120 days old.
+            STALE=$(mktemp -d)
+            cp -a "${HOME}/.cargo/advisory-dbs/advisory-db-3157b0e258782691/." "${STALE}/"
+            rm -rf "${STALE}/.git"
+            WHEN=$(($(date +%s) - 120 * 86400))
+            (cd "${STALE}" && git init -q && git add -A \
+              && GIT_AUTHOR_DATE="@${WHEN}" GIT_COMMITTER_DATE="@${WHEN}" git -c user.name=test -c user.email=test@example.test commit -q -m stale)
+            bash tests/run_command.sh fetch_advisory_db import="${STALE}"
+            expect_failure() {
+              local says=$1
+              shift
+              if bash tests/run_command.sh "$@" > /tmp/run.log 2>&1; then
+                cat /tmp/run.log
+                echo "FAIL: $* passed."
+                exit 1
+              fi
+              cat /tmp/run.log
+              grep -qF -- "${says}" /tmp/run.log
+            }
+            export RUSTSEC_ADVISORY_DB="${HOME}/.cargo/advisory-dbs/advisory-db-3157b0e258782691"
+            expect_failure "newest commit is 120 days old" audit working_dir=tests/fixtures/app no_fetch=true no_yanked=true report_only=true
+            bash tests/run_command.sh audit working_dir=tests/fixtures/app no_fetch=true no_yanked=true allow_stale=true report_only=true
+            expect_failure "repository is stale" deny working_dir=tests/fixtures/app offline=true \
+              metadata_path=/tmp/workspace/metadata.json report_only=true
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [reports/offline]
+  # cargo vet passes with the fixture's supply-chain store and fails with one that has no exemption
+  # for smallvec. sbom writes one CycloneDX SBOM per workspace member without touching Cargo.lock.
+  supply-chain-test:
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - rust-security-orb/install:
+          tools: cargo-vet cargo-cyclonedx
+      - rust-security-orb/vet:
+          working_dir: *fixture
+          locked: true
+          junit: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/supply-chain
+      - run:
+          name: Verify Unvetted Crates Fail
+          command: |
+            if bash tests/run_command.sh vet working_dir=tests/fixtures/app locked=true store_path=supply-chain-unvetted > /tmp/run.log 2>&1; then
+              cat /tmp/run.log
+              echo "FAIL: cargo vet passed without an exemption for smallvec."
+              exit 1
+            fi
+            cat /tmp/run.log
+            grep -q "unvetted: smallvec 1.6.0, missing safe-to-deploy" /tmp/run.log
+      - rust-security-orb/sbom:
+          working_dir: *fixture
+          run_record: true
+          output_dir: /tmp/workspace/reports/supply-chain
+      - run:
+          name: Verify The SBOMs
+          command: |
+            git diff --exit-code -- tests/fixtures/app/Cargo.lock
+            if find tests -name '*.cdx.json' | grep .; then
+              echo "FAIL: an SBOM was left in the workspace."
+              exit 1
+            fi
+            SBOMS=/tmp/workspace/reports/supply-chain/sbom
+            find "${SBOMS}" -type f | sort
+            [[ "$(find "${SBOMS}" -name '*.cdx.json' | wc -l)" -eq 3 ]]
+            jq -e '[.components[].name] | index("smallvec")' "${SBOMS}/rso-fixture.cdx.json"
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [reports/supply-chain]
+  # Every SARIF file the tests wrote validates against the SARIF 2.1.0 schema, every JUnit file is
+  # well-formed, every run record validates against schemas/run-record.v1.json, and every CycloneDX
+  # SBOM says what it is.
+  reports-test:
+    docker:
+      - image: cimg/python:3.13
+    steps:
+      - checkout
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Validate The Reports
+          command: |
+            pip install --quiet jsonschema==4.26.0
+            curl --fail --silent --show-error --location --proto '=https' --output /tmp/sarif-schema-2.1.0.json \
+              https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json
+            echo "c3b4bb2d6093897483348925aaa73af03b3e3f4bd4ca38cef26dcb4212a2682e  /tmp/sarif-schema-2.1.0.json" | sha256sum -c -
+            python3 tests/validate_reports.py --sarif-schema /tmp/sarif-schema-2.1.0.json /tmp/workspace/reports
+
+workflows:
+  test-deploy:
+    jobs:
+      # Make sure to include "filters: *filters" in every test job you want to run as part of your deployment.
+      # Test your orb's commands in a custom job and test your orb's jobs directly as a part of this workflow.
+      - install-test:
+          filters: *filters
+      - checksum-test:
+          filters: *filters
+      - arm64-test:
+          filters: *filters
+      - detection-test:
+          filters: *filters
+      - auditable-test:
+          filters: *filters
+      - bans-test:
+          name: bans-test-<< matrix.backend >>
+          matrix:
+            parameters:
+              backend: ["a", "b"]
+          filters: *filters
+      - offline-test:
+          requires: [detection-test, auditable-test]
+          filters: *filters
+      - supply-chain-test:
+          filters: *filters
+      - reports-test:
+          requires: [detection-test, auditable-test, bans-test, offline-test, supply-chain-test]
+          filters: *filters
+      # The orb must be re-packed for publishing, and saved to the workspace.
+      - orb-tools/pack:
+          filters: *release-filters
+      - orb-tools/publish:
+          orb_name: juburr/rust-security-orb
+          vcs_type: << pipeline.project.type >>
+          pub_type: production
+          # Ensure this job requires all test jobs and the pack job.
+          requires:
+            - orb-tools/pack
+            - install-test
+            - checksum-test
+            - arm64-test
+            - detection-test
+            - auditable-test
+            - bans-test
+            - offline-test
+            - supply-chain-test
+            - reports-test
+          context: orb-publishing
+          filters: *release-filters

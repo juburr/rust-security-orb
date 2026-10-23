@@ -1,0 +1,44 @@
+description: >
+  Build release binaries with cargo auditable, which embeds each binary's
+  resolved dependency list, then check the files you ship: verify_auditable
+  fails if stripping or packaging removed the list and writes a CycloneDX
+  SBOM of what each binary links, and audit_bin checks each binary against
+  the RustSec advisory database. run_record keeps the evidence of what was
+  checked.
+
+usage:
+  version: 2.1
+  orbs:
+    rust-security: juburr/rust-security-orb@0.1.0
+  jobs:
+    release:
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - rust-security/install:
+            tools: cargo-audit cargo-auditable rust-audit-info auditable2cdx
+        - rust-security/fetch_advisory_db
+        - rust-security/auditable_build:
+            extra_args: --release --locked
+        - run:
+            name: Package
+            command: |
+              mkdir -p dist
+              cp target/release/myapp dist/
+              strip dist/myapp
+        - rust-security/verify_auditable:
+            binaries: dist/myapp
+            cyclonedx: true
+            run_record: true
+        - rust-security/audit_bin:
+            binaries: dist/myapp
+            require_auditable: true
+            no_fetch: true
+            run_record: true
+        - store_artifacts:
+            path: dist
+  workflows:
+    release:
+      jobs:
+        - release

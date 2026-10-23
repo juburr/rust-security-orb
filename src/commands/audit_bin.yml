@@ -1,0 +1,161 @@
+description: >
+  Checks built binaries against the RustSec advisory database with cargo audit bin, reading the
+  dependency list cargo auditable embedded in each, so it checks what actually ships rather than
+  the lockfile's superset of every feature set and target. Writes a JSON (and SARIF) report per
+  binary and an index, <report_name>.json. Fails on vulnerabilities and denied warnings unless
+  report_only is true, and always when a binary can't be audited at all. Install cargo-audit
+  first, and build the binaries with auditable_build.
+parameters:
+  working_dir:
+    type: string
+    default: .
+    description: >
+      Directory to run cargo audit in; binaries are relative to it. cargo audit reads
+      .cargo/audit.toml from here, or else from CARGO_HOME.
+  binaries:
+    type: string
+    description: >
+      The binaries to audit, separated by spaces or commas; shell patterns such as
+      dist/* are expanded, and everything they match must be a binary (target/release/*
+      also matches directories and .d files). Name the files you ship, after any
+      stripping or packaging. Environment variables are expanded.
+  require_auditable:
+    type: boolean
+    default: false
+    description: >
+      Count a binary without cargo-auditable data that decodes as a finding, since cargo audit
+      can only guess its dependencies from panic messages. Needs rust-audit-info (in the
+      install command's tools).
+  db_path:
+    type: string
+    default: ""
+    description: >
+      The advisory database to use (cargo audit --db). Defaults to the one fetch_advisory_db
+      fetched or imported earlier in the job (RUSTSEC_ADVISORY_DB), or else
+      $CARGO_HOME/advisory-db. Environment variables are expanded.
+  no_fetch:
+    type: boolean
+    default: false
+    description: >
+      Use the database as it is, without updating it (cargo audit --no-fetch). This command
+      then applies cargo audit's own staleness rule itself: a database whose newest commit is
+      90 days old or more fails the step, unless allow_stale is true.
+  allow_stale:
+    type: boolean
+    default: false
+    description: >
+      Use an advisory database whose newest commit is 90 days old or more (cargo audit
+      --stale), instead of failing.
+  deny:
+    type: string
+    default: ""
+    description: >
+      Warning kinds that fail the step like vulnerabilities (cargo audit --deny), separated by
+      commas or spaces: unmaintained, unsound, yanked, or warnings for all three.
+  target_arch:
+    type: string
+    default: ""
+    description: >
+      Only report vulnerabilities that affect these CPU architectures (cargo audit
+      --target-arch), separated by commas or spaces.
+  target_os:
+    type: string
+    default: ""
+    description: >
+      Only report vulnerabilities that affect these operating systems (cargo audit
+      --target-os), separated by commas or spaces.
+  no_yanked:
+    type: boolean
+    default: false
+    description: >
+      Skip the check for yanked crates (cargo audit --no-yanked, cargo-audit 0.22.2 and
+      later), which otherwise queries the crates.io index.
+  extra_args:
+    type: string
+    default: ""
+    description: >
+      More cargo audit options, split like shell words; nothing in them is expanded or run.
+      --json and --format are refused, since this command writes the reports, and so are
+      --no-fetch, --db and --stale (-n, -d): use no_fetch, db_path and allow_stale, which
+      the staleness check and run record follow. --deny (-D) is refused too: use deny, which the counts and
+      JUnit report follow. Only options and their values are taken: cargo audit would read
+      any other word as a subcommand, such as bin, or its argument.
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory to write the reports into. Environment variables are not
+      expanded, since the path is also passed to store_artifacts and store_test_results.
+  report_name:
+    type: string
+    default: cargo-audit-bin
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+  sarif:
+    type: boolean
+    default: true
+    description: Also write a SARIF 2.1.0 report, <report_name>.sarif.
+  junit:
+    type: boolean
+    default: false
+    description: >
+      Also write JUnit XML, one test case per finding per binary, to output_dir/junit, and
+      show it in CircleCI's Tests tab: vulnerabilities, denied warnings and (with
+      require_auditable) binaries without cargo-auditable data fail; other warnings are
+      skipped.
+  report_only:
+    type: boolean
+    default: false
+    description: >
+      Report findings without failing the step, to adopt the check gradually. A tool that
+      can't complete still fails it.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts
+      and every report's SHA-256.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir as job artifacts under rust-security-reports/, including when the step
+      fails.
+steps:
+  - run:
+      name: cargo audit bin
+      working_directory: << parameters.working_dir >>
+      environment:
+        PARAM_ALLOW_STALE: << parameters.allow_stale >>
+        PARAM_BINARIES: << parameters.binaries >>
+        PARAM_DB_PATH: << parameters.db_path >>
+        PARAM_DENY: << parameters.deny >>
+        PARAM_EXTRA_ARGS: << parameters.extra_args >>
+        PARAM_JUNIT: << parameters.junit >>
+        PARAM_NO_FETCH: << parameters.no_fetch >>
+        PARAM_NO_YANKED: << parameters.no_yanked >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_REPORT_ONLY: << parameters.report_only >>
+        PARAM_REQUIRE_AUDITABLE: << parameters.require_auditable >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        PARAM_SARIF: << parameters.sarif >>
+        PARAM_TARGET_ARCH: << parameters.target_arch >>
+        PARAM_TARGET_OS: << parameters.target_os >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/audit_bin.sh) >>
+  - when:
+      condition: << parameters.junit >>
+      steps:
+        - store_test_results:
+            path: << parameters.output_dir >>/junit/<< parameters.report_name >>.xml
+            when: always
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always

@@ -1,0 +1,29 @@
+description: >
+  Check a Rust project on every push: install verified cargo-audit and
+  cargo-deny, fetch the RustSec advisory database once, audit Cargo.lock
+  against it, and run cargo-deny's advisories, bans, licences and sources
+  checks against the project's deny.toml. Findings fail the job; the JSON,
+  SARIF and JUnit reports are stored even when it fails.
+
+usage:
+  version: 2.1
+  orbs:
+    rust-security: juburr/rust-security-orb@0.1.0
+  jobs:
+    security:
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - rust-security/install
+        - rust-security/fetch_advisory_db
+        - rust-security/audit:
+            no_fetch: true
+            junit: true
+        - rust-security/deny:
+            junit: true
+            require_ignore_reasons: true
+  workflows:
+    security:
+      jobs:
+        - security

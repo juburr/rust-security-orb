@@ -1,0 +1,219 @@
+description: >
+  Checks a project against its own deny.toml with cargo deny check: advisories (RustSec),
+  licences, banned crates and sources. Writes cargo-deny's JSON diagnostics (<report_name>.jsonl,
+  which also lists every advisory an ignore in deny.toml applied to) and a SARIF report. The step
+  fails when a check finds errors, as deny.toml configures them, unless report_only is true; it
+  always fails when cargo deny itself fails. Run it once per shipped feature set and target, such
+  as in a matrix, since each has its own dependency graph. Needs cargo-deny 0.20.0 or newer (the
+  install command installs it by default).
+parameters:
+  working_dir:
+    type: string
+    default: .
+    description: Directory to run cargo deny in. Relative paths are relative to it.
+  checks:
+    type: string
+    default: ""
+    description: >
+      The checks to run, separated by commas or spaces: advisories, bans, licenses, sources.
+      Defaults to all four.
+  manifest_path:
+    type: string
+    default: ""
+    description: >
+      The Cargo.toml to check (cargo deny --manifest-path), relative to working_dir. Defaults
+      to the one in working_dir. Environment variables are expanded.
+  config_path:
+    type: string
+    default: ""
+    description: >
+      The cargo-deny config to use (--config). Defaults to the first deny.toml, .deny.toml or
+      .cargo/deny.toml cargo deny finds in the manifest's directory or above. A path that
+      doesn't exist fails the step, rather than fall back to cargo-deny's default config.
+      Environment variables are expanded.
+  metadata_path:
+    type: string
+    default: ""
+    description: >
+      Check against this pre-generated cargo metadata output (--metadata-path) instead of
+      running cargo metadata, for a reproducible graph with no network. Environment variables
+      are expanded.
+  features:
+    type: string
+    default: ""
+    description: >
+      Features to enable (--features), separated by commas or spaces. Check the feature set
+      you ship: it decides the dependency graph.
+  all_features:
+    type: boolean
+    default: false
+    description: Enable every feature (--all-features).
+  no_default_features:
+    type: boolean
+    default: false
+    description: Disable the default features (--no-default-features).
+  target:
+    type: string
+    default: ""
+    description: >
+      Check only the dependencies of this target triple (--target), such as
+      x86_64-unknown-linux-gnu. deny.toml's [graph] targets lists several. Environment
+      variables are expanded.
+  offline:
+    type: boolean
+    default: false
+    description: >
+      Run without network access (--offline): cargo deny doesn't fetch the advisory database
+      (fetch_advisory_db provides it) and cargo metadata uses only cargo's cache, so warm it
+      or use metadata_path. The database's age is checked against deny.toml's
+      maximum-db-staleness (90 days by default). With [bans.std-replacements], run
+      cargo deny fetch std-replacement earlier in the job: without that data cargo deny
+      skips the check, and the step fails rather than pass without it.
+  locked:
+    type: boolean
+    default: false
+    description: Fail when Cargo.lock is out of date, instead of updating it (--locked).
+  frozen:
+    type: boolean
+    default: false
+    description: Both offline and locked (--frozen).
+  workspace:
+    type: boolean
+    default: false
+    description: >
+      Check every workspace member (--workspace), as a release build of the whole workspace
+      resolves them.
+  exclude:
+    type: string
+    default: ""
+    description: Workspace members to leave out (--exclude), separated by commas or spaces.
+  exclude_dev:
+    type: boolean
+    default: false
+    description: Leave out dev-dependencies (--exclude-dev), which never ship.
+  allow:
+    type: string
+    default: ""
+    description: >
+      Diagnostic codes (such as unmaintained) or levels (warnings) to allow (-A), separated by
+      commas or spaces. Prefer deny.toml, where the reason can sit next to it.
+  warn:
+    type: string
+    default: ""
+    description: >
+      Diagnostic codes or levels to turn into warnings (-W), separated by commas or spaces.
+  deny:
+    type: string
+    default: ""
+    description: >
+      Diagnostic codes or levels to turn into errors (-D), separated by commas or spaces, such
+      as warnings.
+  require_ignore_reasons:
+    type: boolean
+    default: false
+    description: >
+      Fail when an advisory or yanked crate ignored in deny.toml has no reason ({ id =
+      "RUSTSEC-...", reason = "..." }), or a blank one. It reads cargo deny's own report of
+      each ignore it applied, so only ignores that matched count.
+  audit_compatible_output:
+    type: boolean
+    default: false
+    description: >
+      Also write the advisories in cargo audit's JSON format (--audit-compatible-output), to
+      <report_name>.audit.json.
+  extra_args:
+    type: string
+    default: ""
+    description: >
+      More cargo deny check options, split like shell words; nothing in them is expanded or
+      run. --format is refused, since this command writes the reports, and so is
+      --audit-compatible-output: use audit_compatible_output, which keeps that report.
+      Only options and their values are taken: cargo deny would read any other word as a
+      check to run, which checks names.
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory to write the reports into. Environment variables are not
+      expanded, since the path is also passed to store_artifacts and store_test_results.
+  report_name:
+    type: string
+    default: cargo-deny
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+  sarif:
+    type: boolean
+    default: true
+    description: Also write a SARIF 2.1.0 report, <report_name>.sarif.
+  junit:
+    type: boolean
+    default: false
+    description: >
+      Also write JUnit XML, one test case per error or warning, to output_dir/junit, and show
+      it in CircleCI's Tests tab: errors fail, warnings are skipped.
+  report_only:
+    type: boolean
+    default: false
+    description: >
+      Report findings without failing the step, to adopt the check gradually. A tool that
+      can't complete still fails it.
+  run_record:
+    type: boolean
+    default: false
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts
+      and every report's SHA-256.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir as job artifacts under rust-security-reports/, including when the step
+      fails.
+steps:
+  - run:
+      name: cargo deny check << parameters.checks >>
+      working_directory: << parameters.working_dir >>
+      environment:
+        PARAM_ALL_FEATURES: << parameters.all_features >>
+        PARAM_ALLOW: << parameters.allow >>
+        PARAM_AUDIT_COMPATIBLE_OUTPUT: << parameters.audit_compatible_output >>
+        PARAM_CHECKS: << parameters.checks >>
+        PARAM_CONFIG_PATH: << parameters.config_path >>
+        PARAM_DENY: << parameters.deny >>
+        PARAM_EXCLUDE: << parameters.exclude >>
+        PARAM_EXCLUDE_DEV: << parameters.exclude_dev >>
+        PARAM_EXTRA_ARGS: << parameters.extra_args >>
+        PARAM_FEATURES: << parameters.features >>
+        PARAM_FROZEN: << parameters.frozen >>
+        PARAM_JUNIT: << parameters.junit >>
+        PARAM_LOCKED: << parameters.locked >>
+        PARAM_MANIFEST_PATH: << parameters.manifest_path >>
+        PARAM_METADATA_PATH: << parameters.metadata_path >>
+        PARAM_NO_DEFAULT_FEATURES: << parameters.no_default_features >>
+        PARAM_OFFLINE: << parameters.offline >>
+        PARAM_OUTPUT_DIR: << parameters.output_dir >>
+        PARAM_REPORT_NAME: << parameters.report_name >>
+        PARAM_REPORT_ONLY: << parameters.report_only >>
+        PARAM_REQUIRE_IGNORE_REASONS: << parameters.require_ignore_reasons >>
+        PARAM_RUN_RECORD: << parameters.run_record >>
+        PARAM_SARIF: << parameters.sarif >>
+        PARAM_TARGET: << parameters.target >>
+        PARAM_WARN: << parameters.warn >>
+        PARAM_WORKSPACE: << parameters.workspace >>
+        SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
+      command: << include(scripts/deny.sh) >>
+  - when:
+      condition: << parameters.junit >>
+      steps:
+        - store_test_results:
+            path: << parameters.output_dir >>/junit/<< parameters.report_name >>.xml
+            when: always
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always
