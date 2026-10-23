@@ -1,0 +1,13 @@
+[package]
+name = "rso-standalone"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Test fixture for rust-security-orb: a standalone workspace with its own Cargo.lock, as fuzz targets and test harnesses have."
+
+[dependencies]
+smallvec = "=1.6.0"
+
+# Its own workspace, so cargo doesn't take it for a member of the fixture's.
+[workspace]

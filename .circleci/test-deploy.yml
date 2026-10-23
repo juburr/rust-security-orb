@@ -231,6 +231,38 @@ jobs:
           run_record: true
           store_artifacts: false
           output_dir: /tmp/workspace/reports/detection
+      # Several lockfiles and manifests in one step: the fixture and its standalone workspace.
+      - rust-security-orb/audit:
+          working_dir: *fixture
+          lockfiles: Cargo.lock standalone/Cargo.lock
+          no_fetch: true
+          report_only: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: audit-lockfiles
+          output_dir: /tmp/workspace/reports/detection
+      - rust-security-orb/deny:
+          working_dir: *fixture
+          manifest_paths: Cargo.toml standalone/Cargo.toml
+          checks: bans licenses sources
+          locked: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: deny-manifests
+          output_dir: /tmp/workspace/reports/detection
+      - run:
+          name: Verify Each Lockfile And Manifest Has Its Reports
+          command: |
+            cd /tmp/workspace/reports/detection
+            jq -e '[.lockfiles[] | "\(.slug) \(.vulnerabilities) \(.outcome)"] == ["root 1 findings-reported", "standalone 1 findings-reported"]' audit-lockfiles.json
+            jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' audit-lockfiles-standalone.json
+            jq -e '.version == "2.1.0"' audit-lockfiles-standalone.sarif
+            jq -e '[.manifests[] | "\(.slug) \(.outcome)"] == ["root passed", "standalone passed"]' deny-manifests.json
+            [[ "$(grep -c '<testsuite ' junit/audit-lockfiles.xml)" -eq 2 ]]
+            jq -e '([.inputs[] | select(.role == "lockfile")] | length) == 2 and .counts.lockfiles == 2' audit-lockfiles.run-record.json
+            jq -e '.counts.manifests == 2 and .counts.bans.errors == 0' deny-manifests.run-record.json
       - run:
           name: Verify report_only Reported The Advisory
           command: |
@@ -259,6 +291,10 @@ jobs:
             }
             expect_failure "ERROR: cargo audit found 1 vulnerabilities" audit working_dir=tests/fixtures/app no_fetch=true
             expect_failure "ERROR: cargo deny failed: advisories." deny working_dir=tests/fixtures/app
+            expect_failure "ERROR: cargo deny failed in 2 of 2 manifests: Cargo.toml (advisories); standalone/Cargo.toml (advisories)." \
+              deny working_dir=tests/fixtures/app manifest_paths="Cargo.toml standalone/Cargo.toml"
+            expect_failure "Findings in: Cargo.lock, standalone/Cargo.lock." audit working_dir=tests/fixtures/app no_fetch=true \
+              lockfiles="Cargo.lock standalone/Cargo.lock"
             # A tool that can't run fails the step even with report_only.
             expect_failure "ERROR: cargo audit did not complete" audit working_dir=tests/fixtures/app no_fetch=true \
               lockfile=Cargo.toml report_only=true

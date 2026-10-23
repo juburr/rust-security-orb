@@ -1,0 +1,49 @@
+description: >
+  Check a repository's standalone workspaces, such as fuzz targets and test
+  harnesses that each have their own Cargo.lock under the one deny.toml and
+  .cargo/audit.toml at its root, in one step per tool. Each lockfile or
+  manifest gets its own reports, named after its path, and an index lists
+  them; every one is checked before the step fails. The advisory database is
+  fetched once, and the reports are stored once at the end of the job.
+
+usage:
+  version: 2.1
+  orbs:
+    rust-security: juburr/rust-security-orb@0.2.0
+  jobs:
+    dependencies:
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - rust-security/install:
+            tools: cargo-audit cargo-deny
+        - rust-security/fetch_advisory_db
+        - run:
+            name: Fetch Each Workspace's Crates
+            command: for manifest in Cargo.toml fuzz/*/Cargo.toml; do cargo fetch --locked --manifest-path "${manifest}"; done
+        - rust-security/deny:
+            workspace: true
+            offline: true
+            locked: true
+            junit: true
+            store_artifacts: false
+            report_name: deny-workspace
+        - rust-security/deny:
+            manifest_paths: fuzz/*/Cargo.toml
+            offline: true
+            locked: true
+            allow: license-not-encountered
+            junit: true
+            store_artifacts: false
+            report_name: deny-fuzz
+        - rust-security/audit:
+            lockfiles: Cargo.lock fuzz/*/Cargo.lock
+            no_fetch: true
+            junit: true
+            store_artifacts: false
+        - rust-security/store_reports
+  workflows:
+    security:
+      jobs:
+        - dependencies

@@ -258,6 +258,77 @@ rs_list() {
     read -r -a RS_LIST <<< "${value//,/ }"
 }
 
+# rs_list_lines PARAMETER VALUE: as rs_list, but newlines separate items too,
+# for lists that run long, such as files and dependency-graph node sets.
+rs_list_lines() {
+    local value
+    RS_LIST=()
+    value=$(rs_subst "$2")
+    value=${value//[$'\n\r\t']/ }
+    # shellcheck disable=SC2034 # read by the script that evals this file
+    read -r -a RS_LIST <<< "${value//,/ }"
+}
+
+# rs_files PARAMETER: sets RS_FILES to the files RS_LIST names, with shell
+# patterns expanded, each file once, in order. A pattern that matches
+# nothing, and a name that isn't a file, stop the step: a file that isn't
+# there can't pass a check. A name that starts with "-" becomes ./<name>,
+# which no tool reads as an option.
+rs_files() {
+    local pattern file restore=false
+    local -a matches=()
+    local -A seen=()
+    RS_FILES=()
+    if ! shopt -q nullglob; then
+        restore=true
+        shopt -s nullglob
+    fi
+    for pattern in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        # The pattern is expanded here on purpose.
+        # shellcheck disable=SC2206
+        matches=(${pattern})
+        if [[ ${#matches[@]} -eq 0 ]]; then
+            echo "ERROR: $1 names ${pattern}, which matches no file (in $(pwd))." >&2
+            exit 1
+        fi
+        for file in "${matches[@]}"; do
+            if [[ ! -f "${file}" ]]; then
+                echo "ERROR: $1 names ${file}, which is not a file (in $(pwd))." >&2
+                exit 1
+            fi
+            if [[ "${file}" == -* ]]; then
+                file="./${file}"
+            fi
+            if [[ -z "${seen[${file}]:-}" ]]; then
+                seen[${file}]=1
+                RS_FILES+=("${file}")
+            fi
+        done
+    done
+    if [[ "${restore}" == true ]]; then
+        shopt -u nullglob
+    fi
+}
+
+# rs_slug PATH NAME: sets RS_SLUG to the name the reports for the input PATH
+# get in a run over several inputs, <report_name>-<slug>: PATH relative to
+# the working directory, without a last component NAME (Cargo.lock or
+# Cargo.toml), with / as -, characters a report name can't hold as _, and
+# root for the working directory itself.
+rs_slug() {
+    # In other locales [^A-Za-z0-9] can leave letters such as é alone.
+    local path LC_ALL=C
+    path=$(realpath -m -s --relative-to=. -- "$1" 2> /dev/null) || path=$1
+    if [[ "${path}" == "$2" ]]; then
+        path=""
+    fi
+    path=${path%/"$2"}
+    path=${path//\//-}
+    path=${path//[^A-Za-z0-9._-]/_}
+    # shellcheck disable=SC2034 # read by the script that evals this file
+    RS_SLUG=${path:-root}
+}
+
 # rs_sha256 FILE: prints FILE's SHA-256.
 rs_sha256() {
     sha256sum -- "$1" | awk '{ print $1 }'
@@ -313,23 +384,31 @@ rs_db_fresh() {
 #    "message": ..., "detail": ...}
 # A run with no cases gets one passing case, so the tab shows it ran.
 rs_junit() {
+    # shellcheck disable=SC2016 # jq program, not shell
+    rs_junit_suites "$1" "$(jq -c --arg suite "$2" '[{name: $suite, cases: .}]' <<< "$3")"
+}
+
+# rs_junit_suites FILE SUITES: writes JUnit XML as rs_junit does, with one
+# test suite per input of a command that checks several: SUITES is a JSON
+# array of {"name": ..., "cases": CASES}.
+rs_junit_suites() {
     local dir=${1%/*}
     mkdir -p "${dir}"
-    # shellcheck disable=SC2016 # jq program, not shell
-    jq -r --arg suite "$2" '
-        (if length == 0 then [{classname: $suite, name: "no findings", status: "passed"}] else . end) as $cases
-        | "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-          "<testsuites>",
-          "  <testsuite name=\"\($suite | @html)\" tests=\"\($cases | length)\" failures=\"\([$cases[] | select(.status == "failed")] | length)\" skipped=\"\([$cases[] | select(.status == "skipped")] | length)\">",
-          ($cases[] |
-            "    <testcase classname=\"\(.classname | @html)\" name=\"\(.name | @html)\">"
-            + (if .status == "failed" then "<failure message=\"\((.message // "") | @html)\">\((.detail // "") | @html)</failure>"
-               elif .status == "skipped" then "<skipped message=\"\((.message // "") | @html)\"/>"
-               else "" end)
-            + "</testcase>"),
-          "  </testsuite>",
-          "</testsuites>"
-    ' <<< "$3" > "$1"
+    jq -r '
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<testsuites>",
+        (.[] | .name as $suite
+          | (if (.cases | length) == 0 then [{classname: $suite, name: "no findings", status: "passed"}] else .cases end) as $cases
+          | "  <testsuite name=\"\($suite | @html)\" tests=\"\($cases | length)\" failures=\"\([$cases[] | select(.status == "failed")] | length)\" skipped=\"\([$cases[] | select(.status == "skipped")] | length)\">",
+            ($cases[] |
+              "    <testcase classname=\"\(.classname | @html)\" name=\"\(.name | @html)\">"
+              + (if .status == "failed" then "<failure message=\"\((.message // "") | @html)\">\((.detail // "") | @html)</failure>"
+                 elif .status == "skipped" then "<skipped message=\"\((.message // "") | @html)\"/>"
+                 else "" end)
+              + "</testcase>"),
+            "  </testsuite>"),
+        "</testsuites>"
+    ' <<< "$2" > "$1"
 }
 
 # rs_gate FINDINGS REPORT_ONLY SUMMARY: ends a check. Without findings it
@@ -367,6 +446,7 @@ rs_gate() {
 # or error.
 rs_run_record() {
     local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url match
+    local -A listed=()
     rs_path_manifest_inputs
     case "$2" in
         deny | licenses | sbom) rs_license_inputs ;;
@@ -379,11 +459,18 @@ rs_run_record() {
             sha=$(rs_sha256 "${path}")
             path=$(cd "$(dirname "${path}")" && pwd)/${path##*/}
         fi
+        # A command that checks several inputs can find the same file for
+        # more than one, such as a shared config.
+        if [[ -n "${listed[${role}:${path}]:-}" ]]; then
+            continue
+        fi
+        listed[${role}:${path}]=1
         inputs=$(jq -c --arg role "${role}" --arg path "${path}" --arg sha "${sha}" \
             '. + [{role: $role, path: $path, sha256: (if $sha == "" then null else $sha end)}]' <<< "${inputs}")
     done
     for path in ${RS_REPORTS[@]+"${RS_REPORTS[@]}"}; do
-        if [[ -f "${path}" ]]; then
+        if [[ -f "${path}" && -z "${listed[report:${path}]:-}" ]]; then
+            listed[report:${path}]=1
             reports=$(jq -c --arg path "${path}" --arg sha "$(rs_sha256 "${path}")" '. + [{path: $path, sha256: $sha}]' <<< "${reports}")
         fi
     done

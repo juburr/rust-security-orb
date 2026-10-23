@@ -229,6 +229,30 @@ steps:
 
 cargo auditable embeds the resolved dependency list in a `.dep-v0` section of each binary it links, at a cost of a few kilobytes. GNU `strip` keeps it; `llvm-strip`, `strip --strip-section-headers` and some packers remove it without a word, which is why `verify_auditable` reads it back from the file you ship and fails when it is gone. With `cyclonedx`, it also writes a CycloneDX SBOM of exactly what that binary links. `audit_bin` then checks each binary against the advisory database: a binary built without the vulnerable feature passes even when the lockfile lists the crate.
 
+### Check Several Workspaces Under One Policy
+
+Fuzz targets, test harnesses and tools often live in standalone workspaces, each with its own `Cargo.lock`, under the one `deny.toml` and `.cargo/audit.toml` at the repository root. One step checks them all:
+
+```yaml
+steps:
+  - checkout
+  - rust-security/install:
+      tools: cargo-audit cargo-deny
+  - rust-security/fetch_advisory_db
+  - rust-security/audit:
+      lockfiles: Cargo.lock fuzz/*/Cargo.lock crates/diff-tests/Cargo.lock
+      no_fetch: true
+      junit: true
+  - rust-security/deny:
+      manifest_paths: fuzz/*/Cargo.toml crates/diff-tests/Cargo.toml
+      offline: true
+      locked: true
+      allow: license-not-encountered
+      junit: true
+```
+
+Each lockfile or manifest is checked on its own, with the same parameters, and every one is checked before the step fails. Its reports are named after its path: `fuzz/parse/Cargo.lock` gets `cargo-audit-fuzz-parse.json` (and `.sarif`, `.log`), and the working directory's own gets `-root`. `<report_name>.json` is an index of them, with each input's SHA-256, outcome and counts; JUnit has one test suite per input; and one run record lists them all as inputs. Two paths that would get the same report name fail the step. `audit` lets only the first lockfile's audit fetch the database. cargo-deny 0.20 fetches it for every check unless `offline` is true, so fetch it once with `fetch_advisory_db` and set `offline`, as above, which also means cargo's cache must hold each workspace's crates (`cargo fetch --locked` in each, or a `deny` without `offline` first). Workspaces that need different parameters, such as the root workspace with `workspace: true`, take a step of their own.
+
 ### Fetch the Advisory Database Once per Workflow
 
 Fetch the database in one job, persist it, and have every later job check against that very copy:
@@ -351,6 +375,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | --- | --- | --- |
 | `working_dir` | `.` | Directory to run in. |
 | `lockfile` | `Cargo.lock` | The lockfile to audit. It must exist: the step fails rather than let cargo audit generate one. |
+| `lockfiles` | *(empty)* | Several lockfiles to audit instead, separated by commas, spaces or newlines; shell patterns such as `crates/*/fuzz/Cargo.lock` are expanded, and one that matches nothing fails the step. See [Check Several Workspaces Under One Policy](#check-several-workspaces-under-one-policy). |
 | `db_path` | *(empty)* | The advisory database. Defaults to the one `fetch_advisory_db` exported, or else cargo audit's own, `$CARGO_HOME/advisory-db`. |
 | `no_fetch` | `false` | Use the database without updating it. cargo audit checks a database's age only when it fetches, so `audit` then applies cargo audit's 90-day rule itself, as it does when `.cargo/audit.toml` sets `[database] fetch = false` (or `database.fetch = false`; an inline `database = { ... }` table fails the step, since its settings would go unchecked). |
 | `allow_stale` | `false` | Accept a database whose newest commit is 90 days old or more. |
@@ -380,7 +405,8 @@ Runs `cargo deny check` against the project's `deny.toml`: advisories, bans, lic
 | `checks` | *(all four)* | The checks to run, separated by commas or spaces: `advisories`, `bans`, `licenses`, `sources`. |
 | `config_path` | *(empty)* | The config to use. Defaults to the first `deny.toml`, `.deny.toml` or `.cargo/deny.toml` in the manifest's directory or above. A path that doesn't exist fails the step, where cargo deny would fall back to its default config. |
 | `manifest_path` | *(empty)* | The `Cargo.toml` to check, relative to `working_dir`. |
-| `metadata_path` | *(empty)* | Check this saved `cargo metadata --format-version 1` output instead of running cargo metadata. |
+| `manifest_paths` | *(empty)* | Several `Cargo.toml` files to check instead, each with the same config and parameters, separated by commas, spaces or newlines; shell patterns are expanded. See [Check Several Workspaces Under One Policy](#check-several-workspaces-under-one-policy). |
+| `metadata_path` | *(empty)* | Check this saved `cargo metadata --format-version 1` output instead of running cargo metadata. Not with `manifest_paths`. |
 | `features`, `all_features`, `no_default_features` | | The feature set to check. |
 | `target` | *(empty)* | Check only this target triple's dependencies. `deny.toml`'s `[graph] targets` lists several. |
 | `workspace`, `exclude`, `exclude_dev` | `false`, *(empty)*, `false` | Check every workspace member, leave members out, leave out dev-dependencies. |
@@ -496,6 +522,7 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 | Report | Written by |
 | --- | --- |
 | Native JSON | `audit`, `audit_bin` (cargo audit's `--json`), `deny` (cargo-deny's JSON diagnostics, one per line, `.jsonl`), `licenses`, `verify_auditable`, `vet` |
+| Index | `audit` with `lockfiles`, `deny` with `manifest_paths`, `audit_bin` and `verify_auditable`: `<report_name>.json`, listing each input with its SHA-256, its report and its result |
 | SARIF 2.1.0 | `audit`, `audit_bin`, `deny`. cargo-deny's SARIF output exits 0 whatever it finds, so `deny` writes it in a second, offline pass after the JSON pass has decided. |
 | JUnit XML | `audit`, `audit_bin`, `deny`, `vet`: one test case per finding, so the Tests tab lists each advisory with its crate (for `deny`, an ignore in `deny.toml` that matched nothing by its advisory ID, or its crate for a yanked crate). Errors fail; warnings that don't fail the step are skipped, and a clean run has one passing case. `verify_auditable`: one test case per binary. |
 | CycloneDX | `sbom`, and `verify_auditable` with `cyclonedx` |

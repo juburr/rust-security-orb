@@ -120,7 +120,8 @@ EOF
 # crash, nodata (bin: no dependency information), empty (a lockfile with no
 # packages), exit1 (exits 1, reporting nothing), yanked-unchecked (the
 # crates.io index was unreachable) or vuln-warn (a vulnerability and an
-# unmaintained crate).
+# unmaintained crate). A lockfile that holds "STUB_VULN" is vuln whatever
+# STUB_AUDIT says.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -128,6 +129,11 @@ EOF
 if [[ "$1" == --version ]]; then echo "cargo-audit 0.22.2"; exit 0; fi
 mode=${STUB_AUDIT:-clean}
 args=" $* "
+prev=""
+for a in "$@"; do
+    if [[ "${prev}" == --file ]] && grep -q STUB_VULN -- "${a}" 2> /dev/null; then mode=vuln; fi
+    prev=${a}
+done
 if [[ "${mode}" == crash ]]; then echo "error: couldn't load the advisory database" >&2; exit 1; fi
 if [[ "${mode}" == nodata && "${args}" == *" bin "* ]]; then
     echo "error: parse error: No dependency information found! Is this a Rust executable built with cargo?" >&2; exit 2
@@ -176,6 +182,8 @@ EOF
 if [[ "$1" == --version ]]; then echo "cargo-deny 0.20.2"; exit 0; fi
 mode=${STUB_DENY:-clean}
 args=" $* "
+# STUB_DENY_ONLY: STUB_DENY applies to that manifest's check only.
+if [[ -n "${STUB_DENY_ONLY:-}" && "${args}" != *" --manifest-path ${STUB_DENY_ONLY} "* ]]; then mode=clean; fi
 format=human
 prev=""
 for a in "$@"; do [[ "${prev}" == --format ]] && format=${a}; prev=${a}; done
@@ -885,7 +893,7 @@ check "refuses a file that isn't a .tar.gz" failed
 check "saying so" said "Could not unpack"
 
 # --- audit
-DEFAULTS=(PARAM_LOCKFILE=Cargo.lock PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false PARAM_NO_YANKED=false
+DEFAULTS=(PARAM_LOCKFILE= PARAM_LOCKFILES= PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false PARAM_NO_YANKED=false
     PARAM_DENY= PARAM_TARGET_ARCH= PARAM_TARGET_OS= PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set
     PARAM_REPORT_NAME=cargo-audit PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0)
 audit_case() {
@@ -1075,6 +1083,71 @@ audit_case
 # shellcheck disable=SC2016 # expanded by the script
 run audit.sh 'PARAM_LOCKFILE=${LOCK_NAME}' LOCK_NAME=Cargo.lock
 check "expands variables in lockfile" called_with cargo-audit --file Cargo.lock
+
+begin "audit: several lockfiles"
+lockfiles_case() {
+    audit_case
+    mkdir -p "${CASE}/work/crates/a" "${CASE}/work/crates/b"
+    echo "# lockfile" > "${CASE}/work/crates/a/Cargo.lock"
+    echo "# lockfile" > "${CASE}/work/crates/b/Cargo.lock"
+}
+lockfiles_case
+run audit.sh "PARAM_LOCKFILES=Cargo.lock, crates/*/Cargo.lock" PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "succeeds" succeeded
+check "audits each lockfile on its own, the first one fetching" called cargo-audit audit --file Cargo.lock --json
+check "and the others reading that copy" called cargo-audit audit --file crates/a/Cargo.lock --no-fetch --json
+check "with SARIF passes that don't fetch either" called cargo-audit audit --file crates/b/Cargo.lock --no-fetch --format sarif
+check "and the first one's SARIF pass too" called cargo-audit audit --file Cargo.lock --no-fetch --format sarif
+check "writes each one's reports under its slug" exists "${CASE}/out/cargo-audit-crates-a.sarif"
+check "root for the working directory's own" json_is "${CASE}/out/cargo-audit-root.json" '.vulnerabilities.count' 0
+check "lists them in an index" json_is "${CASE}/out/cargo-audit.json" '[.lockfiles[] | "\(.lockfile)=\(.slug)"] | join(" ")' \
+    "Cargo.lock=root crates/a/Cargo.lock=crates-a crates/b/Cargo.lock=crates-b"
+check "with each one's SHA-256, report and outcome" json_is "${CASE}/out/cargo-audit.json" \
+    '.lockfiles[1] | "\(.sha256 | length) \(.report | split("/")[-1]) \(.outcome)"' "64 cargo-audit-crates-a.json passed"
+check "one JUnit file with a suite per lockfile" \
+    test "$(grep -o '<testsuite name="[^"]*"' "${CASE}/out/junit/cargo-audit.xml" | tr '\n' ' ')" \
+    = '<testsuite name="cargo-audit-root" <testsuite name="cargo-audit-crates-a" <testsuite name="cargo-audit-crates-b" '
+check "one run record, with every lockfile as an input" \
+    json_is "${CASE}/out/cargo-audit.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path | split("/")[-2:] | join("/")] | join(" ")' \
+    "work/Cargo.lock a/Cargo.lock b/Cargo.lock"
+check "the arguments they share" json_is "${CASE}/out/cargo-audit.run-record.json" '.arguments | join(" ")' "audit"
+check "and the counts over all of them" json_is "${CASE}/out/cargo-audit.run-record.json" '.counts | "\(.lockfiles) \(.vulnerabilities)"' "3 0"
+check "says so" said "Passed: cargo audit found 0 vulnerabilities and 0 denied warnings in 3 lockfiles."
+lockfiles_case
+echo "# STUB_VULN" >> "${CASE}/work/crates/a/Cargo.lock"
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock crates/b/Cargo.lock" PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "findings in one lockfile fail the step" failed
+check "after every lockfile is audited (and asked for its version)" call_count cargo-audit 5
+check "naming the lockfile" said "ERROR: cargo audit found 1 vulnerabilities and 0 denied warnings in 2 lockfiles. Findings in: crates/a/Cargo.lock."
+check "the index says which" json_is "${CASE}/out/cargo-audit.json" '[.lockfiles[].outcome] | join(" ")' "findings passed"
+check "and JUnit, in its suite" file_has "${CASE}/out/junit/cargo-audit.xml" '<testsuite name="cargo-audit-crates-a" tests="1" failures="1"'
+check "the run record says findings, with cargo audit's exit code" \
+    json_is "${CASE}/out/cargo-audit.run-record.json" '"\(.outcome) \(.exit_code) \(.counts.vulnerabilities)"' "findings 1 1"
+lockfiles_case
+make_db "${CASE}/db" 10
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock crates/b/Cargo.lock" PARAM_NO_FETCH=true "PARAM_DB_PATH=${CASE}/db"
+check "no_fetch passes --no-fetch to each audit once" called cargo-audit audit --file crates/b/Cargo.lock --db "${CASE}/db" --no-fetch --json
+lockfiles_case
+run audit.sh PARAM_LOCKFILE=Cargo.lock PARAM_LOCKFILES=crates/a/Cargo.lock
+check "lockfile and lockfiles together fail" failed
+check "saying so" said "ERROR: lockfile and lockfiles are both set."
+lockfiles_case
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock fuzz/*/Cargo.lock"
+check "a pattern that matches nothing fails" failed
+check "saying so" said "ERROR: lockfiles names fuzz/*/Cargo.lock, which matches no file"
+check "before running cargo audit" call_count cargo-audit 0
+lockfiles_case
+mkdir -p "${CASE}/work/crates-a"
+echo "# lockfile" > "${CASE}/work/crates-a/Cargo.lock"
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock crates-a/Cargo.lock"
+check "two lockfiles whose reports would share a name fail" failed
+check "saying which" said "ERROR: lockfiles names crates/a/Cargo.lock and crates-a/Cargo.lock, whose reports would both be named cargo-audit-crates-a."
+lockfiles_case
+printf '# lockfile\n' > "${CASE}/work/crates/a/Cargo.lock"
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock
+crates/b/Cargo.lock
+crates/a/Cargo.lock"
+check "lockfiles takes newlines, and audits a lockfile named twice once" call_count cargo-audit 5
 
 begin "audit: the advisory database"
 audit_case
@@ -1361,7 +1434,7 @@ check "with the SARIF pass's exit code" json_is "${CASE}/out/cargo-audit-bin.run
 check "and its log" json_is "${CASE}/out/cargo-audit-bin.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-audit-bin-app.json cargo-audit-bin-app.sarif.log"
 
 # --- deny
-DEFAULTS=(PARAM_CHECKS= PARAM_MANIFEST_PATH= PARAM_CONFIG_PATH= PARAM_METADATA_PATH= PARAM_FEATURES= PARAM_ALL_FEATURES=false
+DEFAULTS=(PARAM_CHECKS= PARAM_MANIFEST_PATH= PARAM_MANIFEST_PATHS= PARAM_CONFIG_PATH= PARAM_METADATA_PATH= PARAM_FEATURES= PARAM_ALL_FEATURES=false
     PARAM_NO_DEFAULT_FEATURES=false PARAM_TARGET= PARAM_OFFLINE=false PARAM_LOCKED=false PARAM_FROZEN=false PARAM_WORKSPACE=false
     PARAM_EXCLUDE= PARAM_EXCLUDE_DEV=false PARAM_ALLOW= PARAM_WARN= PARAM_DENY= PARAM_REQUIRE_IGNORE_REASONS=false
     PARAM_AUDIT_COMPATIBLE_OUTPUT=false PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set PARAM_REPORT_NAME=cargo-deny
@@ -1563,6 +1636,63 @@ deny_case
 run deny.sh PARAM_AUDIT_COMPATIBLE_OUTPUT=true
 check "audit_compatible_output passes --audit-compatible-output" called_with cargo-deny --audit-compatible-output
 check "and keeps that report" json_is "${CASE}/out/cargo-deny.audit.json" '.vulnerabilities | length' 0
+
+begin "deny: several manifests"
+manifests_case() {
+    deny_case
+    mkdir -p "${CASE}/work/fuzz"
+    echo "[package]" > "${CASE}/work/fuzz/Cargo.toml"
+    echo "# lockfile" > "${CASE}/work/fuzz/Cargo.lock"
+}
+manifests_case
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_CHECKS=bans PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "succeeds" succeeded
+check "checks each manifest on its own" called cargo-deny --format json --log-level info --manifest-path fuzz/Cargo.toml check bans
+check "with a SARIF pass each" called cargo-deny --format sarif --manifest-path app/Cargo.toml --offline check bans
+check "writes each one's reports under its slug" exists "${CASE}/out/cargo-deny-fuzz.sarif"
+check "lists them in an index" json_is "${CASE}/out/cargo-deny.json" '[.manifests[] | "\(.manifest)=\(.slug) \(.outcome)"] | join(", ")' \
+    "app/Cargo.toml=app passed, fuzz/Cargo.toml=fuzz passed"
+check "with each manifest's SHA-256" json_is "${CASE}/out/cargo-deny.json" '.manifests[1].sha256' "$(sha256sum "${CASE}/work/fuzz/Cargo.toml" | awk '{ print $1 }')"
+check "one JUnit suite per manifest" file_has "${CASE}/out/junit/cargo-deny.xml" '<testsuite name="cargo-deny-fuzz"'
+check "one run record, with each manifest's lockfile" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path | split("/")[-2:] | join("/")] | join(" ")' \
+    "app/Cargo.lock fuzz/Cargo.lock"
+check "and the deny.toml they share once" json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "config")] | length' 1
+check "the arguments they share" json_is "${CASE}/out/cargo-deny.run-record.json" '.arguments | join(" ")' "check bans"
+check "and the counts summed" json_is "${CASE}/out/cargo-deny.run-record.json" '.counts | "\(.manifests) \(.bans.errors)"' "2 0"
+check "says so" said "Passed: cargo deny found no errors in 2 manifests."
+manifests_case
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" STUB_DENY=banned STUB_DENY_ONLY=app/Cargo.toml PARAM_RUN_RECORD=true
+check "findings in one manifest fail the step" failed
+check "after every manifest is checked" called_with cargo-deny --format json --manifest-path fuzz/Cargo.toml
+check "naming the manifest and the check" said "ERROR: cargo deny failed in 1 of 2 manifests: app/Cargo.toml (bans)."
+check "the run record says findings, with cargo deny's exit code" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '"\(.outcome) \(.exit_code) \(.counts.bans.errors)"' "findings 2 1"
+manifests_case
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_MANIFEST_PATHS=fuzz/Cargo.toml
+check "manifest_path and manifest_paths together fail" failed
+check "saying so" said "ERROR: manifest_path and manifest_paths are both set."
+manifests_case
+echo '{}' > "${CASE}/work/metadata.json"
+run deny.sh PARAM_METADATA_PATH=metadata.json PARAM_MANIFEST_PATHS=fuzz/Cargo.toml
+check "and so do metadata_path and manifest_paths" failed
+manifests_case
+run deny.sh "PARAM_MANIFEST_PATHS=*/Nothing.toml"
+check "a pattern that matches nothing fails" failed
+check "before running cargo deny" not_called_with cargo-deny check
+manifests_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+mkdir -p "${CASE}/work/fuzz/dbs"
+make_db "${CASE}/work/fuzz/dbs/${DB_NAME}" 5
+printf '[advisories]\ndb-path = "fuzz/dbs"\n' > "${CASE}/work/fuzz/deny.toml"
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_RUN_RECORD=true
+check "manifests whose checks read different databases" succeeded
+check "get a run record that names none" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+check "with a warning" said "WARN: The manifests' checks read different advisory databases"
+manifests_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_RUN_RECORD=true
+check "and those that read the same one name it" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path | split("/")[-1]' "${DB_NAME}"
 
 begin "deny: run records"
 deny_case
