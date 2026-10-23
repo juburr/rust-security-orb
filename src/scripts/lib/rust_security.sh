@@ -414,18 +414,9 @@ rs_run_record() {
             '{path: $path, url: (if $url == "" then null else $url end), commit: (if $commit == "" then null else $commit end),
                 commit_time: (if $time == "" then null else $time end), files_match_commit: $match}')
     fi
-    # NUL-separated, so arguments that start with "-" never reach jq's own
-    # option parsing. A URL among them, such as cargo audit's --url from
-    # extra_args, loses its userinfo, query and fragment, as the database's
-    # URL does.
-    args="[]"
-    if [[ -n "${RS_ARGS[*]+set}" ]]; then
-        # Ended by a word rather than a NUL, which jq 1.6 drops from the
-        # end of raw input.
-        args=$({ printf '%s\0' "${RS_ARGS[@]}"; printf 'end'; } | jq -Rsc 'split("\u0000") | .[:-1]
-            | map(gsub("(?<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/?#\\s]*@"; "\(.scheme)")
-                | gsub("(?<url>[A-Za-z][A-Za-z0-9+.-]*://[^?#\\s]*)[?#]\\S*"; "\(.url)"))')
-    fi
+    # A URL among the arguments, such as cargo audit's --url from extra_args,
+    # loses its userinfo, query and fragment, as the database's URL does.
+    args=$(rs_public_args ${RS_ARGS[@]+"${RS_ARGS[@]}"})
     toolchain=$(jq -cn --arg cargo "$(cargo --version 2> /dev/null || true)" --arg rustc "$(rustc --version 2> /dev/null || true)" \
         '{cargo: (if $cargo == "" then null else $cargo end), rustc: (if $rustc == "" then null else $rustc end)}')
     if ! jq -n --arg command "$2" --arg outcome "$3" --argjson code "$4" --arg started "$5" \
@@ -446,6 +437,31 @@ rs_run_record() {
         return 0
     fi
     echo "Run record: ${file}"
+}
+
+# rs_public_args ARG...: prints the arguments as a JSON array, with every URL
+# in them stripped of its userinfo, query and fragment, which can hold
+# credentials (https://user:token@host/... or ?access_token=...). They reach
+# jq NUL-separated, so an argument that starts with "-" never reaches jq's
+# own option parsing.
+rs_public_args() {
+    # Bash 4.0 calls an empty "$@" unbound under set -u.
+    if [[ $# -eq 0 ]]; then
+        echo "[]"
+        return 0
+    fi
+    # Ended by a word rather than a NUL, which jq 1.6 drops from the end of
+    # raw input.
+    { printf '%s\0' "$@"; printf 'end'; } | jq -Rsc 'split("\u0000") | .[:-1]
+        | map(gsub("(?<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/?#\\s]*@"; "\(.scheme)")
+            | gsub("(?<url>[A-Za-z][A-Za-z0-9+.-]*://[^?#\\s]*)[?#]\\S*"; "\(.url)"))'
+}
+
+# rs_show_command PROGRAM ARG...: prints the command a step runs, as one line
+# a shell would read back, with URLs stripped as in run records, so a failed
+# job's log says exactly what ran.
+rs_show_command() {
+    echo "Running: $(rs_public_args "$@" | jq -r 'map(if test("^[A-Za-z0-9_@%+=:,./{}-]+$") then . else @sh end) | join(" ")')"
 }
 
 # rs_tool_json PATH VERSION: describes a binary that ran for the run record:

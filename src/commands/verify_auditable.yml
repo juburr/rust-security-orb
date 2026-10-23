@@ -54,7 +54,7 @@ parameters:
       fails.
 steps:
   - run:
-      name: Verify cargo-auditable data
+      name: Verify cargo-auditable data (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_BINARIES: << parameters.binaries >>

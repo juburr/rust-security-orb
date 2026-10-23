@@ -168,6 +168,7 @@ for dir in "${MEMBER_DIRS[@]}"; do
     done < <(find "${dir}" -maxdepth 1 -type f -newer "${MARKER}" -name "*.cdx.${FORMAT}" -print0)
 done
 echo "Writing CycloneDX ${SPEC_VERSION} SBOMs (${DESCRIBE}) with ${RS_TOOL_VERSION:-cargo-cyclonedx}..."
+rs_show_command "${ENV_ARGS[@]}" "${RS_TOOL##*/}" "${RS_ARGS[@]}"
 RC=0
 "${ENV_ARGS[@]}" "${RS_TOOL}" "${RS_ARGS[@]}" > "${RS_BASE}.log" 2>&1 || RC=$?
 RS_REPORTS=()

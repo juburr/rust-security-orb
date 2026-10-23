@@ -126,7 +126,7 @@ parameters:
     description: Store output_dir as job artifacts under rust-security-reports/, including when the step fails.
 steps:
   - run:
-      name: cargo audit << parameters.lockfile >>
+      name: cargo audit (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_ALLOW_STALE: << parameters.allow_stale >>

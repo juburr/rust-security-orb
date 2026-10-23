@@ -102,6 +102,7 @@ RS_REPORTS=()
 for format in "${FORMATS[@]}"; do
     file="${RS_BASE}.${format}"
     echo "Listing licences as ${format} with ${RS_TOOL_VERSION:-cargo-deny}..."
+    rs_show_command "${RS_TOOL##*/}" "${RS_ARGS[@]}" --format "${format}"
     rc=0
     "${RS_TOOL}" "${RS_ARGS[@]}" --format "${format}" > "${file}" 2> "${RS_BASE}.log" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then

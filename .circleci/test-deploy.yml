@@ -215,18 +215,21 @@ jobs:
           name: Write The Fixture's cargo metadata
           working_directory: *fixture
           command: cargo metadata --format-version 1 --locked > /tmp/workspace/metadata.json
+      # The reports are stored once, by store_reports at the end of the job.
       - rust-security-orb/audit:
           working_dir: *fixture
           no_fetch: true
           report_only: true
           junit: true
           run_record: true
+          store_artifacts: false
           output_dir: /tmp/workspace/reports/detection
       - rust-security-orb/deny:
           working_dir: *fixture
           report_only: true
           junit: true
           run_record: true
+          store_artifacts: false
           output_dir: /tmp/workspace/reports/detection
       - run:
           name: Verify report_only Reported The Advisory
@@ -274,6 +277,7 @@ jobs:
           working_dir: *fixture
           all_features: true
           run_record: true
+          store_artifacts: false
           output_dir: /tmp/workspace/reports/detection
       - run:
           name: Verify The Licence Inventory Lists Every Crate
@@ -284,6 +288,8 @@ jobs:
             [[ "$(wc -l < /tmp/crates.txt)" -eq 4 ]]
             jq -r 'keys[] | split(" ")[:2] | join(" ")' /tmp/workspace/reports/detection/licenses.json | sort | diff /tmp/crates.txt -
             tail -n +2 /tmp/workspace/reports/detection/licenses.tsv | cut -f 1 | tr '@' ' ' | sort | diff /tmp/crates.txt -
+      - rust-security-orb/store_reports:
+          output_dir: /tmp/workspace/reports/detection
       - persist_to_workspace:
           root: /tmp/workspace
           paths: [advisory-db.tar.gz, metadata.json, reports/detection]

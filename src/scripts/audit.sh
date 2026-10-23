@@ -50,6 +50,7 @@ JSON="${RS_BASE}.json"
 LOG="${RS_BASE}.log"
 
 echo "Auditing ${LOCKFILE} with ${RS_TOOL_VERSION:-cargo-audit}..."
+rs_show_command "${RS_TOOL##*/}" "${RS_ARGS[@]}" --json
 RC=0
 "${RS_TOOL}" "${RS_ARGS[@]}" --json > "${JSON}" 2> "${LOG}" || RC=$?
 if ! rs_json_is "${JSON}" 'type == "object" and (.vulnerabilities | type == "object")'; then

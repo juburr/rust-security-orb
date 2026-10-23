@@ -117,9 +117,10 @@ for binary in "${BINARIES[@]}"; do
         OPTS+=(--no-fetch)
     fi
     CODES=$((CODES + 1))
+    ARGS=(audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${OPTS[@]+"${OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} --json bin "${binary}")
+    rs_show_command "${RS_TOOL##*/}" "${ARGS[@]}"
     rc=0
-    "${RS_TOOL}" audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${OPTS[@]+"${OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} \
-        --json bin "${binary}" > "${base}.json" 2> "${base}.log" || rc=$?
+    "${RS_TOOL}" "${ARGS[@]}" > "${base}.json" 2> "${base}.log" || rc=$?
     if ! rs_json_is "${base}.json" 'type == "object" and (.vulnerabilities | type == "object")'; then
         echo "ERROR: cargo audit bin could not audit ${binary} (exit code ${rc}). Its output:" >&2
         sed 's/^/  /' "${base}.log" | tail -n 20 >&2

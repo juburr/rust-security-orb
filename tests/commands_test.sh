@@ -164,8 +164,10 @@ EOF
 } > "${STUBS}/cargo-audit"
 
 # cargo-deny: STUB_DENY is clean, vuln, banned, crash, ignored-bare,
-# ignored-reason, warn, nolabel (a warning about no crate or advisory) or
-# nostd (std-replacement-data that couldn't be loaded).
+# ignored-reason, yanked-reason (a yanked crate ignored with a reason),
+# yanked-bare (one ignored without), not-detected (an ignored advisory and an
+# ignored yanked crate that matched nothing), warn, nolabel (a warning about no
+# crate or advisory) or nostd (std-replacement-data that couldn't be loaded).
 # "list" prints an inventory.
 {
     echo '#!/usr/bin/env bash'
@@ -231,6 +233,16 @@ case "${mode}" in
     nolabel)
         echo '{"type":"diagnostic","fields":{"severity":"warning","code":"license-not-encountered","message":"license was not encountered","labels":[]}}' >&2
         ;;
+    # As cargo-deny 0.20.2 labels them: the ignore's ID, or the yanked crate's
+    # spec, is the first label's span, and a yanked crate's reason is "reason".
+    not-detected)
+        echo '{"type":"diagnostic","fields":{"severity":"warning","code":"advisory-not-detected","message":"advisory was not encountered","graphs":[],"labels":[{"message":"no crate matched advisory criteria","span":"RUSTSEC-2023-0071"},{"message":"ignore reason","span":"rsa is not linked"}]}}' >&2
+        echo '{"type":"diagnostic","fields":{"severity":"warning","code":"yanked-not-detected","message":"yanked crate was not encountered","graphs":[],"labels":[{"message":"yanked crate not detected","span":"gone@1.0.0"},{"message":"reason","span":"pinned"}]}}' >&2
+        adv='{"errors":0,"warnings":2,"notes":0,"helps":0}' ;;
+    yanked-reason)
+        echo '{"type":"diagnostic","fields":{"severity":"note","code":"yanked-ignored","message":"yanked crate '"'"'old 0.1.0'"'"' detected, but ignored","labels":[{"message":"yanked ignore","span":"old@0.1.0"},{"message":"reason","span":"no fixed release yet"}]}}' >&2 ;;
+    yanked-bare)
+        echo '{"type":"diagnostic","fields":{"severity":"note","code":"yanked-ignored","message":"yanked crate '"'"'old 0.1.0'"'"' detected, but ignored","labels":[{"message":"yanked ignore","span":"old@0.1.0"}]}}' >&2 ;;
     # The ignore reason label's span is the reason's text: STUB_REASON, or else "never called".
     ignored-reason)
         printf '{"type":"diagnostic","fields":{"severity":"note","code":"advisory-ignored","message":"advisory was not encountered","labels":[{"message":"advisory ignored here","span":"RUSTSEC-2021-0003"},{"message":"ignore reason","span":"%s"}]}}\n' \
@@ -1233,6 +1245,9 @@ check "records a URL in the arguments without its credentials, query or fragment
     json_is "${CASE}/out/cargo-audit.run-record.json" '.arguments[3:] | join(" ")' \
     "--url https://mirror.example.test/advisory-db -uhttps://mirror.example.test/db"
 check "which reach the run record nowhere" not_file_has "${CASE}/out/cargo-audit.run-record.json" "s3cret-token"
+check "the log shows the command with the URL stripped the same way" \
+    said "Running: cargo-audit audit --file Cargo.lock --url https://mirror.example.test/advisory-db -uhttps://mirror.example.test/db --json"
+check "and never the credentials" not_said "s3cret-token"
 audit_case
 mkdir -p "${CASE}/nosha"
 printf '#!/bin/sh\necho "sha512sum: not available" >&2\nexit 127\n' > "${CASE}/nosha/sha512sum"
@@ -1504,8 +1519,29 @@ deny_case
 run deny.sh STUB_DENY=ignored-bare
 check "an ignore without a reason passes unless require_ignore_reasons is true" succeeded
 check "quietly" not_said "Ignored without a reason"
+deny_case
+run deny.sh STUB_DENY=yanked-reason PARAM_REQUIRE_IGNORE_REASONS=true
+check "a yanked crate ignored with a reason, which cargo deny labels \"reason\", passes" succeeded
+deny_case
+run deny.sh STUB_DENY=yanked-bare PARAM_REQUIRE_IGNORE_REASONS=true
+check "and one without a reason fails" failed
+check "naming the crate" said "Ignored without a reason in deny.toml: old@0.1.0"
+deny_case
+run deny.sh STUB_DENY=not-detected PARAM_JUNIT=true
+check "an ignore that matched nothing" succeeded
+check "is listed with its advisory's ID, which cargo deny puts in a label" said "warning[advisory-not-detected] RUSTSEC-2023-0071: advisory was not encountered"
+check "and a yanked crate's ignore with its crate spec" said "warning[yanked-not-detected] gone@1.0.0: yanked crate was not encountered"
+check "named so in JUnit" file_has "${CASE}/out/junit/cargo-deny.xml" 'classname="cargo-deny.advisory-not-detected" name="RUSTSEC-2023-0071"><skipped'
+check "both of them" file_has "${CASE}/out/junit/cargo-deny.xml" 'classname="cargo-deny.yanked-not-detected" name="gone@1.0.0"><skipped'
+deny_case
+run deny.sh STUB_DENY=nolabel
+check "a diagnostic about no crate or advisory is listed by its code alone" said "  warning[license-not-encountered]: license was not encountered"
 
 begin "deny: options"
+deny_case
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_ALL_FEATURES=true "PARAM_EXTRA_ARGS=--hide-inclusion-graph"
+check "logs the whole command, the options before check included" \
+    said "Running: cargo-deny --format json --log-level info --manifest-path app/Cargo.toml --all-features check --hide-inclusion-graph"
 deny_case
 run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_CONFIG_PATH=deny.toml "PARAM_FEATURES=a, b" PARAM_WORKSPACE=true \
     "PARAM_EXCLUDE=x y" PARAM_EXCLUDE_DEV=true PARAM_TARGET=x86_64-unknown-linux-gnu PARAM_OFFLINE=true PARAM_LOCKED=true \

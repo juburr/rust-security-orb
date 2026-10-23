@@ -310,7 +310,7 @@ Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a f
 
 ## 🧰 Commands
 
-Run `install` before the other commands in the same job. Each reporting command writes to `output_dir` (default `/tmp/rust-security-reports`) and stores it as job artifacts under `rust-security-reports/`, even when the step fails. Give each run in a job its own `report_name`, so they don't overwrite each other's reports.
+Run `install` before the other commands in the same job. Each reporting command writes to `output_dir` (default `/tmp/rust-security-reports`) and stores it as job artifacts under `rust-security-reports/`, even when the step fails. Give each run in a job its own `report_name`, so they don't overwrite each other's reports: it is also in the step's name, such as `cargo deny check bans (deny-fuzz)`, and each step logs the whole command it runs. In a job with several reporting commands, set `store_artifacts: false` on each and end the job with [`store_reports`](#rust-securitystore_reports), so each report is uploaded once.
 
 ### `rust-security/install`
 
@@ -455,6 +455,30 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 | `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. `--store-path` and `--manifest-path` are refused in `extra_args`, and so is `--manifest-path` passed to cargo with `--cargo-arg`: use `store_path` and `manifest_path`, which the run record follows. |
 | `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-vet`. |
 
+### `rust-security/store_reports`
+
+Stores `output_dir` as job artifacts under `rust-security-reports/`, even when an earlier step failed. Each reporting command stores `output_dir` after itself by default, so a job with several of them uploads the shared directory once per command, each time with more in it. Turn that off on each and store the reports once, at the end:
+
+```yaml
+steps:
+  - rust-security/deny:
+      store_artifacts: false
+      report_name: deny-app
+  - rust-security/deny:
+      manifest_path: fuzz/Cargo.toml
+      store_artifacts: false
+      report_name: deny-fuzz
+  - rust-security/audit:
+      store_artifacts: false
+  - rust-security/store_reports
+```
+
+JUnit results need nothing of the kind: each command stores only its own `junit/<report_name>.xml`.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `output_dir` | `/tmp/rust-security-reports` | The `output_dir` the reporting commands wrote into. |
+
 String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except `output_dir`, `report_name` and `install`'s `tools`, which CircleCI reads when it compiles the config, before the job's environment exists. In `extra_args` and the lists, that happens before the value is split, so quote a variable that may hold spaces.
 
 ## 📄 Reports and Evidence
@@ -467,13 +491,13 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 | `junit` | `false` | Also write `junit/<report_name>.xml` and store it with `store_test_results`, for CircleCI's Tests tab. |
 | `report_only` | `false` | Report findings without failing the step. A tool that can't complete still fails it. |
 | `run_record` | `false` | Also write `<report_name>.run-record.json`. |
-| `store_artifacts` | `true` | Store `output_dir` as artifacts under `rust-security-reports/`, even when the step fails. |
+| `store_artifacts` | `true` | Store `output_dir` as artifacts under `rust-security-reports/`, even when the step fails. With several reporting commands in a job, set it to `false` on each and end the job with `store_reports`. |
 
 | Report | Written by |
 | --- | --- |
 | Native JSON | `audit`, `audit_bin` (cargo audit's `--json`), `deny` (cargo-deny's JSON diagnostics, one per line, `.jsonl`), `licenses`, `verify_auditable`, `vet` |
 | SARIF 2.1.0 | `audit`, `audit_bin`, `deny`. cargo-deny's SARIF output exits 0 whatever it finds, so `deny` writes it in a second, offline pass after the JSON pass has decided. |
-| JUnit XML | `audit`, `audit_bin`, `deny`, `vet`: one test case per finding, so the Tests tab lists each advisory with its crate. Errors fail; warnings that don't fail the step are skipped, and a clean run has one passing case. `verify_auditable`: one test case per binary. |
+| JUnit XML | `audit`, `audit_bin`, `deny`, `vet`: one test case per finding, so the Tests tab lists each advisory with its crate (for `deny`, an ignore in `deny.toml` that matched nothing by its advisory ID, or its crate for a yanked crate). Errors fail; warnings that don't fail the step are skipped, and a clean run has one passing case. `verify_auditable`: one test case per binary. |
 | CycloneDX | `sbom`, and `verify_auditable` with `cyclonedx` |
 | Licence inventory | `licenses` (JSON and TSV) |
 | Run record | every reporting command except `fetch_advisory_db`, with `run_record` (see [Keep Evidence for an Assessor](#keep-evidence-for-an-assessor)) |

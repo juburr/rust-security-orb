@@ -125,7 +125,7 @@ parameters:
       fails.
 steps:
   - run:
-      name: cargo audit bin
+      name: cargo audit bin (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_ALLOW_STALE: << parameters.allow_stale >>

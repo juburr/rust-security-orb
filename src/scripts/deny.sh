@@ -187,8 +187,20 @@ if [[ "${RUN_RECORD}" == true ]]; then
 fi
 RS_REPORTS=()
 JSONL="${RS_BASE}.jsonl"
+# What a diagnostic is about, for the log and JUnit: its advisory's ID and
+# crate. A diagnostic about an entry in deny.toml, such as an ignore that
+# matched nothing, has no advisory object, so the ID (or for a yanked crate,
+# the crate spec) comes from the label cargo-deny puts on that entry.
+# shellcheck disable=SC2016 # jq program, not shell
+DENY_SUBJECT_JQ='
+    def subject: [(.advisory.id // ([.labels[]? | select(.message == "no crate matched advisory criteria"
+            or .message == "unknown advisory" or .message == "advisory ignored here"
+            or .message == "yanked crate not detected" or .message == "yanked ignore") | .span] | .[0])),
+        (.graphs[0].Krate | if . then "\(.name) \(.version)" else null end)] | map(select(. != null)) | join(" ");
+'
 
-echo "Running cargo deny ${CHECK_ARGS[*]} with ${RS_TOOL_VERSION:-cargo-deny}..."
+echo "Checking with ${RS_TOOL_VERSION:-cargo-deny}..."
+rs_show_command "${RS_TOOL##*/}" --format json --log-level info "${RS_ARGS[@]}"
 RC=0
 "${RS_TOOL}" --format json --log-level info "${RS_ARGS[@]}" 2> "${JSONL}" > "${RS_BASE}.audit.json" || RC=$?
 # The database cargo deny read, which it fetched just now unless offline.
@@ -247,29 +259,32 @@ if [[ "${SARIF}" == true ]]; then
     RS_REPORTS+=("${RS_BASE}.sarif")
 fi
 
-# Advisories ignored in deny.toml without a reason: cargo-deny notes each
-# ignore that applied, with its reason as a label when it has one, whose span
-# is the reason's text. A reason of only spaces, or "", gives none.
+# Advisories and yanked crates ignored in deny.toml without a reason:
+# cargo-deny notes each ignore that applied, with its reason as a label when
+# it has one, whose span is the reason's text: "ignore reason" for an
+# advisory, "reason" for a yanked crate. A reason of only spaces, or "", gives
+# none.
+# shellcheck disable=SC2016 # jq program, not shell
 MISSING_REASONS=$(jq -c 'select(.type? == "diagnostic" and (.fields.code == "advisory-ignored" or .fields.code == "yanked-ignored"))
-    | select([.fields.labels[]? | select(.message == "ignore reason" and ((.span // "") | test("[^[:space:]]")))] | length == 0)
-    | .fields.labels[0].span' "${JSONL}" | jq -sc '.')
+    | .fields | (if .code == "yanked-ignored" then "reason" else "ignore reason" end) as $reason_label
+    | select([.labels[]? | select(.message == $reason_label and ((.span // "") | test("[^[:space:]]")))] | length == 0)
+    | .labels[0].span' "${JSONL}" | jq -sc '.')
 # shellcheck disable=SC2034 # read by rs_run_record
 RS_COUNTS=$(jq -c --argjson missing "${MISSING_REASONS}" '. + {ignores_without_reason: ($missing | length)}' <<< "${SUMMARY}")
 
 echo "cargo deny results:"
 jq -r 'to_entries[] | "  \(.key): \(.value.errors) errors, \(.value.warnings) warnings"' <<< "${SUMMARY}"
-# shellcheck disable=SC2016 # jq program, not shell
-jq -r 'select(.type? == "diagnostic" and (.fields.severity == "error" or .fields.severity == "warning")) | .fields
-    | "  \(.severity)[\(.code)] \(.advisory.id // "")\(if .advisory then " " else "" end)\(.graphs[0].Krate.name // "") \(.graphs[0].Krate.version // ""): \(.message)"' "${JSONL}"
+jq -r "${DENY_SUBJECT_JQ}"'select(.type? == "diagnostic" and (.fields.severity == "error" or .fields.severity == "warning")) | .fields
+    | "  \(.severity)[\(.code)]\(subject | if . == "" then "" else " " + . end): \(.message)"' "${JSONL}"
 if [[ "${REQUIRE_REASONS}" == true && "${MISSING_REASONS}" != "[]" ]]; then
     echo "Ignored without a reason in deny.toml: $(jq -r 'join(", ")' <<< "${MISSING_REASONS}")"
 fi
 
 if [[ "${JUNIT}" == true ]]; then
     # shellcheck disable=SC2016 # jq program, not shell
-    CASES=$(jq -c 'select(.type? == "diagnostic" and (.fields.severity == "error" or .fields.severity == "warning")) | .fields | .code as $code | {
+    CASES=$(jq -c "${DENY_SUBJECT_JQ}"'select(.type? == "diagnostic" and (.fields.severity == "error" or .fields.severity == "warning")) | .fields | .code as $code | {
             classname: "cargo-deny.\(.code)",
-            name: ([.advisory.id, (.graphs[0].Krate | if . then "\(.name) \(.version)" else null end)] | map(select(. != null)) | join(" ") | if . == "" then $code else . end),
+            name: (subject | if . == "" then $code else . end),
             status: (if .severity == "error" then "failed" else "skipped" end),
             message: .message,
             detail: ((.notes // []) | join("\n"))
