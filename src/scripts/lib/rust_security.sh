@@ -921,8 +921,10 @@ rs_deny_db() {
     elif ! db_path=$(rs_expand_path "${db_path}"); then
         return 0
     fi
+    # cargo-deny opens a relative db-path from the directory it runs in,
+    # which is this one, not the config's.
     if [[ "${db_path}" != /* ]]; then
-        return 0
+        db_path="$(pwd)/${db_path}"
     fi
     db_path=${db_path%/}
     # cargo-deny reads RustSec's database when db-urls is unset or empty,

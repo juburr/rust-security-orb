@@ -143,6 +143,13 @@ if [[ "${LOCKED}" == true ]]; then
     fi
 fi
 
+# SBOMs an earlier run left in output_dir/<report_name>, for a member since
+# removed or in the other format, would be stored with this run's, which the
+# run record doesn't list.
+DEST="${RS_OUT%/}/${PARAM_REPORT_NAME}"
+if [[ -d "${DEST}" ]]; then
+    find "${DEST}" -type f \( -name '*.cdx.json' -o -name '*.cdx.xml' \) -delete
+fi
 # Files cargo cyclonedx writes from now on are newer than this marker, and an
 # SBOM written before it isn't, even where file times keep whole seconds:
 # cargo cyclonedx starts once the clock has passed the marker's second.
@@ -175,7 +182,6 @@ if [[ "${RC}" -ne 0 ]]; then
     exit 1
 fi
 
-DEST="${RS_OUT%/}/${PARAM_REPORT_NAME}"
 # cdx_xml FILE: whether FILE looks like a whole CycloneDX XML document: after
 # its XML declaration and any comments, a bom element in the CycloneDX
 # namespace, and </bom> at the end. Without an XML parser, which the orb

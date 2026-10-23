@@ -136,8 +136,10 @@ fi
 # (core.fsmonitor, core.sshCommand). So before any other git command reads
 # the copy, its config keeps only the settings a checkout needs, with remote
 # URLs stripped of credentials, and the rest reaches neither git here, nor
-# the archive, nor a later job. --git-dir keeps git from looking for another
-# repository in a parent directory to change.
+# the archive, nor a later job. git edits the file as a file, from outside
+# any repository and without following its include directives: as the
+# copy's own config, git would read its includes, wherever they point (a
+# FIFO there blocks git forever), before anything could remove them.
 if [[ ! -d "${STAGED}/.git" || -L "${STAGED}/.git" ]]; then
     echo "ERROR: The advisory database is not a git checkout with its own .git directory, so its age can't be told." >&2
     echo "  Import a copy with its .git directory, such as the archive fetch_advisory_db writes." >&2
@@ -180,7 +182,7 @@ if [[ -n "${NESTED}" ]]; then
     echo "  archive fetch_advisory_db writes." >&2
     exit 1
 fi
-GIT_STAGED=(git --git-dir="${STAGED}/.git")
+GIT_CONFIG=(git -C / config --file "${STAGED}/.git/config" --no-includes)
 declare -A SEEN=()
 while IFS= read -r -d '' ENTRY; do
     KEY=${ENTRY%%$'\n'*}
@@ -189,15 +191,15 @@ while IFS= read -r -d '' ENTRY; do
     fi
     SEEN[${KEY}]=1
     if rs_match "${KEY}" '^remote\..+\.(url|pushurl)$'; then
-        mapfile -t VALUES < <("${GIT_STAGED[@]}" config --local --get-all "${KEY}")
-        "${GIT_STAGED[@]}" config --local --unset-all "${KEY}"
+        mapfile -t VALUES < <("${GIT_CONFIG[@]}" --get-all "${KEY}")
+        "${GIT_CONFIG[@]}" --unset-all "${KEY}"
         for VALUE in ${VALUES[@]+"${VALUES[@]}"}; do
-            "${GIT_STAGED[@]}" config --local --add "${KEY}" "$(rs_url_public "${VALUE}")"
+            "${GIT_CONFIG[@]}" --add "${KEY}" "$(rs_url_public "${VALUE}")"
         done
     elif ! rs_match "${KEY}" '^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)|extensions\.(objectformat|refstorage)|remote\..+\.(fetch|tagopt)|branch\..+\.(remote|merge))$'; then
-        "${GIT_STAGED[@]}" config --local --unset-all "${KEY}"
+        "${GIT_CONFIG[@]}" --unset-all "${KEY}"
     fi
-done < <("${GIT_STAGED[@]}" config --local --null --list 2> /dev/null)
+done < <("${GIT_CONFIG[@]}" --null --list 2> /dev/null)
 # The other places git reads settings or commands from: per-worktree config
 # (which only extensions.worktreeConfig, now dropped, made git read), linked
 # worktrees' and submodules' own config, sparse-checkout patterns and hooks.

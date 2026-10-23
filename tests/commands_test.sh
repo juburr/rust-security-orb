@@ -754,6 +754,15 @@ for place in .git/config crates/smallvec/pipe; do
     check "saying so" said "${place}, which is a symbolic link, FIFO, socket or device"
 done
 new_case
+cp -a "${REMOTE}" "${CASE}/including"
+mkfifo "${CASE}/outside-fifo"
+printf '[include]\n\tpath = %s\n[includeIf "gitdir:/"]\n\tpath = %s\n' "${CASE}/outside-fifo" "${CASE}/outside-fifo" >> "${CASE}/including/.git/config"
+OUTPUT=$(cd "${CASE}/work" && env -u CARGO_HOME -u RUSTSEC_ADVISORY_DB PATH="${STUBS}:${PATH}" HOME="${CASE}/home" \
+    BASH_ENV="${CASE}/bash_env" "${DEFAULTS[@]}" "PARAM_IMPORT=${CASE}/including" timeout 30 bash "${SCRIPTS}/fetch_advisory_db.sh" 2>&1)
+RC=$?
+check "imports a copy whose config includes a file outside it, a FIFO here, without reading that file (exit ${RC})" succeeded
+check "dropping its include directives" test -z "$(grep -i include "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}/.git/config")"
+new_case
 "${REAL_GIT}" clone -q --shared "${REMOTE}" "${CASE}/borrowing"
 "${REAL_GIT}" -C "${CASE}/borrowing" remote remove origin
 run fetch_advisory_db.sh "PARAM_IMPORT=${CASE}/borrowing"
@@ -1607,9 +1616,16 @@ run deny.sh PARAM_RUN_RECORD=true "CI_PROJECT_DIR=${CASE}/ci"
 check "expands variables in db-path as cargo-deny does" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path' "${CASE}/ci/dbs/advisory-db-3157b0e258782691"
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+make_db "${CASE}/work/dbs/${DB_NAME}" 2
 printf '[advisories]\ndb-path = "dbs"\n' > "${CASE}/work/deny.toml"
 run deny.sh PARAM_RUN_RECORD=true
-check "leaves the database out for a relative db-path, rather than name the wrong one" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+check "records a database in a relative db-path, from the directory cargo deny runs in, as cargo deny opens it" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path' "${CASE}/work/dbs/${DB_NAME}"
+deny_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+printf '[advisories]\ndb-path = "dbs"\n' > "${CASE}/work/deny.toml"
+run deny.sh PARAM_RUN_RECORD=true
+check "and none when it isn't there, rather than the default one" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
 deny_case
 make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
 printf '[advisories]\ndb-urls = ["https://mirror.example.test/advisory-db"]\n' > "${CASE}/work/deny.toml"
@@ -1911,6 +1927,17 @@ check "out of output_dir" absent "${CASE}/out/sbom/crates/a/ahead.cdx.json"
 check "and out of the counts" json_is "${CASE}/out/sbom.run-record.json" .counts.sboms 2
 check "with a warning" said "WARN: crates/a/ahead.cdx.json is dated in the future, and cargo cyclonedx didn't write it"
 check "while one it rewrote is taken" json_is "${CASE}/out/sbom/crates/a/a.cdx.json" '.stale // false' false
+sbom_case
+mkdir -p "${CASE}/out/sbom/crates/gone"
+echo '{"bomFormat":"CycloneDX"}' > "${CASE}/out/sbom/crates/gone/gone.cdx.json"
+echo '<bom/>' > "${CASE}/out/sbom/work.cdx.xml"
+echo "notes" > "${CASE}/out/sbom/notes.txt"
+run sbom.sh
+check "replaces the SBOMs an earlier run left in output_dir/<report_name>: one for a member since removed" \
+    absent "${CASE}/out/sbom/crates/gone/gone.cdx.json"
+check "or in the other format" absent "${CASE}/out/sbom/work.cdx.xml"
+check "with this run's" exists "${CASE}/out/sbom/work.cdx.json"
+check "leaving other files there" exists "${CASE}/out/sbom/notes.txt"
 sbom_case
 mkdir -p "${CASE}/work/legal"
 for file in LICENSE-MIT legal/terms.txt crates/a/COPYING crates/a/NOTICE; do echo "${file}" > "${CASE}/work/${file}"; done

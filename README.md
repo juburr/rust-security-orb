@@ -426,7 +426,7 @@ Reads each binary's embedded dependency list back with `rust-audit-info`, writes
 
 ### `rust-security/sbom`
 
-Writes CycloneDX SBOMs of a workspace from Cargo's metadata with `cargo cyclonedx`, one per member (or per binary), into `output_dir/<report_name>/`, under each member's path in the workspace. cargo cyclonedx updates an out-of-date `Cargo.lock` as it reads it, so by default the lockfile is checked first and an out-of-date one fails the step. Only the SBOMs cargo cyclonedx writes in the step are taken: one already there stays, even when it is dated in the future, as a cache made where the clock ran ahead can leave it. For an SBOM of exactly what one binary links, use `verify_auditable` with `cyclonedx`.
+Writes CycloneDX SBOMs of a workspace from Cargo's metadata with `cargo cyclonedx`, one per member (or per binary), into `output_dir/<report_name>/`, under each member's path in the workspace. cargo cyclonedx updates an out-of-date `Cargo.lock` as it reads it, so by default the lockfile is checked first and an out-of-date one fails the step. SBOMs an earlier run left in `output_dir/<report_name>/` (`*.cdx.json` and `*.cdx.xml`) are deleted first, so the stored artifacts are this run's. Only the SBOMs cargo cyclonedx writes in the step are taken: one already there stays, even when it is dated in the future, as a cache made where the clock ran ahead can leave it. For an SBOM of exactly what one binary links, use `verify_auditable` with `cyclonedx`.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
