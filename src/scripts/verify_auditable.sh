@@ -2,10 +2,11 @@
 #
 # Checks, for the verify_auditable command, that each binary carries the
 # dependency list cargo auditable embeds and that it decodes, by reading it
-# back with rust-audit-info. Stripping, post-link tools and packaging can
-# each remove it without a word, so this checks the final artifact, not the
-# build output. Writes the decoded list of each binary as JSON and, with
-# cyclonedx, a CycloneDX SBOM made from it by auditable2cdx.
+# back with rust-audit-info or the orb's native decoder (see rs_decoder), and
+# that it has the shape cargo auditable writes. Stripping, post-link tools and
+# packaging can each remove it without a word, so this checks the final
+# artifact, not the build output. Writes the decoded list of each binary as
+# JSON and, with cyclonedx, a CycloneDX SBOM made from it by auditable2cdx.
 
 set -euo pipefail
 
@@ -21,7 +22,14 @@ JUNIT=$(rs_bool junit "${PARAM_JUNIT}")
 RUN_RECORD=$(rs_bool run_record "${PARAM_RUN_RECORD}")
 rs_output "${PARAM_OUTPUT_DIR}" "${PARAM_REPORT_NAME}"
 rs_require_jq
-rs_tool rust-audit-info
+rs_decoder "${PARAM_DECODER}"
+RS_TOOL=${RS_DECODER_TOOL}
+# shellcheck disable=SC2034 # read by rs_run_record
+RS_TOOL_VERSION=""
+if [[ "${RS_DECODER}" == native ]]; then
+    # shellcheck disable=SC2034 # read by rs_run_record
+    RS_TOOL_VERSION=$("${RS_TOOL}" --version 2>&1 || true)
+fi
 if [[ "${CYCLONEDX}" == true ]]; then
     if ! CDX=$(command -v auditable2cdx); then
         echo "ERROR: cyclonedx needs auditable2cdx, which is not on the PATH. Add auditable2cdx to the install command's" >&2
@@ -71,7 +79,7 @@ CASES="[]"
 MISSING=()
 declare -A USED_NAMES=()
 
-echo "Checking ${#BINARIES[@]} binaries for cargo-auditable data..."
+echo "Checking ${#BINARIES[@]} binaries for cargo-auditable data, with the ${RS_DECODER} decoder (${RS_TOOL})..."
 for binary in "${BINARIES[@]}"; do
     RS_INPUTS+=("binary:${binary}")
     name=${binary##*/}
@@ -86,8 +94,17 @@ for binary in "${BINARIES[@]}"; do
     name=${candidate}
     USED_NAMES[${name}]=1
     base="${RS_BASE}-${name}"
-    if ! "${RS_TOOL}" "${binary}" > "${base}.audit.json" 2> "${base}.log" \
-        || ! rs_json_is "${base}.audit.json" '.packages | type == "array" and length > 0'; then
+    rc=0
+    rs_decode "${binary}" "${base}.audit.json" "${base}.log" || rc=$?
+    if [[ "${rc}" -eq 2 ]]; then
+        echo "ERROR: The ${RS_DECODER} decoder can't tell whether ${binary} carries cargo-auditable data: $(head -n 1 "${base}.log")" >&2
+        rm -f "${base}.audit.json"
+        RS_REPORTS+=("${base}.log")
+        if [[ "${RUN_RECORD}" == true ]]; then
+            rs_run_record "${RS_BASE}.run-record.json" verify_auditable error 2 "${STARTED}"
+        fi
+        exit 1
+    elif [[ "${rc}" -ne 0 ]]; then
         echo "  ${binary}: FAILED: $(head -n 1 "${base}.log")"
         MISSING+=("${binary}")
         rm -f "${base}.audit.json" "${base}.log"
@@ -124,10 +141,10 @@ for binary in "${BINARIES[@]}"; do
     CASES=$(jq -c --arg binary "${binary}" '. + [{classname: "auditable", name: $binary, status: "passed"}]' <<< "${CASES}")
 done
 
-jq '{binaries: .}' <<< "${INDEX}" > "${RS_BASE}.json"
+jq --arg decoder "${RS_DECODER}" '{decoder: $decoder, binaries: .}' <<< "${INDEX}" > "${RS_BASE}.json"
 RS_REPORTS+=("${RS_BASE}.json")
 # shellcheck disable=SC2034 # read by rs_run_record
-RS_COUNTS=$(jq -c '{binaries: (.binaries | length), without_auditable_data: ([.binaries[] | select(.auditable | not)] | length)}' "${RS_BASE}.json")
+RS_COUNTS=$(jq -c '{binaries: (.binaries | length), without_auditable_data: ([.binaries[] | select(.auditable | not)] | length), decoder}' "${RS_BASE}.json")
 if [[ "${JUNIT}" == true ]]; then
     rs_junit "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${PARAM_REPORT_NAME}" "${CASES}"
     RS_REPORTS+=("${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml")

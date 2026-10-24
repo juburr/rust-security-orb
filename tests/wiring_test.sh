@@ -6,7 +6,8 @@
 #     it, from the parameter of the same name, and every parameter a command
 #     declares is passed on to its script (or used in its steps);
 #   - every script that reads a SCRIPT_<NAME>_LIB (or _PY) variable gets it,
-#     from scripts/lib/<name>.sh (or .py);
+#     from scripts/lib/<name>.sh (or .py), and every one that picks a .dep-v0
+#     decoder (rs_decoder) gets the native one, SCRIPT_DEP_V0_PY;
 #   - every reporting command stores output_dir as artifacts under
 #     rust-security-reports/ with when: always, and stores JUnit results
 #     only when junit is true;
@@ -88,6 +89,9 @@ for yml in src/commands/*.yml; do
                 fail "${command}: src/${script} needs ${var}, which ${command}.yml doesn't pass from ${file}"
             fi
         done < <(grep -oE '\$\{SCRIPT_[A-Z0-9_]+' "src/${script}" | sed 's/^\${//' | sort -u)
+        if grep -qE '^ *rs_decoder ' "src/${script}" && ! grep -qF 'SCRIPT_DEP_V0_PY: << include(scripts/lib/dep_v0.py) >>' "${yml}"; then
+            fail "${command}: src/${script} picks a decoder, but ${command}.yml doesn't pass SCRIPT_DEP_V0_PY from scripts/lib/dep_v0.py"
+        fi
     done
     for name in ${declared[@]+"${declared[@]}"}; do
         if ! grep -qE "<< parameters\.${name} >>" "${yml}"; then

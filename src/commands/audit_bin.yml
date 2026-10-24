@@ -23,9 +23,18 @@ parameters:
     type: boolean
     default: false
     description: >
-      Count a binary without cargo-auditable data that decodes as a finding, since cargo audit
-      can only guess its dependencies from panic messages. Needs rust-audit-info (in the
-      install command's tools).
+      Count a binary without cargo-auditable data that decodes, with the shape cargo auditable
+      writes, as a finding, since cargo audit can only guess its dependencies from panic
+      messages. Reads it with decoder: rust-audit-info (in the install command's tools), or
+      the native decoder, which needs only python3.
+  decoder:
+    type: enum
+    enum: ["auto", "native", "rust-audit-info"]
+    default: auto
+    description: >
+      What reads each binary's .dep-v0 section for require_auditable, as for verify_auditable:
+      rust-audit-info, native (python3, no Rust toolchain, ELF of any architecture), or auto,
+      a verified rust-audit-info or else native.
   db_path:
     type: string
     default: ""
@@ -140,6 +149,7 @@ steps:
         PARAM_ALLOW_STALE: << parameters.allow_stale >>
         PARAM_BINARIES: << parameters.binaries >>
         PARAM_DB_PATH: << parameters.db_path >>
+        PARAM_DECODER: << parameters.decoder >>
         PARAM_DENY: << parameters.deny >>
         PARAM_EXTRA_ARGS: << parameters.extra_args >>
         PARAM_JUNIT: << parameters.junit >>
@@ -154,6 +164,7 @@ steps:
         PARAM_TARGET_ARCH: << parameters.target_arch >>
         PARAM_TARGET_OS: << parameters.target_os >>
         PARAM_UNUSED_IGNORES: << parameters.unused_ignores >>
+        SCRIPT_DEP_V0_PY: << include(scripts/lib/dep_v0.py) >>
         SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
       command: << include(scripts/audit_bin.sh) >>
   - when:

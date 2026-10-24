@@ -164,7 +164,8 @@ jobs:
               echo "FAIL: install accepted a misspelled tool."
               exit 1
             fi
-  # Installs every tool on an Arm machine: native release binaries, and the crates built there.
+  # Installs every tool on an Arm machine: native release binaries, and the crates built there. Builds
+  # the fixture with cargo auditable there too, for offline-test to read on x86_64.
   arm64-test:
     docker:
       - image: cimg/rust:1.99
@@ -199,6 +200,23 @@ jobs:
       - run:
           name: Verify The Audit Found The Advisory
           command: jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' /tmp/reports/arm64/cargo-audit.json
+      - rust-security-orb/auditable_build:
+          working_dir: *fixture
+          extra_args: --release --locked
+      - run:
+          name: Strip And Keep The arm64 Build
+          working_directory: *fixture
+          command: |
+            mkdir -p /tmp/workspace/dist-arm64
+            cp target/release/rso-fixture /tmp/workspace/dist-arm64/rso-fixture-arm64
+            strip /tmp/workspace/dist-arm64/rso-fixture-arm64
+      - rust-security-orb/verify_auditable:
+          binaries: /tmp/workspace/dist-arm64/rso-fixture-arm64
+          output_dir: /tmp/workspace/reports/arm64
+          report_name: auditable-arm64
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [dist-arm64, reports/arm64]
   # Detection: audit and deny fail on the fixture's advisory by default, pass with report_only while
   # still reporting it, and fail even with report_only when the tool can't run. Also deny's
   # require_ignore_reasons and the licence inventory, and the advisory database archive and cargo
@@ -403,6 +421,8 @@ jobs:
             strip /tmp/workspace/dist/rso-fixture-clean
             cargo build --release --locked --target-dir target/plain
             cp target/plain/release/rso-fixture /tmp/rso-fixture-plain
+            mkdir -p /tmp/workspace/plain
+            cp /tmp/rso-fixture-plain /tmp/workspace/plain/rso-fixture-plain
       - rust-security-orb/verify_auditable:
           binaries: /tmp/workspace/dist/rso-fixture-vulnerable /tmp/workspace/dist/rso-fixture-clean
           cyclonedx: true
@@ -451,7 +471,7 @@ jobs:
             grep -q "carry no cargo-auditable data that decodes: /tmp/rso-fixture-plain" /tmp/run.log
       - persist_to_workspace:
           root: /tmp/workspace
-          paths: [dist, reports/auditable]
+          paths: [dist, plain, reports/auditable]
   # Bans per configuration: with the config for one backend, a build of that backend passes the bans
   # check, and the other backend, or both, fail it. The workflow runs it for each backend.
   bans-test:
@@ -613,7 +633,10 @@ jobs:
   # Offline: on a machine with no Rust toolchain, after the tools are installed, github.com and
   # crates.io stop resolving. audit, deny, licenses and audit_bin then run against the advisory
   # database detection-test archived, the cargo metadata it wrote and the binaries auditable-test
-  # built. A database 90 days old fails unless allow_stale is true.
+  # built. A database 90 days old fails unless allow_stale is true. verify_auditable and audit_bin's
+  # require_auditable read the binaries' .dep-v0 sections with the native decoder, arm64-test's
+  # aarch64 binary included, writing what rust-audit-info wrote in auditable-test byte for byte, and
+  # fail on sections that are removed or broken.
   offline-test:
     machine:
       image: ubuntu-2204:current
@@ -663,6 +686,71 @@ jobs:
           no_fetch: true
           report_only: true
           output_dir: /tmp/workspace/reports/offline
+      - rust-security-orb/verify_auditable:
+          binaries: /tmp/workspace/dist/rso-fixture-vulnerable /tmp/workspace/dist/rso-fixture-clean /tmp/workspace/dist-arm64/rso-fixture-arm64
+          decoder: native
+          junit: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/offline
+          report_name: native
+      - rust-security-orb/audit_bin:
+          binaries: /tmp/workspace/dist/rso-fixture-vulnerable /tmp/workspace/dist-arm64/rso-fixture-arm64
+          require_auditable: true
+          decoder: native
+          no_fetch: true
+          report_only: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/offline
+          report_name: audit-bin-native
+      - run:
+          name: Verify The Native Decoder
+          command: |
+            R=/tmp/workspace/reports
+            command -v rust-audit-info && { echo "FAIL: rust-audit-info is on the PATH."; exit 1; }
+            # The bytes rust-audit-info wrote for the same binaries in auditable-test and arm64-test.
+            cmp "${R}/offline/native-rso-fixture-vulnerable.audit.json" "${R}/auditable/auditable-rso-fixture-vulnerable.audit.json"
+            cmp "${R}/offline/native-rso-fixture-clean.audit.json" "${R}/auditable/auditable-rso-fixture-clean.audit.json"
+            cmp "${R}/offline/native-rso-fixture-arm64.audit.json" "${R}/arm64/auditable-arm64-rso-fixture-arm64.audit.json"
+            jq -e '.decoder == "native" and ([.binaries[] | select(.auditable)] | length) == 3' "${R}/offline/native.json"
+            jq -e '.tool.name == "python3" and .tool.program.name == "dep_v0.py"' "${R}/offline/native.run-record.json"
+            [[ "$(jq -r .tool.program.sha256 "${R}/offline/native.run-record.json")" == "$(sha256sum src/scripts/lib/dep_v0.py | cut -d' ' -f1)" ]]
+            jq -e '.without_auditable_data == [] and (.binaries | length) == 2' "${R}/offline/audit-bin-native.json"
+            jq -e '.other_tools[0].program.name == "dep_v0.py"' "${R}/offline/audit-bin-native.run-record.json"
+      - run:
+          name: Verify Missing And Broken .dep-v0 Sections Fail
+          command: |
+            B=/tmp/broken
+            mkdir -p "${B}"
+            SOURCE=/tmp/workspace/dist/rso-fixture-vulnerable
+            objcopy --remove-section .dep-v0 "${SOURCE}" "${B}/removed"
+            # Sections that decode to something else than one dependency list: a zlib stream cut
+            # short, text that isn't JSON, no packages, and every package a root.
+            GOOD=/tmp/workspace/reports/auditable/auditable-rso-fixture-vulnerable.audit.json
+            python3 -c 'import json, sys, zlib
+            good = open(sys.argv[1], "rb").read()
+            roots = json.loads(good)
+            for package in roots["packages"]:
+                package["root"] = True
+            payloads = {
+                "truncated": zlib.compress(good)[:-6],
+                "not-json": zlib.compress(b"not json"),
+                "no-packages": zlib.compress(json.dumps({"packages": [], "format": 1}).encode()),
+                "two-roots": zlib.compress(json.dumps(roots).encode()),
+            }
+            for name, payload in payloads.items():
+                open(sys.argv[2] + "/" + name + ".z", "wb").write(payload)' "${GOOD}" "${B}"
+            for name in truncated not-json no-packages two-roots; do
+              objcopy --update-section ".dep-v0=${B}/${name}.z" "${SOURCE}" "${B}/${name}"
+            done
+            for binary in "${B}/removed" "${B}/truncated" "${B}/not-json" "${B}/no-packages" "${B}/two-roots" /tmp/workspace/plain/rso-fixture-plain; do
+              if bash tests/run_command.sh verify_auditable binaries="${binary}" decoder=native > /tmp/run.log 2>&1; then
+                cat /tmp/run.log
+                echo "FAIL: verify_auditable passed ${binary}."
+                exit 1
+              fi
+              cat /tmp/run.log
+              grep -q "carry no cargo-auditable data that decodes: ${binary}" /tmp/run.log
+            done
       - run:
           name: Verify Each Command Found The Advisory Offline
           command: |
@@ -788,7 +876,7 @@ workflows:
       - graph-test:
           filters: *filters
       - offline-test:
-          requires: [detection-test, auditable-test]
+          requires: [detection-test, auditable-test, arm64-test]
           filters: *filters
       - supply-chain-test:
           filters: *filters

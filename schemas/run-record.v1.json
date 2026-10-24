@@ -45,9 +45,9 @@
       "description": "The absolute directory the command ran in. Relative paths in arguments are relative to it.",
       "type": "string"
     },
-    "tool": { "description": "The tool binary the command ran.", "$ref": "#/$defs/tool" },
+    "tool": { "description": "The tool binary the command ran: for verify_auditable, its .dep-v0 decoder, rust-audit-info or python3 (with program); for tree_forbid and tree_expect, cargo.", "$ref": "#/$defs/tool" },
     "other_tools": {
-      "description": "Other binaries the command ran, each described as tool is: auditable2cdx for verify_auditable with cyclonedx, rust-audit-info for audit_bin with require_auditable, and none otherwise.",
+      "description": "Other binaries the command ran, each described as tool is: auditable2cdx for verify_auditable with cyclonedx, the .dep-v0 decoder for audit_bin with require_auditable (rust-audit-info, or python3 running the orb's native decoder), and none otherwise.",
       "type": "array",
       "items": { "$ref": "#/$defs/tool" }
     },
@@ -132,6 +132,15 @@
         "path": { "description": "The binary that ran.", "type": "string" },
         "version": { "description": "What the binary reports as its version; empty when it reports none.", "type": "string" },
         "sha512": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha512" }] },
+        "program": {
+          "description": "For an interpreter that ran a program of the orb's, such as python3 running the native .dep-v0 decoder (verify_auditable and audit_bin with decoder native): the program's name and SHA-256, which identify the decoder as the binary's SHA-512 identifies a tool.",
+          "type": "object",
+          "required": ["name", "sha256"],
+          "properties": {
+            "name": { "type": "string" },
+            "sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
         "install": {
           "description": "How the orb installed the binary that ran, from the record its install command left beside it. null when there is none, or when it describes another binary than the one that ran.",
           "oneOf": [

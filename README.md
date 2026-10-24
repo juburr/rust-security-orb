@@ -230,6 +230,29 @@ steps:
 
 cargo auditable embeds the resolved dependency list in a `.dep-v0` section of each binary it links, at a cost of a few kilobytes. GNU `strip` keeps it; `llvm-strip`, `strip --strip-section-headers` and some packers remove it without a word, which is why `verify_auditable` reads it back from the file you ship and fails when it is gone. With `cyclonedx`, it also writes a CycloneDX SBOM of exactly what that binary links. `audit_bin` then checks each binary against the advisory database: a binary built without the vulnerable feature passes even when the lockfile lists the crate.
 
+Reading the section back doesn't need rust-audit-info, which has to be built from source with cargo. With `decoder: native`, `verify_auditable` and `audit_bin` read it with the orb's own decoder, a short Python program that needs only `python3` and reads ELF binaries of any architecture, so the job that checks a release needs neither Rust nor a build: a machine executor, or the image the binary ships in. It writes exactly the bytes rust-audit-info writes (the orb's CI compares the two on amd64 and arm64 builds), and with either decoder the list must have the shape cargo auditable writes (packages, exactly one root, dependencies that point at packages), or the binary fails. The default, `auto`, takes rust-audit-info when the install command installed it and the native decoder otherwise. The native decoder doesn't read PE, Mach-O or WebAssembly files; use rust-audit-info for those.
+
+```yaml
+jobs:
+  verify-release:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - rust-security/install:
+          tools: cargo-audit
+      - rust-security/fetch_advisory_db
+      - rust-security/verify_auditable:
+          binaries: /tmp/workspace/dist/*
+          decoder: native
+      - rust-security/audit_bin:
+          binaries: /tmp/workspace/dist/*
+          require_auditable: true
+          decoder: native
+          no_fetch: true
+```
+
 ### Check Several Workspaces Under One Policy
 
 Fuzz targets, test harnesses and tools often live in standalone workspaces, each with its own `Cargo.lock`, under the one `deny.toml` and `.cargo/audit.toml` at the repository root. One step checks them all:
@@ -386,7 +409,7 @@ Both commands run `cargo tree --locked` by default, check its exit code before r
 
 ### Keep Evidence for an Assessor
 
-`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, and for `deny`, `licenses` and `sbom` those packages' licence files (`LICENSE*`, `COPYING*` and `license-file`), which the tools read, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
+`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well, or for the native decoder, `python3` and the decoder's SHA-256), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, and for `deny`, `licenses` and `sbom` those packages' licence files (`LICENSE*`, `COPYING*` and `license-file`), which the tools read, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
 
 ### Inventory Licences for Legal Review
 
@@ -458,7 +481,8 @@ Checks built binaries with `cargo audit bin`, which reads the dependency list ca
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `binaries` | *required* | The binaries to audit, separated by spaces or commas. Shell patterns such as `dist/*` are expanded, and everything they match must be a binary (`target/release/*` also matches directories and `.d` files); a pattern that matches nothing fails the step. Name the files you ship, after stripping and packaging. |
-| `require_auditable` | `false` | Count a binary without cargo-auditable data as a finding: without it, cargo audit can only guess a binary's dependencies from its panic messages. Needs rust-audit-info. |
+| `require_auditable` | `false` | Count a binary without cargo-auditable data as a finding: without it, cargo audit can only guess a binary's dependencies from its panic messages. A binary whose data doesn't decode, or doesn't have the shape cargo auditable writes, counts too. |
+| `decoder` | `auto` | What reads the data for `require_auditable`, as for `verify_auditable`. |
 | `working_dir`, `db_path`, `no_fetch`, `allow_stale`, `deny`, `target_arch`, `target_os`, `no_yanked`, `unused_ignores`, `extra_args` | | As for `audit`. An ignore is unused when no binary has a finding for it. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit-bin`. |
 
@@ -507,11 +531,12 @@ Runs `cargo auditable build` (or `install`, or `rustc`), which builds as cargo d
 
 ### `rust-security/verify_auditable`
 
-Reads each binary's embedded dependency list back with `rust-audit-info`, writes it as `<report_name>-<binary>.audit.json`, and fails when a binary has none or it doesn't decode. Every binary is checked before the step fails, and the index, `<report_name>.json`, lists each with its SHA-256.
+Reads each binary's embedded dependency list back, writes it as `<report_name>-<binary>.audit.json`, and fails when a binary has none, it doesn't decode, or it doesn't have the shape cargo auditable writes: packages, exactly one root, and dependencies that are indices into the packages. Every binary is checked before the step fails, and the index, `<report_name>.json`, lists each with its SHA-256 and names the decoder.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `binaries` | *required* | The binaries to check, separated by spaces or commas; shell patterns are expanded. Name the final files. |
+| `decoder` | `auto` | What reads each `.dep-v0` section. `rust-audit-info`; `native`, the orb's own decoder, which needs only `python3` (no cargo, no build), reads ELF binaries of any architecture and writes exactly what rust-audit-info writes; or `auto`, which takes a rust-audit-info the install command verified, or else `native`, or else an unverified rust-audit-info, with a warning. `native` reads ELF only, and fails the step on another format. The run record names the decoder, and for `native`, `python3` with the decoder's SHA-256. |
 | `cyclonedx` | `false` | Also write a CycloneDX 1.3 SBOM of each binary, from its embedded list, with `auditable2cdx`, to `<report_name>-<binary>.cdx.json`. |
 | `working_dir` | `.` | Directory the binaries are relative to. |
 | `output_dir`, `report_name`, `junit`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `auditable`. |
@@ -641,9 +666,9 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 
 ## 💻 Supported Platforms
 
-Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including CircleCI [Arm resource classes](https://circleci.com/docs/using-arm/). macOS and Windows executors aren't supported yet: `install` fails on them rather than install a binary that can't run. The arm64 releases of cargo-audit and cargo-cyclonedx link glibc (2.18 and 2.34 or newer), so on arm64 they need a glibc-based image such as `cimg/rust`; on Alpine and other musl-based arm64 images, their install fails before downloading anything. The other release binaries are static, and the tools built from crates build wherever cargo runs. CI runs every command on `cimg/rust` (Docker, amd64), installs every tool on an Arm Docker executor, and runs the offline checks on a machine executor with no Rust toolchain.
+Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including CircleCI [Arm resource classes](https://circleci.com/docs/using-arm/). macOS and Windows executors aren't supported yet: `install` fails on them rather than install a binary that can't run. The arm64 releases of cargo-audit and cargo-cyclonedx link glibc (2.18 and 2.34 or newer), so on arm64 they need a glibc-based image such as `cimg/rust`; on Alpine and other musl-based arm64 images, their install fails before downloading anything. The other release binaries are static, and the tools built from crates build wherever cargo runs. CI runs every command on `cimg/rust` (Docker, amd64), installs every tool and builds an auditable binary on an Arm Docker executor, and runs the offline checks, the native decoder's on both builds included, on a machine executor with no Rust toolchain.
 
-The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `realpath`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet`, `tree_forbid`, `tree_expect` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. `cimg/rust` has all of them.
+The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `realpath`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet`, `tree_forbid`, `tree_expect` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. The native `.dep-v0` decoder of `verify_auditable` and `audit_bin` needs `python3` (3.8 or newer, standard library only) instead. `cimg/rust` has all of them.
 
 The cache is keyed by tool, version, executor architecture and home directory, so amd64 and arm64 jobs never share a cached download. On executors whose `PATH` doesn't already include `install_path` (for example, machine executors), `install` adds it for later steps through `BASH_ENV`.
 

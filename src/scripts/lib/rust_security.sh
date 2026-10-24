@@ -204,12 +204,115 @@ rs_tool() {
 # rs_tool_verified NAME PATH: warns unless PATH is a NAME this orb's install
 # command verified, as the install record it leaves beside the binary says.
 rs_tool_verified() {
+    if ! rs_is_verified "$1" "$2"; then
+        echo "WARN: $2 is not the $1 this orb's install command verified against its checksum table." >&2
+        echo "WARN: Install $1 with the install command, and put its install_path first on the PATH, to run a verified one." >&2
+    fi
+}
+
+# rs_is_verified NAME PATH: whether PATH is a NAME this orb's install command
+# verified.
+rs_is_verified() {
     local record sha
     record="$(dirname "$2")/.$1.install.json"
     sha=$(sha512sum -- "$2" 2> /dev/null | awk '{ print $1 }') || sha=""
-    if [[ -z "${sha}" || ! -f "${record}" ]] || ! grep -qF "\"binary_sha512\":\"${sha}\"" "${record}"; then
-        echo "WARN: $2 is not the $1 this orb's install command verified against its checksum table." >&2
-        echo "WARN: Install $1 with the install command, and put its install_path first on the PATH, to run a verified one." >&2
+    [[ -n "${sha}" && -f "${record}" ]] && grep -qF "\"binary_sha512\":\"${sha}\"" "${record}"
+}
+
+# The shape cargo auditable's dependency list has, as jq: a format, when there
+# is one, that is a whole number (cargo auditable before 0.7 writes none, and
+# never writes 0); a non-empty packages array of objects with a name, version
+# and source, exactly one of them the root; and dependencies that are indices
+# into packages. rust-audit-info checks none of it, so it is checked here for
+# both decoders.
+# shellcheck disable=SC2016 # jq program, not shell
+RS_DEP_V0_SHAPE='type == "object" and ((has("format") | not) or (.format | type == "number" and . == floor and . >= 0))
+    and (.packages | type == "array" and length > 0)
+    and all(.packages[]; type == "object" and (.name | type == "string") and (.version | type == "string") and (.source | type == "string"))
+    and ([.packages[] | select(.root == true)] | length == 1)
+    and ((.packages | length) as $n | all(.packages[]; (.dependencies // []) | type == "array"
+        and all(.[]; type == "number" and . == floor and . >= 0 and . < $n)))'
+
+# rs_decoder VALUE: picks how the dependency list cargo auditable embeds in a
+# binary (its .dep-v0 section) is read: decoder VALUE is rust-audit-info, the
+# tool the install command builds from source; native, the orb's own decoder
+# (scripts/lib/dep_v0.py, passed as SCRIPT_DEP_V0_PY), which needs only
+# python3 and reads ELF binaries of any architecture; or auto, which takes a
+# rust-audit-info the install command verified, or else native, or else an
+# unverified rust-audit-info, with a warning. Sets RS_DECODER (native or
+# rust-audit-info) and RS_DECODER_TOOL (the binary that runs), and for native,
+# RS_PROGRAM_PATH, RS_PROGRAM_NAME and RS_PROGRAM_SHA256 for the run record.
+rs_decoder() {
+    local tool python
+    RS_DECODER=""
+    RS_DECODER_TOOL=""
+    case "$1" in
+        auto | native | rust-audit-info) ;;
+        *)
+            echo "ERROR: decoder must be auto, native or rust-audit-info, not '$1'." >&2
+            exit 1
+            ;;
+    esac
+    tool=$(command -v rust-audit-info) || tool=""
+    python=$(command -v python3) || python=""
+    # rust-audit-info when asked for, or with auto when the install command
+    # verified it.
+    if [[ -n "${tool}" ]] && { [[ "$1" == rust-audit-info ]] || { [[ "$1" == auto ]] && rs_is_verified rust-audit-info "${tool}"; }; }; then
+        rs_tool_verified rust-audit-info "${tool}"
+        RS_DECODER=rust-audit-info
+        RS_DECODER_TOOL=${tool}
+        return 0
+    fi
+    if [[ "$1" != rust-audit-info && -n "${python}" ]]; then
+        if [[ -z "${SCRIPT_DEP_V0_PY:-}" ]]; then
+            echo "ERROR: The native decoder was not loaded: SCRIPT_DEP_V0_PY is empty." >&2
+            exit 1
+        fi
+        RS_DECODER=native
+        RS_DECODER_TOOL=${python}
+        RS_PROGRAM_PATH=${python}
+        # shellcheck disable=SC2034 # read by rs_tool_json
+        RS_PROGRAM_NAME=dep_v0.py
+        # shellcheck disable=SC2034 # read by rs_tool_json
+        # As the file is in the orb's source, ending in one newline, whatever
+        # the step's environment kept of it.
+        RS_PROGRAM_SHA256=$(printf '%s\n' "$(printf '%s' "${SCRIPT_DEP_V0_PY}")" | sha256sum | awk '{ print $1 }')
+        return 0
+    fi
+    # auto without python3 takes the rust-audit-info there is, verified or not.
+    if [[ "$1" == auto && -n "${tool}" ]]; then
+        rs_tool_verified rust-audit-info "${tool}"
+        RS_DECODER=rust-audit-info
+        RS_DECODER_TOOL=${tool}
+        return 0
+    fi
+    case "$1" in
+        rust-audit-info) echo "ERROR: decoder rust-audit-info needs rust-audit-info, which is not on the PATH. Add" >&2 ;;
+        native) echo "ERROR: decoder native needs python3, which is not on the PATH. Install Python 3 in an earlier step, or add" >&2 ;;
+        *) echo "ERROR: Reading cargo-auditable data needs rust-audit-info or python3, and neither is on the PATH. Add" >&2 ;;
+    esac
+    echo "  rust-audit-info to the install command's tools (it builds with cargo), or install Python 3 for decoder: native." >&2
+    exit 1
+}
+
+# rs_decode BINARY OUTPUT LOG: writes the dependency list BINARY carries to
+# OUTPUT with RS_DECODER, and returns 0 when it decodes and has the shape
+# cargo auditable writes, 1 (with the reason in LOG) when there is none or it
+# doesn't, and 2 (with the reason in LOG) when the decoder can't tell, such as
+# for a file the native decoder can't read (it reads ELF only).
+rs_decode() {
+    local rc=0
+    if [[ "${RS_DECODER}" == native ]]; then
+        "${RS_DECODER_TOOL}" -I -c "${SCRIPT_DEP_V0_PY}" "$1" > "$2" 2> "$3" || rc=$?
+        if [[ "${rc}" -ne 0 ]]; then
+            return $((rc == 1 ? 1 : 2))
+        fi
+    elif ! "${RS_DECODER_TOOL}" "$1" > "$2" 2> "$3"; then
+        return 1
+    fi
+    if ! rs_json_is "$2" "${RS_DEP_V0_SHAPE}"; then
+        echo "Its dependency list is not the JSON cargo auditable writes: packages, one root, dependencies within them." > "$3"
+        return 1
     fi
 }
 
@@ -557,7 +660,7 @@ rs_show_command() {
 # its SHA-512, and how the orb installed it, from the install record beside
 # it when that record describes this very binary.
 rs_tool_json() {
-    local sha="" install="null" entry
+    local sha="" install="null" entry program="null"
     if [[ -n "$1" && -f "$1" ]]; then
         # Without sha512sum the record says so with a null SHA-512, as rs_tool
         # only warns.
@@ -568,8 +671,14 @@ rs_tool_json() {
             install=$(jq -c 'del(.binary_sha512)' "${entry}")
         fi
     fi
+    # An interpreter that ran a program of the orb's, such as python3 the
+    # native .dep-v0 decoder: the program, by its SHA-256.
+    if [[ -n "$1" && "$1" == "${RS_PROGRAM_PATH:-}" ]]; then
+        program=$(jq -cn --arg name "${RS_PROGRAM_NAME}" --arg sha "${RS_PROGRAM_SHA256}" '{name: $name, sha256: $sha}')
+    fi
     jq -cn --arg name "${1##*/}" --arg path "$1" --arg version "$2" --arg sha "${sha}" --argjson install "${install}" \
-        '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end), install: $install}'
+        --argjson program "${program}" '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end),
+            install: $install} + (if $program == null then {} else {program: $program} end)'
 }
 
 # rs_manifest_inputs METADATA: adds the workspace's manifests to RS_INPUTS,

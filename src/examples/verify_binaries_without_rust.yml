@@ -1,0 +1,59 @@
+description: >
+  Check release binaries where there is no Rust toolchain: a machine executor
+  receives the binaries an earlier job built with cargo auditable, and
+  verify_auditable and audit_bin read their embedded dependency lists with the
+  orb's native decoder, which needs only python3 and reads ELF binaries of any
+  architecture, so an arm64 build is checked on an amd64 machine. A binary
+  whose .dep-v0 section was stripped, or doesn't decode, fails the job.
+
+usage:
+  version: 2.1
+  orbs:
+    rust-security: juburr/rust-security-orb@0.2.0
+  jobs:
+    build:
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - rust-security/install:
+            tools: cargo-auditable
+        - rust-security/auditable_build:
+            extra_args: --release --locked
+        - run:
+            name: Package
+            command: |
+              mkdir -p dist
+              cp target/release/myapp dist/
+              strip dist/myapp
+        - persist_to_workspace:
+            root: .
+            paths: [dist]
+    verify-release:
+      machine:
+        image: ubuntu-2204:current
+      steps:
+        - attach_workspace:
+            at: .
+        - rust-security/install:
+            tools: cargo-audit
+        - rust-security/fetch_advisory_db
+        - rust-security/verify_auditable:
+            binaries: dist/*
+            decoder: native
+            run_record: true
+            store_artifacts: false
+        - rust-security/audit_bin:
+            binaries: dist/*
+            require_auditable: true
+            decoder: native
+            no_fetch: true
+            run_record: true
+            store_artifacts: false
+        - rust-security/store_reports
+  workflows:
+    release:
+      jobs:
+        - build
+        - verify-release:
+            requires: [build]

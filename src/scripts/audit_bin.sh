@@ -34,15 +34,13 @@ rs_output "${PARAM_OUTPUT_DIR}" "${PARAM_REPORT_NAME}"
 rs_audit_extra_args
 rs_require_jq
 rs_tool cargo-audit
+# With require_auditable, each binary's .dep-v0 section is read with
+# rust-audit-info or the native decoder (rs_decoder), as verify_auditable
+# reads it, before cargo audit reads it its own way.
 if [[ "${REQUIRE_AUDITABLE}" == true ]]; then
-    if ! AUDIT_INFO=$(command -v rust-audit-info); then
-        echo "ERROR: require_auditable needs rust-audit-info, which is not on the PATH. Add rust-audit-info to the" >&2
-        echo "  install command's tools, or use install_rust_audit_info." >&2
-        exit 1
-    fi
-    rs_tool_verified rust-audit-info "${AUDIT_INFO}"
+    rs_decoder "${PARAM_DECODER}"
     # shellcheck disable=SC2034 # read by rs_run_record
-    RS_OTHER_TOOLS=("${AUDIT_INFO}")
+    RS_OTHER_TOOLS=("${RS_DECODER_TOOL}")
 fi
 
 # Every binary named, with shell patterns expanded. A pattern that matches
@@ -117,11 +115,22 @@ for binary in "${BINARIES[@]}"; do
     name=${candidate}
     USED_NAMES[${name}]=1
     base="${RS_BASE}-${name}"
-    if [[ "${REQUIRE_AUDITABLE}" == true ]] && ! "${AUDIT_INFO}" "${binary}" > /dev/null 2> "${base}.audit-info.log"; then
-        echo "  ${binary}: no cargo-auditable data ($(head -n 1 "${base}.audit-info.log"))"
-        MISSING+=("${binary}")
+    if [[ "${REQUIRE_AUDITABLE}" == true ]]; then
+        rc=0
+        rs_decode "${binary}" "${base}.audit-info.json" "${base}.audit-info.log" || rc=$?
+        if [[ "${rc}" -eq 2 ]]; then
+            echo "ERROR: The ${RS_DECODER} decoder can't tell whether ${binary} carries cargo-auditable data: $(head -n 1 "${base}.audit-info.log")" >&2
+            rm -f "${base}.audit-info.json" "${base}.audit-info.log"
+            if [[ "${RUN_RECORD}" == true ]]; then
+                rs_run_record "${RS_BASE}.run-record.json" audit_bin error 2 "${STARTED}"
+            fi
+            exit 1
+        elif [[ "${rc}" -ne 0 ]]; then
+            echo "  ${binary}: no cargo-auditable data ($(head -n 1 "${base}.audit-info.log"))"
+            MISSING+=("${binary}")
+        fi
+        rm -f "${base}.audit-info.json" "${base}.audit-info.log"
     fi
-    rm -f "${base}.audit-info.log"
     # Only the first scan may fetch the database; the others read that copy.
     OPTS=()
     if [[ "${RS_NO_FETCH}" != true && "${CODES}" -gt 0 ]]; then

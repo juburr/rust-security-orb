@@ -498,7 +498,8 @@ done
 
 SCRIPT_RUST_SECURITY_LIB=$(cat "${SCRIPTS}/lib/rust_security.sh")
 SCRIPT_CARGO_TREE_LIB=$(cat "${SCRIPTS}/lib/cargo_tree.sh")
-export SCRIPT_RUST_SECURITY_LIB SCRIPT_CARGO_TREE_LIB
+SCRIPT_DEP_V0_PY=$(cat "${SCRIPTS}/lib/dep_v0.py")
+export SCRIPT_RUST_SECURITY_LIB SCRIPT_CARGO_TREE_LIB SCRIPT_DEP_V0_PY
 
 # new_case: a fresh HOME, working directory, output_dir and record of calls.
 new_case() {
@@ -1502,9 +1503,10 @@ check "without a working sha512sum, the step still passes" succeeded
 check "and the run record has no SHA-512 for the tool" json_is "${CASE}/out/cargo-audit.run-record.json" .tool.sha512 null
 
 # --- audit_bin
-DEFAULTS=(PARAM_BINARIES="app" PARAM_REQUIRE_AUDITABLE=0 PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false
+AUDIT_BIN_DEFAULTS=(PARAM_BINARIES="app" PARAM_REQUIRE_AUDITABLE=0 PARAM_DECODER=auto PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false
     PARAM_NO_YANKED=false PARAM_DENY= PARAM_TARGET_ARCH= PARAM_TARGET_OS= PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set
     PARAM_REPORT_NAME=cargo-audit-bin PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0 PARAM_UNUSED_IGNORES=allow)
+DEFAULTS=("${AUDIT_BIN_DEFAULTS[@]}")
 bin_case() {
     new_case
     mkdir -p "${CASE}/work/target/release" "${CASE}/work/dist"
@@ -1583,13 +1585,13 @@ bin_case
 mkdir -p "${CASE}/bin"
 cp "${STUBS}/rust-audit-info" "${CASE}/bin/rust-audit-info"
 echo "# changed" >> "${CASE}/bin/rust-audit-info"
-run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 "PATH=${CASE}/bin:${STUBS}:${PATH}"
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=rust-audit-info "PATH=${CASE}/bin:${STUBS}:${PATH}"
 check "and warns about one the install command didn't verify" \
     said "WARN: ${CASE}/bin/rust-audit-info is not the rust-audit-info this orb's install command verified"
 bin_case
-run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 "PATH=$(path_without rust-audit-info)"
-check "require_auditable needs rust-audit-info" failed
-check "saying how to install it" said "require_auditable needs rust-audit-info"
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=rust-audit-info "PATH=$(path_without rust-audit-info)"
+check "decoder rust-audit-info needs rust-audit-info" failed
+check "saying how to install it" said "ERROR: decoder rust-audit-info needs rust-audit-info, which is not on the PATH."
 bin_case
 run audit_bin.sh "PARAM_BINARIES=missing/*"
 check "a pattern that matches nothing fails" failed
@@ -2157,7 +2159,7 @@ run auditable_build.sh 'PARAM_EXTRA_ARGS=--release; rm -rf /'
 check "refuses shell operators in extra_args" failed
 
 # --- verify_auditable
-DEFAULTS=(PARAM_BINARIES=app PARAM_CYCLONEDX=false PARAM_OUTPUT_DIR=/will/be/set PARAM_REPORT_NAME=auditable PARAM_JUNIT=false
+DEFAULTS=(PARAM_BINARIES=app PARAM_DECODER=auto PARAM_CYCLONEDX=false PARAM_OUTPUT_DIR=/will/be/set PARAM_REPORT_NAME=auditable PARAM_JUNIT=false
     PARAM_RUN_RECORD=false)
 
 begin "verify_auditable"
@@ -2231,6 +2233,120 @@ bin_case
 run verify_auditable.sh PARAM_BINARIES=target
 check "a directory fails" failed
 check "saying it isn't a file" said "target is not a file"
+
+begin "the native .dep-v0 decoder"
+# make_elf FILE BITS ORDER MODE: an ELF file of BITS (32 or 64) and byte ORDER
+# (le or be) with a .text section and, unless MODE is none, a .dep-v0 section:
+# good (the dependency list cargo auditable writes), truncated, notzlib,
+# notjson, empty (no packages), tworoots, badindex or nobits.
+cat > "${WORK}/make_elf.py" << 'PY'
+import json, struct, sys, zlib
+path, bits, order, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+e = "<" if order == "le" else ">"
+good = json.dumps({"packages": [{"name": "app", "version": "0.1.0", "source": "local", "dependencies": [1], "root": True},
+                                {"name": "smallvec", "version": "1.6.0", "source": "crates.io"}], "format": 1},
+                  separators=(",", ":")).encode()
+lists = {
+    "good": good, "nobits": good, "notjson": b"not json",
+    "empty": b'{"packages":[],"format":1}',
+    "tworoots": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true},{"name":"b","version":"1.0.0","source":"local","root":true}],"format":1}',
+    "badindex": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true,"dependencies":[5]}],"format":1}',
+    "badformat": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true}],"format":"1"}',
+    # cargo auditable before 0.7 writes no format.
+    "noformat": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true}]}',
+}
+payload = {"none": None, "notzlib": b"plain bytes", "truncated": zlib.compress(good)[:-6]}.get(mode)
+if mode in lists:
+    payload = zlib.compress(lists[mode])
+names = b"\0.text\0.shstrtab\0" + (b".dep-v0\0" if payload is not None else b"")
+ehsize, shentsize = (64, 64) if bits == 64 else (52, 40)
+text = b"\x90" * 4
+sections = [(0, 0, b""), (1, 1, text)]
+if payload is not None:
+    sections.append((17, 8 if mode == "nobits" else 1, payload))
+sections.append((7, 3, names))
+body, offsets = b"", []
+for _, _, data in sections:
+    offsets.append(ehsize + len(body) if data else 0)
+    body += data
+shoff = ehsize + len(body)
+ident = b"\x7fELF" + bytes([2 if bits == 64 else 1, 1 if order == "le" else 2, 1]) + bytes(9)
+fmt = "HHIQQQIHHHHHH" if bits == 64 else "HHIIIIIHHHHHH"
+header = ident + struct.pack(e + fmt, 2, 0xB7, 1, 0, 0, shoff, 0, ehsize, 0, 0, shentsize, len(sections), len(sections) - 1)
+entry = "IIQQQQIIQQ" if bits == 64 else "IIIIIIIIII"
+table = b"".join(struct.pack(e + entry, name, kind, 0, 0, offset, len(data), 0, 0, 1, 0)
+                 for (name, kind, data), offset in zip(sections, offsets))
+open(path, "wb").write(header + body + table)
+if mode == "good":
+    open(path + ".json", "wb").write(good)
+PY
+make_elf() { python3 -I "${WORK}/make_elf.py" "$@"; }
+bin_case
+for spec in 64-le 32-be 64-be 32-le; do
+    make_elf "${CASE}/work/elf-${spec}" "${spec%-*}" "${spec#*-}" good
+done
+run verify_auditable.sh "PARAM_BINARIES=elf-64-le elf-32-be elf-64-be elf-32-le" PARAM_DECODER=native PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "reads 32- and 64-bit ELF of either byte order, with no Rust tool" succeeded
+check "saying which decoder it used" said "with the native decoder"
+check "and never runs rust-audit-info" call_count rust-audit-info 0
+check "writing the dependency list exactly as it is stored" cmp -s "${CASE}/out/auditable-elf-32-be.audit.json" "${CASE}/work/elf-32-be.json"
+check "the index names the decoder" json_is "${CASE}/out/auditable.json" '"\(.decoder) \([.binaries[] | select(.auditable)] | length)"' "native 4"
+check "and the run record python3, with the decoder by its SHA-256 as stored in the orb's source" \
+    json_is "${CASE}/out/auditable.run-record.json" '.tool | "\(.name) \(.program.name) \(.program.sha256)"' \
+    "python3 dep_v0.py $(sha256sum "${SCRIPTS}/lib/dep_v0.py" | awk '{ print $1 }')"
+bin_case
+for mode in none truncated notzlib notjson empty tworoots badindex badformat nobits; do
+    make_elf "${CASE}/work/bad-${mode}" 64 le "${mode}"
+done
+make_elf "${CASE}/work/fine" 64 be good
+make_elf "${CASE}/work/old" 64 le noformat
+run verify_auditable.sh "PARAM_BINARIES=bad-* fine old" PARAM_DECODER=native PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "fails on every binary whose data is missing or broken" said "ERROR: 9 of 11 binaries carry no cargo-auditable data that decodes"
+check "after checking them all, passing a list with no format, as cargo auditable before 0.7 writes" \
+    json_is "${CASE}/out/auditable.json" '[.binaries[] | select(.auditable) | .binary] | join(" ")' "fine old"
+for reason in "bad-none: FAILED: No usable audit data: it has no .dep-v0 section" \
+    "bad-truncated: FAILED: No usable audit data: its .dep-v0 section's zlib stream is cut short" \
+    "bad-notzlib: FAILED: No usable audit data: its .dep-v0 section is not a zlib stream that decodes" \
+    "bad-nobits: FAILED: No usable audit data: its .dep-v0 section holds no data" \
+    "bad-tworoots: FAILED: Its dependency list is not the JSON cargo auditable writes" \
+    "bad-badformat: FAILED: Its dependency list is not the JSON cargo auditable writes"; do
+    check "saying why (${reason%%:*})" said "${reason}"
+done
+check "the run record says findings" json_is "${CASE}/out/auditable.run-record.json" .outcome findings
+bin_case
+make_elf "${CASE}/work/tworoots" 64 le tworoots
+run verify_auditable.sh PARAM_BINARIES=tworoots
+check "rust-audit-info's output must have the shape cargo auditable writes too" failed
+bin_case
+run verify_auditable.sh PARAM_BINARIES=app PARAM_DECODER=native PARAM_RUN_RECORD=true
+check "a file the native decoder can't read fails the step" failed
+check "as an error, not a finding" json_is "${CASE}/out/auditable.run-record.json" .outcome error
+check "saying to use rust-audit-info" said "is not an ELF file, and the native decoder reads only ELF; use decoder: rust-audit-info"
+bin_case
+make_elf "${CASE}/work/elf" 64 le good
+mkdir -p "${CASE}/bin"
+cp "${STUBS}/rust-audit-info" "${CASE}/bin/rust-audit-info"
+echo "# not the verified one" >> "${CASE}/bin/rust-audit-info"
+run verify_auditable.sh PARAM_BINARIES=elf "PATH=${CASE}/bin:${STUBS}:${PATH}"
+check "auto takes the native decoder over a rust-audit-info the install command didn't verify" said "with the native decoder"
+check "without warning about it" not_said "WARN"
+bin_case
+run verify_auditable.sh PARAM_BINARIES=app
+check "and a verified rust-audit-info over the native decoder" said "with the rust-audit-info decoder"
+bin_case
+run verify_auditable.sh PARAM_DECODER=objdump
+check "decoder refuses another value" said "ERROR: decoder must be auto, native or rust-audit-info, not 'objdump'."
+DEFAULTS=("${AUDIT_BIN_DEFAULTS[@]}")
+bin_case
+make_elf "${CASE}/work/elf" 32 be good
+make_elf "${CASE}/work/stripped" 64 le none
+run audit_bin.sh "PARAM_BINARIES=elf stripped" PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=native PARAM_RUN_RECORD=1
+check "audit_bin's require_auditable reads the data with the native decoder too" said "stripped: no cargo-auditable data (No usable audit data: it has no .dep-v0 section"
+check "telling the two binaries apart" json_is "${CASE}/out/cargo-audit-bin.json" '.without_auditable_data | join(" ")' stripped
+check "and names it in the run record" json_is "${CASE}/out/cargo-audit-bin.run-record.json" '.other_tools[0].program.name' dep_v0.py
+bin_case
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=native PARAM_RUN_RECORD=1
+check "and fails, as an error, on a file it can't read" json_is "${CASE}/out/cargo-audit-bin.run-record.json" .outcome error
 
 # --- sbom
 DEFAULTS=(PARAM_MANIFEST_PATH= PARAM_FORMAT=json PARAM_SPEC_VERSION=1.5 PARAM_DESCRIBE=crate PARAM_FEATURES= PARAM_ALL_FEATURES=false
