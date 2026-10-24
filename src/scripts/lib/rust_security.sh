@@ -758,67 +758,80 @@ rs_db_files_match() {
     fi
 }
 
-# rs_path_manifest_inputs: when RS_INPUTS lists manifests, adds those of the
-# lockfile's other path packages: path dependencies outside the workspace,
-# and [patch] and [replace] paths. Their package metadata (licence, publish,
-# description) shapes what the tools report, and changing it changes neither
-# the lockfile nor the workspace's manifests. cargo pkgid finds each one's
-# directory from the lockfile alone, without the network. rs_run_record runs
-# it, since cargo can write the lockfile during the run.
+# rs_path_manifest_inputs: when RS_INPUTS lists manifests, adds those of
+# each lockfile's other path packages: path dependencies outside its
+# workspace, and [patch] and [replace] paths. Their package metadata
+# (licence, publish, description) shapes what the tools report, and changing
+# it changes neither the lockfile nor the workspace's manifests. cargo pkgid
+# finds each one's directory from the lockfile alone, without the network.
+# rs_run_record runs it, since cargo can write the lockfile during the run.
 rs_path_manifest_inputs() {
-    local entry lockfile="" manifests=false root spec id encoded dir byte
-    local -A known=() members=()
+    local entry lockfile manifests=false root spec id encoded dir byte
+    local -a lockfiles=()
+    local -A known=() seen=() members=()
     for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
         case "${entry}" in
             manifest:*)
                 manifests=true
                 known[${entry#manifest:}]=1
                 ;;
-            lockfile:*) lockfile=${entry#lockfile:} ;;
+            lockfile:*)
+                # Several with deny's and the tree commands' manifest_paths,
+                # one per workspace.
+                if [[ -z "${seen[${entry#lockfile:}]:-}" ]]; then
+                    seen[${entry#lockfile:}]=1
+                    lockfiles+=("${entry#lockfile:}")
+                fi
+                ;;
         esac
     done
-    if [[ "${manifests}" != true || ! -f "${lockfile}" ]] || ! command -v cargo > /dev/null 2>&1; then
+    if [[ "${manifests}" != true ]] || ! command -v cargo > /dev/null 2>&1; then
         return 0
     fi
-    root=$(cd "$(dirname "${lockfile}")" && pwd) || return 0
-    # The workspace's own packages are listed already, and cargo pkgid takes
-    # a while, so it only looks up the others.
-    while IFS= read -r spec; do
-        if [[ -n "${spec}" ]]; then
-            members[${spec}]=1
-        fi
-    done < <(cargo metadata --no-deps --format-version 1 --manifest-path "${root}/Cargo.toml" 2> /dev/null \
-        | jq -r '.packages[]? | "\(.name)@\(.version)"' 2> /dev/null)
-    # Packages without a source are path packages; [[patch.unused]] entries
-    # are not packages.
-    while IFS= read -r spec; do
-        if [[ -n "${members[${spec}]:-}" ]] \
-            || ! id=$(cargo pkgid --offline --manifest-path "${root}/Cargo.toml" "${spec}" 2> /dev/null) \
-            || ! rs_match "${id}" '^(path\+)?file://(/[^#]*)'; then
+    for lockfile in ${lockfiles[@]+"${lockfiles[@]}"}; do
+        if [[ ! -f "${lockfile}" ]] || ! root=$(cd "$(dirname "${lockfile}")" && pwd); then
             continue
         fi
-        encoded=${BASH_REMATCH[2]}
-        dir=""
-        while rs_match "${encoded}" '^([^%]*)%([0-9A-Fa-f]{2})(.*)$'; do
-            printf -v byte '%b' "\\x${BASH_REMATCH[2]}"
-            dir+=${BASH_REMATCH[1]}${byte}
-            encoded=${BASH_REMATCH[3]}
-        done
-        dir+=${encoded}
-        if [[ -z "${known[${dir%/}/Cargo.toml]:-}" ]]; then
-            known[${dir%/}/Cargo.toml]=1
-            RS_INPUTS+=("manifest:${dir%/}/Cargo.toml")
-        fi
-    done < <(awk '
-        function flush() {
-            if (package && name != "" && source == "") print name "@" version
-            package = 0; name = version = source = ""
-        }
-        /^\[/ { flush(); package = ($0 ~ /^\[\[package\]\][ \t]*$/); next }
-        package && /^name = "/ { name = $0; sub(/^name = "/, "", name); sub(/"[ \t]*$/, "", name) }
-        package && /^version = "/ { version = $0; sub(/^version = "/, "", version); sub(/"[ \t]*$/, "", version) }
-        package && /^source = / { source = "yes" }
-        END { flush() }' "${lockfile}")
+        # The workspace's own packages are listed already, and cargo pkgid
+        # takes a while, so it only looks up the others.
+        members=()
+        while IFS= read -r spec; do
+            if [[ -n "${spec}" ]]; then
+                members[${spec}]=1
+            fi
+        done < <(cargo metadata --no-deps --format-version 1 --manifest-path "${root}/Cargo.toml" 2> /dev/null \
+            | jq -r '.packages[]? | "\(.name)@\(.version)"' 2> /dev/null)
+        # Packages without a source are path packages; [[patch.unused]]
+        # entries are not packages.
+        while IFS= read -r spec; do
+            if [[ -n "${members[${spec}]:-}" ]] \
+                || ! id=$(cargo pkgid --offline --manifest-path "${root}/Cargo.toml" "${spec}" 2> /dev/null) \
+                || ! rs_match "${id}" '^(path\+)?file://(/[^#]*)'; then
+                continue
+            fi
+            encoded=${BASH_REMATCH[2]}
+            dir=""
+            while rs_match "${encoded}" '^([^%]*)%([0-9A-Fa-f]{2})(.*)$'; do
+                printf -v byte '%b' "\\x${BASH_REMATCH[2]}"
+                dir+=${BASH_REMATCH[1]}${byte}
+                encoded=${BASH_REMATCH[3]}
+            done
+            dir+=${encoded}
+            if [[ -z "${known[${dir%/}/Cargo.toml]:-}" ]]; then
+                known[${dir%/}/Cargo.toml]=1
+                RS_INPUTS+=("manifest:${dir%/}/Cargo.toml")
+            fi
+        done < <(awk '
+            function flush() {
+                if (package && name != "" && source == "") print name "@" version
+                package = 0; name = version = source = ""
+            }
+            /^\[/ { flush(); package = ($0 ~ /^\[\[package\]\][ \t]*$/); next }
+            package && /^name = "/ { name = $0; sub(/^name = "/, "", name); sub(/"[ \t]*$/, "", name) }
+            package && /^version = "/ { version = $0; sub(/^version = "/, "", version); sub(/"[ \t]*$/, "", version) }
+            package && /^source = / { source = "yes" }
+            END { flush() }' "${lockfile}")
+    done
 }
 
 # rs_license_inputs: adds to RS_INPUTS the licence files of the local

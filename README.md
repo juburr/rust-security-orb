@@ -597,7 +597,7 @@ Fails unless a depth-bounded tree from `cargo tree` is exactly the expected set 
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `invert` | *(empty)* | The package to invert the tree on (`cargo tree -i`), as `name` or `name@version`: the tree lists what depends on it. Empty, the tree runs forward from `package`, or the manifest's package. |
-| `depth` | *required* | How many levels to compare (`--depth`); `1` is the subject and its direct dependents or dependencies. |
+| `depth` | *required* | How many levels to compare (`--depth`); `1` is the subject and its direct dependents or dependencies. A package is within `depth` when some path to it is, so cargo tree runs with `--no-dedupe` (by default it expands a shared dependency only where it first meets it, which can hide what lies below a shorter path to it); its output lists every path, so keep `depth` small. |
 | `expected` | *required* | Every package the tree holds, the subject included: `name@version` (registry), `path:name@version`, `git:name@version`, and `{root}` for the selection's root package. Quote a YAML value that starts with `{root}`. |
 | `if_absent` | `fail` | When the subject isn't in the graph: `fail`, or `pass`. |
 | `package`, `workspace`, `features`, `all_features`, `no_default_features`, `target`, `edges`, `locked`, `offline`, `frozen`, `exception`, `working_dir`, `manifest_path`, `manifest_paths` | | As for `tree_forbid`. |

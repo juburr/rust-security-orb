@@ -1876,6 +1876,24 @@ manifests_case
 make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
 run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_RUN_RECORD=true
 check "and those that read the same one name it" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path | split("/")[-1]' "${DB_NAME}"
+manifests_case
+# Each workspace has a path dependency outside it: app the lockfile's
+# outside and smallvec, fuzz its own fuzzdep, which has a licence file.
+path_lockfile "${CASE}/work/app/Cargo.lock"
+printf 'version = 4\n\n[[package]]\nname = "fuzz"\nversion = "0.1.0"\ndependencies = [\n "fuzzdep",\n]\n\n[[package]]\nname = "fuzzdep"\nversion = "0.1.0"\n' \
+    > "${CASE}/work/fuzz/Cargo.lock"
+for dir in outside patched fuzzdep; do
+    mkdir -p "${CASE}/${dir}"
+    echo "[package]" > "${CASE}/${dir}/Cargo.toml"
+done
+echo "MIT" > "${CASE}/fuzzdep/LICENSE"
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_RUN_RECORD=true \
+    "STUB_PKGIDS=outside@0.1.0=${CASE}/outside smallvec@1.99.0=${CASE}/patched fuzzdep@0.1.0=${CASE}/fuzzdep"
+check "the run record has the path dependencies of every manifest's workspace, not only the last one's" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' \
+    "app/Cargo.toml fuzz/Cargo.toml outside/Cargo.toml patched/Cargo.toml fuzzdep/Cargo.toml"
+check "each looked up in its own workspace" called cargo pkgid --offline --manifest-path "${CASE}/work/fuzz/Cargo.toml" fuzzdep@0.1.0
+check "and their licence files" json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "license") | .path] | join(" ")' "${CASE}/fuzzdep/LICENSE"
 
 begin "deny: run records"
 deny_case
@@ -2800,7 +2818,8 @@ run tree_expect.sh PARAM_INVERT=paste "PARAM_EXPECTED=paste@1.0.15, utoipa-axum@
     PARAM_RUN_RECORD=true PARAM_JUNIT=true
 check "passes when the inverted tree is exactly the expected set, in any order" succeeded
 check "reading whether the subject is there from the full graph" called cargo tree --target all --locked --prefix depth --format $'{p}\t{f}' --color never
-check "then the tree around it" called cargo tree --target all --locked -i paste --depth 1 --prefix depth --format $'{p}\t{f}' --color never
+check "then the tree around it, down to depth, without deduplication, which can hide a package within depth" \
+    called cargo tree --target all --locked -i paste --depth 1 --no-dedupe --prefix depth --format $'{p}\t{f}' --color never
 check "saying so" said "Passed: cargo tree's graph around paste is the expected one."
 check "keeping both graphs" exists "${CASE}/out/tree-expect.graph.txt"
 check "the report lists the nodes" json_is "${CASE}/out/tree-expect.json" '[.nodes[].key] | join(" ")' "paste@1.0.15 serde@1.0.200 utoipa-axum@0.2.0"

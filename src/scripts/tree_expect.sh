@@ -83,8 +83,10 @@ RS_REPORTS=()
 RS_TREE_LOG="${RS_BASE}.cargo.log"
 FORMAT_ARGS=(--prefix depth --format "${RS_TREE_FORMAT}" --color never)
 # The tree to compare: inverted from invert, or else forward from the
-# selection, down to depth.
-SHAPE_ARGS=(--depth "${DEPTH}")
+# selection, down to depth. Without --no-dedupe, cargo tree prints a package's
+# dependencies only where it first meets it, so one first met at the depth
+# limit hides its dependencies from a shorter path to it.
+SHAPE_ARGS=(--depth "${DEPTH}" --no-dedupe)
 if [[ -n "${INVERT}" ]]; then
     SHAPE_ARGS=(-i "${INVERT}" "${SHAPE_ARGS[@]}")
 fi

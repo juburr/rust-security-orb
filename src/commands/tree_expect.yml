@@ -97,7 +97,9 @@ parameters:
       package). Environment variables are expanded.
   depth:
     type: integer
-    description: How many levels of the tree to compare (cargo tree --depth); 1 is the subject and its direct dependents or dependencies.
+    description: >
+      How many levels of the tree to compare (cargo tree --depth, with --no-dedupe, so a package within
+      depth by any path counts); 1 is the subject and its direct dependents or dependencies.
   expected:
     type: string
     description: >
