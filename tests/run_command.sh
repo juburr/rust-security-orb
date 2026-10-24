@@ -2,8 +2,8 @@
 #
 # Runs a command's script the way the command's step runs it: with every
 # PARAM_ variable set from the command's parameter defaults, overridden by
-# NAME=VALUE arguments, and SCRIPT_RUST_SECURITY_LIB set to the shared
-# helpers. test-deploy.yml uses it to check steps that must fail, since a
+# NAME=VALUE arguments, and every SCRIPT_ variable the step sets (such as
+# SCRIPT_RUST_SECURITY_LIB, the shared helpers) set to the file it includes. test-deploy.yml uses it to check steps that must fail, since a
 # failing orb step would fail the test job itself. working_dir, like the
 # step's working_directory, is where the script runs.
 #
@@ -68,12 +68,18 @@ while IFS= read -r line; do
     name=${name% >>}
     ENVIRONMENT+=("${var}=${VALUES[${name}]}")
 done < <(grep -oE 'PARAM_[A-Z0-9_]+: << parameters\.[a-z0-9_]+ >>' "${YML}")
+INCLUDES=()
+while IFS= read -r line; do
+    var=${line%%:*}
+    file=${line#*include(}
+    file=${file%) >>}
+    INCLUDES+=("${var}=$(cat "${ROOT}/src/${file}")")
+done < <(grep -oE 'SCRIPT_[A-Z0-9_]+: << include\([^)]+\) >>' "${YML}")
 
 DIR=${VALUES[working_dir]:-.}
-echo "Running ${SCRIPT} in ${DIR} with ${ENVIRONMENT[*]-}"
+echo "Running ${SCRIPT} in ${DIR} with ${ENVIRONMENT[*]-} and ${INCLUDES[*]%%=*}"
 cd "${DIR}"
 STATUS=0
-env ${ENVIRONMENT[@]+"${ENVIRONMENT[@]}"} SCRIPT_RUST_SECURITY_LIB="$(cat "${ROOT}/src/scripts/lib/rust_security.sh")" \
-    bash "${ROOT}/src/${SCRIPT}" || STATUS=$?
+env ${ENVIRONMENT[@]+"${ENVIRONMENT[@]}"} "${INCLUDES[@]}" bash "${ROOT}/src/${SCRIPT}" || STATUS=$?
 echo "${SCRIPT} exited with ${STATUS}."
 exit "${STATUS}"

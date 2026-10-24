@@ -461,6 +461,120 @@ jobs:
       - persist_to_workspace:
           root: /tmp/workspace
           paths: [reports/bans-<< parameters.backend >>]
+  # Dependency-graph assertions with the real cargo tree, on the fixture: backend b must never ship
+  # in the backend-a build, as a package and as a feature, and smallvec's only dependent is the
+  # fixture (in the standalone workspace too, through {root}), until the default feature that links
+  # it is off. A skipped check says so, and a stale lockfile is an error for both commands.
+  graph-test:
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - rust-security-orb/tree_forbid:
+          working_dir: *fixture
+          features: backend-a
+          forbidden_packages: rso-backend-b
+          forbidden_features: rso-fixture:backend-b
+          exception: boundary:backend-a
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: forbid-backend-b
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_forbid:
+          working_dir: *fixture
+          workspace: true
+          all_features: true
+          forbidden_features: rso-fixture:backend-b
+          only_if_reachable: rso-backend-b
+          only_if_reachable_from: rso-backend-a
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: forbid-skipped
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_expect:
+          working_dir: *fixture
+          invert: smallvec
+          depth: 1
+          expected: smallvec@1.6.0 path:rso-fixture@0.1.0
+          exception: RUSTSEC-2021-0003
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_expect:
+          working_dir: *fixture
+          manifest_paths: Cargo.toml standalone/Cargo.toml
+          invert: smallvec
+          depth: 1
+          expected: "smallvec@1.6.0 {root}"
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec-root
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_expect:
+          working_dir: *fixture
+          no_default_features: true
+          invert: smallvec
+          depth: 1
+          expected: smallvec@1.6.0 path:rso-fixture@0.1.0
+          if_absent: pass
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec-absent
+          output_dir: /tmp/workspace/reports/graph
+      - run:
+          name: Verify The Graph Reports
+          command: |
+            cd /tmp/workspace/reports/graph
+            jq -e '.verdict == "passed" and .exceptions == ["boundary:backend-a"] and ([.nodes[].name] | index("rso-backend-a"))' forbid-backend-b.json
+            jq -e '.verdict == "skipped"' forbid-skipped.json
+            jq -e '.outcome == "skipped"' forbid-skipped.run-record.json
+            grep -q '<skipped message="rso-backend-b is not in the graph of rso-backend-a' junit/forbid-skipped.xml
+            jq -e '.verdict == "passed" and ([.nodes[].key] | sort) == ["path:rso-fixture@0.1.0", "smallvec@1.6.0"]' expect-smallvec.json
+            jq -e '.exceptions == ["RUSTSEC-2021-0003"] and .outcome == "passed"' expect-smallvec.run-record.json
+            jq -e '[.selections[] | "\(.slug) \(.verdict)"] == ["root passed", "standalone passed"]' expect-smallvec-root.json
+            jq -e '.expected == ["path:rso-standalone@0.1.0", "smallvec@1.6.0"]' expect-smallvec-root-standalone.json
+            jq -e '.present == false and .verdict == "passed"' expect-smallvec-absent.json
+      - run:
+          name: Verify What Must Fail Fails
+          command: |
+            expect_failure() {
+              local says=$1
+              shift
+              if bash tests/run_command.sh "$@" > /tmp/run.log 2>&1; then
+                cat /tmp/run.log
+                echo "FAIL: $* passed."
+                exit 1
+              fi
+              cat /tmp/run.log
+              grep -qF -- "${says}" /tmp/run.log
+            }
+            # backend b with every feature on, as a package and as a feature.
+            expect_failure "forbidden: path:rso-backend-b@0.1.0 (rso-backend-b), reached by rso-fixture v0.1.0 -> rso-backend-b v0.1.0" \
+              tree_forbid working_dir=tests/fixtures/app all_features=true forbidden_packages=rso-backend-b
+            expect_failure "forbidden: path:rso-fixture@0.1.0 with feature backend-b (rso-fixture:backend-b)" \
+              tree_forbid working_dir=tests/fixtures/app all_features=true forbidden_features=rso-fixture:backend-b
+            # smallvec gone without the default feature, with if_absent fail.
+            expect_failure "smallvec is not in the graph" tree_expect working_dir=tests/fixtures/app no_default_features=true \
+              invert=smallvec depth=1 expected="smallvec@1.6.0 path:rso-fixture@0.1.0"
+            # A lockfile cargo would have to update, under locked, is an error even with report_only.
+            STALE=$(mktemp -d)
+            cp -a tests/fixtures/app/. "${STALE}/"
+            sed -i '0,/^version = "0.1.0"/s//version = "0.1.1"/' "${STALE}/Cargo.toml"
+            expect_failure "cargo tree failed (exit code 101)" tree_forbid working_dir="${STALE}" forbidden_packages=x \
+              report_only=true run_record=true output_dir=/tmp/stale
+            expect_failure "cargo tree failed (exit code 101)" tree_expect working_dir="${STALE}" invert=smallvec depth=1 \
+              expected=smallvec@1.6.0 report_only=true run_record=true output_dir=/tmp/stale
+            jq -e '.outcome == "error" and .exit_code == 101' /tmp/stale/tree-forbid.run-record.json /tmp/stale/tree-expect.run-record.json
+      - rust-security-orb/store_reports:
+          output_dir: /tmp/workspace/reports/graph
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [reports/graph]
   # Offline: on a machine with no Rust toolchain, after the tools are installed, github.com and
   # crates.io stop resolving. audit, deny, licenses and audit_bin then run against the advisory
   # database detection-test archived, the cargo metadata it wrote and the binaries auditable-test
@@ -636,13 +750,15 @@ workflows:
             parameters:
               backend: ["a", "b"]
           filters: *filters
+      - graph-test:
+          filters: *filters
       - offline-test:
           requires: [detection-test, auditable-test]
           filters: *filters
       - supply-chain-test:
           filters: *filters
       - reports-test:
-          requires: [detection-test, auditable-test, bans-test, offline-test, supply-chain-test]
+          requires: [detection-test, auditable-test, bans-test, graph-test, offline-test, supply-chain-test]
           filters: *filters
       # The orb must be re-packed for publishing, and saved to the workspace.
       - orb-tools/pack:
@@ -660,6 +776,7 @@ workflows:
             - detection-test
             - auditable-test
             - bans-test
+            - graph-test
             - offline-test
             - supply-chain-test
             - reports-test

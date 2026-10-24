@@ -442,8 +442,10 @@ rs_gate() {
 #   RS_REPORTS       the report files written
 #   RS_DB            the advisory database directory used, if any
 #   RS_COUNTS        a JSON object of the command's counts
-# OUTCOME is passed, findings, findings-reported (findings with report_only)
-# or error.
+#   RS_EXCEPTIONS    the exceptions a check guards, as a JSON array (the
+#                    tree commands); the record has no exceptions without it
+# OUTCOME is passed, findings, findings-reported (findings with report_only),
+# skipped (a check whose precondition didn't hold) or error.
 rs_run_record() {
     local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url match
     local -A listed=()
@@ -511,7 +513,7 @@ rs_run_record() {
         --argjson tool "${tool_json}" --argjson others "${others}" --argjson toolchain "${toolchain}" --argjson db "${db_json}" \
         --argjson inputs "${inputs}" --argjson reports "${reports}" --argjson counts "${RS_COUNTS:-null}" \
         --arg build_url "${CIRCLE_BUILD_URL:-}" --arg sha1 "${CIRCLE_SHA1:-}" --arg job "${CIRCLE_JOB:-}" \
-        --argjson args "${args}" '{
+        --argjson args "${args}" --argjson exceptions "${RS_EXCEPTIONS:-null}" '{
             schema: "https://github.com/juburr/rust-security-orb/blob/main/schemas/run-record.v1.json",
             command: $command, outcome: $outcome, exit_code: $code,
             started_at: $started, finished_at: $finished,
@@ -519,7 +521,7 @@ rs_run_record() {
             working_directory: $cwd,
             tool: $tool, other_tools: $others, arguments: $args, toolchain: $toolchain,
             advisory_db: $db, inputs: $inputs, counts: $counts, reports: $reports
-        }' > "${file}"; then
+        } + (if $exceptions == null then {} else {exceptions: $exceptions} end)' > "${file}"; then
         echo "WARN: Could not write the run record ${file}." >&2
         return 0
     fi

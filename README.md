@@ -7,7 +7,7 @@
 ### Check Rust dependencies and shipped binaries against RustSec, your policy and your supply chain, straight from CircleCI.
 
 Install checksum-verified [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit), [cargo-deny](https://github.com/EmbarkStudios/cargo-deny), [cargo-auditable](https://github.com/rust-secure-code/cargo-auditable) and friends, and gate builds on what they find:<br>
-advisories, licences, banned crates and sources, the dependency list embedded in each binary you ship, SBOMs and supply-chain audits.<br>
+advisories, licences, banned crates and sources, what may and may not be in each build's dependency graph, the dependency list embedded in each binary you ship, SBOMs and supply-chain audits.<br>
 Your tools' own configs are the policy · SARIF, JUnit and run records · Works offline · Strict SHA-512 verification by default · No `sudo`
 
 [![CircleCI Build Status](https://circleci.com/gh/juburr/rust-security-orb.svg?style=shield "CircleCI Build Status")](https://circleci.com/gh/juburr/rust-security-orb)
@@ -70,6 +70,7 @@ Every tool is checked against a SHA-512 this orb pins: release binaries for x86_
 | **One advisory database** | Each tool fetches its own copy, at its own time, into its own directory | `fetch_advisory_db` puts one copy where both tools read it, to persist and import in later jobs, with its commit in every run record |
 | **SARIF and JUnit** | cargo-deny's SARIF exits 0 whatever it finds; JUnit means writing a converter | Every reporting command writes SARIF (where the tool can), JUnit on request, and stores both |
 | **Shipped binaries** | Hope the lockfile matches what the binary links, and that strip kept the audit data | `verify_auditable` reads the data back from the final file, and `audit_bin` checks that file |
+| **Graph boundaries and exception premises** | `cargo tree \| grep` steps, where a resolve failure, `grep`'s exit code or a `SIGPIPE` reads as "nothing forbidden" | `tree_forbid` and `tree_expect` check cargo tree's own exit code, parse every line, and fail closed |
 
 ## 🔄 How It Works
 
@@ -319,6 +320,59 @@ The orb adds no exception file. Each tool already has one:
 
 Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a field only this orb understood would tie every adopter to it.
 
+### Guard Boundaries and Exception Premises in the Graph
+
+`deny.toml` bans whole crates by exact name, for the one graph its run resolves. Two kinds of rule need more, and `tree_forbid` and `tree_expect` check them against the graph `cargo tree` resolves for exactly the selection you name, with no policy file of their own: the parameters are the rule.
+
+**Boundaries**: "the server binary never links an HTTP client, a worker-only crate, or a crate family we're replacing":
+
+```yaml
+- rust-security/tree_forbid:
+    report_name: boundary-server
+    exception: boundary:server
+    package: server
+    edges: no-dev
+    all_features: true
+    forbidden_packages: >-
+      reqwest reqwest-* hyper-tls native-tls ureq curl curl-*
+      ingest replication index-writer
+    forbidden_features: index:writer
+- rust-security/tree_forbid:
+    report_name: boundary-workspace-index
+    workspace: true
+    edges: no-dev
+    all_features: true
+    forbidden_features: index:writer
+    only_if_reachable: index
+    only_if_reachable_from: server
+```
+
+`*` matches any run of characters and `?` any one, against the whole name, so `curl-*` is `curl-sys` but not `curly`: a family is `curl curl-*`. A forbidden feature counts on every occurrence of its crate, since a build dependency's copy can have other features than the normal one. `package` picks the graph `cargo build -p server` resolves; `workspace` picks the one `cargo build --workspace` does, where cargo unifies a shared crate's features across every member, so a feature only `worker` enables is compiled into `server` too. The second step checks that, but only when `server` reaches `index` at all; otherwise it is reported as skipped, never as passed. `target` defaults to `all`, so a crate behind a `cfg` the CI host doesn't match still counts. Each violation is reported with the path from the root to it.
+
+**Exception premises**: an ignored advisory or a licence exception was reviewed for one shape of the graph, and should be reviewed again when that shape changes:
+
+```yaml
+- rust-security/tree_expect:
+    report_name: premise-paste
+    exception: RUSTSEC-2024-0436
+    workspace: true
+    all_features: true
+    invert: paste
+    depth: 1
+    expected: paste@1.0.15 utoipa-axum@0.2.0
+- rust-security/tree_expect:
+    report_name: premise-libfuzzer-licence
+    exception: licence:NCSA
+    manifest_paths: fuzz/*/Cargo.toml
+    invert: libfuzzer-sys
+    depth: 1
+    expected: "libfuzzer-sys@0.4.13 {root}"
+```
+
+`expected` is the exact set of packages within `depth` of the subject (`invert`, or `package` forward), compared as a set: a new dependent, a changed version, or a dependent gone fails it, listing what is missing and what is unexpected. Write a registry package as `name@version`, a path package as `path:name@version`, a git one as `git:name@version`, and `{root}` for the selection's root package, which lets one expectation cover several standalone workspaces. When the subject isn't in the graph at all, `if_absent` decides: `fail` (the default: the reviewed edge is gone, so review the exception, or drop it) or `pass`, for a premise whose healthy state is "absent", such as an advisory's crate that only a disabled backend would link (`tree_forbid` says the same more directly). Whether the subject is there is read from the full graph of the same selection, never from `cargo tree -i`'s error, whose exit code is the same as for a graph that didn't resolve.
+
+Both commands run `cargo tree --locked` by default, check its exit code before reading its output, parse every line (one that doesn't parse is an error, as is a graph that doesn't start where the selection says), and fail closed: a stale lockfile, a wrong `manifest_path` or a typo in `package` stops the step even with `report_only`. `exception` names what each check is a premise of, in its JSON report and run record. Each keeps what `cargo tree` printed (`<report_name>.tree.txt`, and `.graph.txt` or `.reachability.txt` for the full graph they also read), so an assessor sees exactly what was evaluated.
+
 ### Keep Evidence for an Assessor
 
 `run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, and for `deny`, `licenses` and `sbom` those packages' licence files (`LICENSE*`, `COPYING*` and `license-file`), which the tools read, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
@@ -481,6 +535,37 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 | `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. `--store-path` and `--manifest-path` are refused in `extra_args`, and so is `--manifest-path` passed to cargo with `--cargo-arg`: use `store_path` and `manifest_path`, which the run record follows. |
 | `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-vet`. |
 
+### `rust-security/tree_forbid`
+
+Fails when the dependency graph `cargo tree` resolves for a selection holds a forbidden package, or a package with a forbidden feature enabled. Writes `<report_name>.tree.txt` (what cargo tree printed) and `<report_name>.json` (the parsed packages, each violation with the path from the root to it, and the exceptions). A graph cargo tree can't resolve, or output this command can't parse, fails the step even with `report_only`. Needs cargo. See [Guard Boundaries and Exception Premises in the Graph](#guard-boundaries-and-exception-premises-in-the-graph).
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `forbidden_packages` | *(empty)* | Crate names that must not be in the graph, separated by commas, spaces or newlines. `*` matches any run of characters and `?` any one, against the whole name. |
+| `forbidden_features` | *(empty)* | Features that must not be enabled, as `crate:feature`, with the same wildcards on both sides, such as `rpc-kit:transport-*-client*`. Every occurrence of the crate counts. |
+| `only_if_reachable`, `only_if_reachable_from` | *(empty)* | Run the check only when the package `only_if_reachable` names is in the graph of `only_if_reachable_from` (or of the selection), with the same features, target and edges. Otherwise the check is skipped, and the JSON report, JUnit and run record (`outcome: skipped`) say so. |
+| `package`, `workspace` | *(empty)*, `false` | The graph's root: a package (`cargo tree -p`, as `name` or `name@version`), every workspace member together (`--workspace`), or the manifest's package. |
+| `features`, `all_features`, `no_default_features` | | The feature set. |
+| `target` | `all` | The target whose dependencies count; `all` covers every one. Empty is the host's. |
+| `edges` | *(empty)* | The dependency kinds to follow: `all`, `normal`, `build`, `dev`, `no-normal`, `no-build`, `no-dev`, `no-proc-macro`. Defaults to cargo tree's (normal, build and dev). |
+| `locked`, `offline`, `frozen` | `true`, `false`, `false` | As for `deny`, but `locked` defaults to `true`. |
+| `exception` | *(empty)* | The exceptions or boundaries the check guards, such as `RUSTSEC-2023-0071` or `boundary:server`, carried into the JSON report and the run record. |
+| `working_dir`, `manifest_path`, `manifest_paths` | | As for `deny`. With `manifest_paths`, each manifest gets its own reports and an index lists them. |
+| `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `tree-forbid`. JUnit has a test case per pattern. |
+
+### `rust-security/tree_expect`
+
+Fails unless a depth-bounded tree from `cargo tree` is exactly the expected set of packages. Writes `<report_name>.tree.txt` and `<report_name>.graph.txt` (the tree compared, and the full graph the subject's presence was read from) and `<report_name>.json` (the parsed packages, `missing`, `unexpected`, and the exceptions). Fails closed as `tree_forbid` does. Needs cargo.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `invert` | *(empty)* | The package to invert the tree on (`cargo tree -i`), as `name` or `name@version`: the tree lists what depends on it. Empty, the tree runs forward from `package`, or the manifest's package. |
+| `depth` | *required* | How many levels to compare (`--depth`); `1` is the subject and its direct dependents or dependencies. |
+| `expected` | *required* | Every package the tree holds, the subject included: `name@version` (registry), `path:name@version`, `git:name@version`, and `{root}` for the selection's root package. Quote a YAML value that starts with `{root}`. |
+| `if_absent` | `fail` | When the subject isn't in the graph: `fail`, or `pass`. |
+| `package`, `workspace`, `features`, `all_features`, `no_default_features`, `target`, `edges`, `locked`, `offline`, `frozen`, `exception`, `working_dir`, `manifest_path`, `manifest_paths` | | As for `tree_forbid`. |
+| `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `tree-expect`. JUnit has a test case per manifest. |
+
 ### `rust-security/store_reports`
 
 Stores `output_dir` as job artifacts under `rust-security-reports/`, even when an earlier step failed. Each reporting command stores `output_dir` after itself by default, so a job with several of them uploads the shared directory once per command, each time with more in it. Turn that off on each and store the reports once, at the end:
@@ -527,7 +612,8 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 | JUnit XML | `audit`, `audit_bin`, `deny`, `vet`: one test case per finding, so the Tests tab lists each advisory with its crate (for `deny`, an ignore in `deny.toml` that matched nothing by its advisory ID, or its crate for a yanked crate). Errors fail; warnings that don't fail the step are skipped, and a clean run has one passing case. `verify_auditable`: one test case per binary. |
 | CycloneDX | `sbom`, and `verify_auditable` with `cyclonedx` |
 | Licence inventory | `licenses` (JSON and TSV) |
-| Run record | every reporting command except `fetch_advisory_db`, with `run_record` (see [Keep Evidence for an Assessor](#keep-evidence-for-an-assessor)) |
+| Dependency graph | `tree_forbid` and `tree_expect`: what `cargo tree` printed (`.tree.txt`, and `.graph.txt` or `.reachability.txt`), and a JSON report of the parsed packages and the verdict |
+| Run record | every reporting command except `fetch_advisory_db` and `store_reports`, with `run_record` (see [Keep Evidence for an Assessor](#keep-evidence-for-an-assessor)) |
 
 ## 🔒 Secure by Design
 
@@ -544,7 +630,7 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 
 Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including CircleCI [Arm resource classes](https://circleci.com/docs/using-arm/). macOS and Windows executors aren't supported yet: `install` fails on them rather than install a binary that can't run. The arm64 releases of cargo-audit and cargo-cyclonedx link glibc (2.18 and 2.34 or newer), so on arm64 they need a glibc-based image such as `cimg/rust`; on Alpine and other musl-based arm64 images, their install fails before downloading anything. The other release binaries are static, and the tools built from crates build wherever cargo runs. CI runs every command on `cimg/rust` (Docker, amd64), installs every tool on an Arm Docker executor, and runs the offline checks on a machine executor with no Rust toolchain.
 
-The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. `cimg/rust` has all of them.
+The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `realpath`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet`, `tree_forbid`, `tree_expect` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. `cimg/rust` has all of them.
 
 The cache is keyed by tool, version, executor architecture and home directory, so amd64 and arm64 jobs never share a cached download. On executors whose `PATH` doesn't already include `install_path` (for example, machine executors), `install` adds it for later steps through `BASH_ENV`.
 
@@ -580,8 +666,8 @@ Hosts to allow (HTTPS, port 443) when running on a locked-down, self-hosted runn
 | --- | --- | --- | --- |
 | `github.com` | `install` (cargo-audit, cargo-deny, cargo-auditable, cargo-cyclonedx); `fetch_advisory_db`; `audit` and `audit_bin`; `deny` | Release downloads; the RustSec advisory database, which cargo-audit and cargo-deny also update themselves; cargo-deny's `std-replacement-data` repository | `download_base_url` is set; `fetch_advisory_db` imports, or `url` names a mirror; `audit` and `audit_bin` run with `no_fetch`; `deny` runs with `offline` |
 | `release-assets.githubusercontent.com`, `objects.githubusercontent.com` | `install`, for the same tools | Where GitHub redirects release downloads | `download_base_url` is set |
-| `index.crates.io` | `install` (cargo-vet, rust-audit-info, auditable2cdx); `audit` and `audit_bin`; `deny`, `licenses`, `sbom`, `vet`, `auditable_build` | crates.io's index: resolving dependencies, and yanked-crate checks | The crates come from a [source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html); `audit` and `audit_bin` run with `no_yanked`; `deny` and `licenses` run with `offline` or `metadata_path`; `sbom` with `offline` |
-| `static.crates.io` | `install` (the same three); `deny`, `licenses`, `sbom`, `vet`, `auditable_build` | Crate archives, for builds and for `cargo metadata` | As for `index.crates.io`, or when cargo's cache already holds the crates |
+| `index.crates.io` | `install` (cargo-vet, rust-audit-info, auditable2cdx); `audit` and `audit_bin`; `deny`, `licenses`, `sbom`, `vet`, `auditable_build`, `tree_forbid`, `tree_expect` | crates.io's index: resolving dependencies, and yanked-crate checks | The crates come from a [source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html); `audit` and `audit_bin` run with `no_yanked`; `deny` and `licenses` run with `offline` or `metadata_path`; `sbom`, `tree_forbid` and `tree_expect` with `offline` |
+| `static.crates.io` | `install` (the same three); `deny`, `licenses`, `sbom`, `vet`, `auditable_build`, `tree_forbid`, `tree_expect` | Crate archives, for builds and for `cargo metadata` and `cargo tree` | As for `index.crates.io`, or when cargo's cache already holds the crates |
 | The hosts in `supply-chain/config.toml`'s `[imports]` | `vet` with `locked: false` | Audits imported from other organizations | `locked` is `true` (the default) |
 | `circleci-tasks-prod.s3.us-east-1.amazonaws.com` | The install commands with `caching: true` (the default), on CircleCI cloud with self-hosted runners | CircleCI's cache storage, used by the built-in `restore_cache` and `save_cache` steps (see the [runner FAQ](https://circleci.com/docs/guides/execution-runner/runner-faqs/#what-connectivity-is-required)) | `caching` is `false` |
 

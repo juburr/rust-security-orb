@@ -17,7 +17,10 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPTS="${ROOT}/src/scripts"
 WORK=$(mktemp -d)
-trap 'rm -rf "${WORK}"' EXIT
+# Only the test's own shell cleans up: bash 4.0 runs the EXIT trap in a
+# subshell that dies on an unbound variable too, which would remove WORK
+# while the tests still run.
+trap '[[ "${BASHPID}" != "$$" ]] || rm -rf "${WORK}"' EXIT
 STUBS="${WORK}/stubs"
 CALLS="${WORK}/calls"
 mkdir -p "${STUBS}" "${CALLS}"
@@ -362,8 +365,10 @@ EOF
 # STUB_LICENSE_FILE as the license-file of each but the root package, and the
 # workspace's and root package's metadata tables STUB_WORKSPACE_METADATA and
 # STUB_PACKAGE_METADATA), pkgid (STUB_PKGIDS lists "name@version=URL path"
-# pairs), locate-project, and auditable, which prints help, as cargo does when
-# a .cargo/config.toml sets [alias] auditable = "help".
+# pairs), locate-project, tree (STUB_TREE_MAP names a file of
+# "PATTERN<TAB>OUTPUT<TAB>CODE" lines: the first PATTERN that matches " ARGS "
+# decides what cargo tree prints and exits with), and auditable, which prints
+# help, as cargo does when a .cargo/config.toml sets [alias] auditable = "help".
 {
     echo '#!/usr/bin/env bash'
     record
@@ -406,6 +411,18 @@ case "$1" in
         done
         echo "error: package ID specification \`${!#}\` did not match any packages" >&2
         exit 101 ;;
+    tree)
+        while IFS=$'\t' read -r pattern output code; do
+            [[ -z "${pattern}" ]] && continue
+            # shellcheck disable=SC2053 # the pattern is a glob
+            if [[ " $* " == ${pattern} ]]; then
+                [[ -n "${output}" ]] && cat "${output}"
+                [[ "${code}" -ne 0 ]] && echo "error: the lock file needs to be updated but --locked was passed to prevent this" >&2
+                exit "${code}"
+            fi
+        done < "${STUB_TREE_MAP:-/dev/null}"
+        echo "cargo stand-in: no tree for $*" >&2
+        exit 2 ;;
     locate-project)
         manifest="$(pwd)/Cargo.toml"
         [[ "$2 $3 $4" == "--message-format plain --manifest-path" ]] && manifest=$(cd "$(dirname "$5")" && pwd)/${5##*/}
@@ -452,11 +469,16 @@ for stub in "${STUBS}"/*; do
 done
 
 SCRIPT_RUST_SECURITY_LIB=$(cat "${SCRIPTS}/lib/rust_security.sh")
-export SCRIPT_RUST_SECURITY_LIB
+SCRIPT_CARGO_TREE_LIB=$(cat "${SCRIPTS}/lib/cargo_tree.sh")
+export SCRIPT_RUST_SECURITY_LIB SCRIPT_CARGO_TREE_LIB
 
 # new_case: a fresh HOME, working directory, output_dir and record of calls.
 new_case() {
-    CASE=$(mktemp -d "${WORK}/case.XXXXXX")
+    # Without WORK, every path a test writes would be relative to /.
+    if ! CASE=$(mktemp -d "${WORK}/case.XXXXXX") || [[ -z "${CASE}" ]]; then
+        echo "FAIL: could not make a directory for the next test case in ${WORK}"
+        exit 1
+    fi
     mkdir -p "${CASE}/home" "${CASE}/work"
     : > "${CASE}/bash_env"
     rm -f "${CALLS}"/*
@@ -2305,6 +2327,306 @@ run vet.sh "PATH=$(path_without cargo)"
 check "needs cargo" failed
 check "saying so" said "cargo is not on the PATH"
 
+# --- tree_forbid and tree_expect
+TREE_DEFAULTS=(PARAM_MANIFEST_PATH= PARAM_MANIFEST_PATHS= PARAM_PACKAGE= PARAM_WORKSPACE=false PARAM_FEATURES= PARAM_ALL_FEATURES=false
+    PARAM_NO_DEFAULT_FEATURES=false PARAM_TARGET=all PARAM_EDGES= PARAM_LOCKED=true PARAM_OFFLINE=false PARAM_FROZEN=false
+    PARAM_EXCEPTION= PARAM_OUTPUT_DIR=/will/be/set PARAM_JUNIT=false PARAM_REPORT_ONLY=false PARAM_RUN_RECORD=false)
+# tree_case: a workspace whose one member, work, is the root of every graph,
+# and an empty map of cargo tree's answers.
+tree_case() {
+    new_case
+    echo "[package]" > "${CASE}/work/Cargo.toml"
+    echo "# lockfile" > "${CASE}/work/Cargo.lock"
+    : > "${CASE}/tree.map"
+    set_default "PARAM_OUTPUT_DIR=${CASE}/out"
+    set_default "STUB_TREE_MAP=${CASE}/tree.map"
+}
+# tree_output NAME LINE...: writes what cargo tree prints to CASE/NAME, a
+# LINE per line, with | for the tab between a package and its features.
+tree_output() {
+    local file="${CASE}/$1"
+    shift
+    : > "${file}"
+    # Bash 4.0 calls an empty "$@" unbound under set -u.
+    if [[ $# -gt 0 ]]; then
+        printf '%s\n' "$@" | tr '|' '\t' > "${file}"
+    fi
+}
+# tree_answer PATTERN [NAME [CODE]]: cargo tree prints CASE/NAME and exits
+# with CODE (0) when " ARGS " matches PATTERN, the first such line winning.
+tree_answer() {
+    printf '%s\t%s\t%s\n' "$1" "${2:+${CASE}/$2}" "${3:-0}" >> "${CASE}/tree.map"
+}
+# The graph of work: crates whose names a family pattern must tell apart,
+# a proc macro with and without a path source, a repeated subtree, a git and
+# an alternative registry source, and index twice, the second time (as a
+# build dependency) with the writer feature.
+tree_graph() {
+    tree_output graph.txt \
+        "0work v0.1.0 (${CASE}/work)|default" \
+        "1acme-sys v1.0.0|" \
+        "1acmes v2.0.0|" \
+        "1serde v1.0.200|default,derive,std" \
+        "2serde_derive v1.0.200 (proc-macro)|default" \
+        "3proc-macro2 v1.0.80|proc-macro" \
+        "2proc-macro2 v1.0.80|proc-macro (*)" \
+        "1index v0.1.0 (${CASE}/work/crates/index)|default" \
+        "1local-macro v0.2.0 (proc-macro) (${CASE}/work/macro)|" \
+        "1itoa v1.0.11 (https://github.com/dtolnay/itoa?tag=1.0.11#8f392032)|" \
+        "1alt v0.1.0 (my-registry)|" \
+        "1index v0.1.0 (${CASE}/work/crates/index)|default,writer"
+}
+
+DEFAULTS=("${TREE_DEFAULTS[@]}" PARAM_REPORT_NAME=tree-forbid PARAM_FORBIDDEN_PACKAGES= PARAM_FORBIDDEN_FEATURES=
+    PARAM_ONLY_IF_REACHABLE= PARAM_ONLY_IF_REACHABLE_FROM=)
+
+begin "tree_forbid"
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_PACKAGES=acme acme-*" PARAM_EXCEPTION=boundary:server PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "a forbidden package fails the step" failed
+check "reading the whole graph, for every target" \
+    called cargo tree --target all --locked --prefix depth --format $'{p}\t{f}' --color never
+check "matching a family pattern against the whole name: acme-* is acme-sys" said "forbidden: acme-sys@1.0.0 (acme-*), reached by work v0.1.0 -> acme-sys v1.0.0"
+check "and not acmes" not_said "forbidden: acmes"
+check "saying how many" said "ERROR: cargo tree's graph holds 1 forbidden packages or features."
+REPORT="${CASE}/out/tree-forbid.json"
+check "the report names the violation and the path to it" \
+    json_is "${REPORT}" '.violations[0] | "\(.rule) \(.package) \(.path | join(" > "))"' "acme-* acme-sys@1.0.0 work v0.1.0 > acme-sys v1.0.0"
+check "and the exceptions it guards" json_is "${REPORT}" '.exceptions | join(" ")' "boundary:server"
+check "and keeps what cargo tree printed" cmp -s "${CASE}/out/tree-forbid.tree.txt" "${CASE}/graph.txt"
+check "with its SHA-256 among the calls" json_is "${REPORT}" '.runs[0].sha256' "$(sha256sum "${CASE}/graph.txt" | awk '{ print $1 }')"
+check "and the lockfile's" json_is "${REPORT}" '.lockfile.sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
+check "reads a path source relative to the working directory" json_is "${REPORT}" '.nodes[] | select(.name == "index") | .source' crates/index
+check "a proc macro with a path source" json_is "${REPORT}" '.nodes[] | select(.name == "local-macro") | "\(.kind) \(.proc_macro) \(.source)"' "path true macro"
+check "a git source" json_is "${REPORT}" '.nodes[] | select(.name == "itoa") | .key' "git:itoa@1.0.11"
+check "and another registry's" json_is "${REPORT}" '.nodes[] | select(.name == "alt") | .key' "alt@0.1.0"
+check "each package once, a repeated one included" json_is "${REPORT}" '[.nodes[] | select(.name == "proc-macro2")] | length' 1
+check "with every feature set it has" json_is "${REPORT}" '.nodes[] | select(.name == "index") | .features | map(join(",")) | join(" ")' "default default,writer"
+check "JUnit has a case per pattern, the one that matched failing" \
+    file_has "${CASE}/out/junit/tree-forbid.xml" '<testcase classname="tree-forbid.package" name="acme-*"><failure message="forbidden: acme-sys@1.0.0">work v0.1.0 -&gt; acme-sys v1.0.0</failure>'
+check "and the other passing" file_has "${CASE}/out/junit/tree-forbid.xml" '<testcase classname="tree-forbid.package" name="acme"></testcase>'
+RECORD="${CASE}/out/tree-forbid.run-record.json"
+check "the run record says findings" json_is "${RECORD}" '"\(.command) \(.outcome)"' "tree_forbid findings"
+check "names cargo as the tool" json_is "${RECORD}" '.tool.version' "cargo 1.99.0 (stand-in)"
+check "with the exceptions" json_is "${RECORD}" '.exceptions | join(" ")' "boundary:server"
+check "the lockfile and manifest" json_is "${RECORD}" '[.inputs[].role] | join(" ")' "lockfile manifest"
+check "and the graph cargo tree printed among the reports" json_is "${RECORD}" '[.reports[].path | split("/")[-1]] | join(" ")' "tree-forbid.tree.txt tree-forbid.json tree-forbid.xml"
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_FEATURES=index:writer serde:no-std" PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
+check "a forbidden feature on any occurrence of the crate is found" said "forbidden: path:index@0.1.0 with feature writer (index:writer), reached by work v0.1.0 -> index v0.1.0"
+check "report_only passes" succeeded
+check "with a warning" said "WARN: cargo tree's graph holds 1 forbidden packages or features."
+check "the run record says findings-reported" json_is "${CASE}/out/tree-forbid.run-record.json" .outcome findings-reported
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_PACKAGES=acme-sy? s*de" "PARAM_FORBIDDEN_FEATURES=*:derive*"
+check "? matches one character, * any run, on both sides of crate:feature" \
+    test "$(grep -c '^  forbidden:' <<< "${OUTPUT}")" -eq 3
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=nothing-like-it PARAM_PACKAGE=work PARAM_EDGES=no-dev "PARAM_FEATURES=a b" \
+    PARAM_ALL_FEATURES=true PARAM_TARGET= PARAM_OFFLINE=true
+check "passes when nothing forbidden is there" succeeded
+check "saying so" said "Passed: cargo tree's graph holds no forbidden package or feature."
+check "with the selection's options" called cargo tree -p work --features a,b --all-features --edges no-dev --offline --locked \
+    --prefix depth --format $'{p}\t{f}' --color never
+tree_case
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=x PARAM_FROZEN=true PARAM_TARGET=x86_64-unknown-linux-gnu
+check "frozen stands for locked and offline" called_with cargo tree --frozen --target x86_64-unknown-linux-gnu
+
+begin "tree_forbid: a graph that can't be read"
+tree_case
+tree_output partial.txt "0work v0.1.0 (${CASE}/work)|"
+tree_answer '*' partial.txt 101
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=acme PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
+check "a cargo tree that fails (a stale lockfile under --locked) fails the step, even with report_only" failed
+check "rather than read what it printed as a graph without acme" said "ERROR: cargo tree failed (exit code 101), so there is no graph to check."
+check "with cargo's error" said "needs to be updated but --locked was passed"
+check "an error run record with cargo tree's exit code" json_is "${CASE}/out/tree-forbid.run-record.json" '"\(.outcome) \(.exit_code)"' "error 101"
+check "and the call that failed" json_is "${CASE}/out/tree-forbid.run-record.json" '.arguments[:4] | join(" ")' "tree --target all --locked"
+check "listing cargo's log" json_is "${CASE}/out/tree-forbid.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' "tree-forbid.tree.txt tree-forbid.cargo.log"
+for broken in empty garbage depth source root; do
+    tree_case
+    case "${broken}" in
+        empty) tree_output out.txt ;;
+        garbage) tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1[build-dependencies]" ;;
+        depth) tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "2acme v1.0.0|" ;;
+        source) tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1acme v1.0.0 (a source cargo never prints)|" ;;
+        root) tree_output out.txt "0elsewhere v0.1.0 (/elsewhere)|" "1acme v1.0.0|" ;;
+    esac
+    tree_answer '*' out.txt
+    run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=nothing-like-it PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
+    check "output cargo tree shouldn't print (${broken}) fails the step, even with report_only" failed
+    check "with an error run record" json_is "${CASE}/out/tree-forbid.run-record.json" .outcome error
+done
+check "naming a graph that starts elsewhere" said "ERROR: cargo tree's graph starts at elsewhere v0.1.0, which is not a member of the workspace."
+tree_case
+tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1acme v1.0.0|"
+tree_answer '*' out.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=acme PARAM_PACKAGE=server
+check "and one that doesn't start at package" failed
+check "saying so" said "ERROR: cargo tree's graph starts at work v0.1.0, not at server."
+tree_case
+tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1[build-dependencies]"
+tree_answer '*' out.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=x
+check "a line that doesn't parse is named" said "ERROR: cargo tree printed a line this command cannot read: 1[build-dependencies]"
+for bad in "PARAM_FORBIDDEN_PACKAGES=" "PARAM_FORBIDDEN_PACKAGES=a/b" "PARAM_FORBIDDEN_FEATURES=writer" "PARAM_EDGES=features" \
+    "PARAM_PACKAGE=https://example.test/x" "PARAM_ONLY_IF_REACHABLE_FROM=server" "PARAM_WORKSPACE=true PARAM_PACKAGE=server"; do
+    tree_case
+    # shellcheck disable=SC2086 # some cases set two parameters
+    run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=x ${bad}
+    check "refuses ${bad#PARAM_}" failed
+    check "before running cargo tree" not_called_with cargo tree
+done
+
+begin "tree_forbid: only_if_reachable"
+tree_case
+tree_output server.txt "0server v0.1.0 (${CASE}/work)|" "1http v1.0.0|"
+tree_graph
+tree_answer '* -p server *' server.txt
+tree_answer '* --workspace *' graph.txt
+run tree_forbid.sh PARAM_WORKSPACE=true PARAM_FORBIDDEN_FEATURES=index:writer PARAM_ONLY_IF_REACHABLE=index \
+    PARAM_ONLY_IF_REACHABLE_FROM=server STUB_MEMBERS=. PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "is skipped when the package isn't reachable from the binary" succeeded
+check "saying so" said "Skipped: index is not in the graph of server, so nothing was checked."
+check "without reading the workspace's graph" not_called_with cargo tree --workspace
+check "the report says skipped, with the reason" json_is "${CASE}/out/tree-forbid.json" '"\(.verdict): \(.reason)"' \
+    "skipped: index is not in the graph of server, so the check does not apply"
+check "JUnit skips the check" file_has "${CASE}/out/junit/tree-forbid.xml" '<skipped message="index is not in the graph of server, so the check does not apply"/>'
+check "and the run record says skipped, not passed" json_is "${CASE}/out/tree-forbid.run-record.json" .outcome skipped
+check "naming the call that decided it" json_is "${CASE}/out/tree-forbid.run-record.json" '.arguments[:3] | join(" ")' "tree -p server"
+tree_case
+tree_output server.txt "0server v0.1.0 (${CASE}/work)|" "1index v0.1.0 (${CASE}/work/crates/index)|default"
+tree_graph
+tree_answer '* -p server *' server.txt
+tree_answer '* --workspace *' graph.txt
+run tree_forbid.sh PARAM_WORKSPACE=true PARAM_FORBIDDEN_FEATURES=index:writer PARAM_ONLY_IF_REACHABLE=index \
+    PARAM_ONLY_IF_REACHABLE_FROM=server
+check "and runs when it is, on the workspace's unified features" failed
+check "finding the feature" said "forbidden: path:index@0.1.0 with feature writer (index:writer)"
+
+DEFAULTS=("${TREE_DEFAULTS[@]}" PARAM_REPORT_NAME=tree-expect PARAM_INVERT= PARAM_DEPTH=1 PARAM_EXPECTED= PARAM_IF_ABSENT=fail)
+
+begin "tree_expect"
+tree_case
+tree_graph
+tree_output paste.txt "0paste v1.0.15 (proc-macro)|" "1utoipa-axum v0.2.0|" "1serde v1.0.200|default (*)"
+tree_answer '* -i paste *' paste.txt
+tree_answer '*' graph.txt
+printf '%s\n' "0work v0.1.0 (${CASE}/work)|default" "1paste v1.0.15 (proc-macro)|" | tr '|' '\t' >> "${CASE}/graph.txt"
+run tree_expect.sh PARAM_INVERT=paste "PARAM_EXPECTED=paste@1.0.15, utoipa-axum@0.2.0 serde@1.0.200" PARAM_EXCEPTION=RUSTSEC-2024-0436 \
+    PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "passes when the inverted tree is exactly the expected set, in any order" succeeded
+check "reading whether the subject is there from the full graph" called cargo tree --target all --locked --prefix depth --format $'{p}\t{f}' --color never
+check "then the tree around it" called cargo tree --target all --locked -i paste --depth 1 --prefix depth --format $'{p}\t{f}' --color never
+check "saying so" said "Passed: cargo tree's graph around paste is the expected one."
+check "keeping both graphs" exists "${CASE}/out/tree-expect.graph.txt"
+check "the report lists the nodes" json_is "${CASE}/out/tree-expect.json" '[.nodes[].key] | join(" ")' "paste@1.0.15 serde@1.0.200 utoipa-axum@0.2.0"
+check "the run record names the call that decided" json_is "${CASE}/out/tree-expect.run-record.json" '.arguments[4:8] | join(" ")' "-i paste --depth 1"
+check "and the exceptions" json_is "${CASE}/out/tree-expect.run-record.json" '.exceptions[0]' RUSTSEC-2024-0436
+tree_case
+tree_graph
+printf '%s\n' "0work v0.1.0 (${CASE}/work)|default" "1paste v1.0.15 (proc-macro)|" | tr '|' '\t' >> "${CASE}/graph.txt"
+tree_output paste.txt "0paste v1.0.15 (proc-macro)|" "1utoipa-axum v0.2.0|" "1new-consumer v0.3.0|"
+tree_answer '* -i paste@1.0.15 *' paste.txt
+tree_answer '*' graph.txt
+run tree_expect.sh PARAM_INVERT=paste@1.0.15 "PARAM_EXPECTED=paste@1.0.15 utoipa-axum@0.2.0 path:gone@0.1.0" PARAM_JUNIT=true
+check "a new dependent, and one that's gone, fail the step" failed
+check "listing them" said "  missing: path:gone@0.1.0"
+check "both kinds" said "  unexpected: new-consumer@0.3.0"
+check "saying how many" said "ERROR: cargo tree's graph around paste@1.0.15 is not the expected one: 1 missing, 1 unexpected."
+check "in the report" json_is "${CASE}/out/tree-expect.json" '"\(.missing | join(",")) \(.unexpected | join(","))"' "path:gone@0.1.0 new-consumer@0.3.0"
+check "and JUnit" file_has "${CASE}/out/junit/tree-expect.xml" '<failure message="missing: path:gone@0.1.0; unexpected: new-consumer@0.3.0">'
+for absent in fail pass; do
+    tree_case
+    tree_graph
+    tree_answer '* -i paste *' "" 101
+    tree_answer '*' graph.txt
+    run tree_expect.sh PARAM_INVERT=paste "PARAM_EXPECTED=paste@1.0.15" "PARAM_IF_ABSENT=${absent}" PARAM_RUN_RECORD=true PARAM_REPORT_ONLY=true
+    check "a subject not in the full graph, with if_absent ${absent}, is read from that graph, not from cargo tree -i's error" \
+        not_called_with cargo tree -i paste
+    check "and the report says absent" json_is "${CASE}/out/tree-expect.json" '"\(.present) \(.verdict)"' "false $([[ "${absent}" == fail ]] && echo failed || echo passed)"
+    check "the run record too" json_is "${CASE}/out/tree-expect.run-record.json" '"\(.outcome) \(.counts.absent)"' \
+        "$([[ "${absent}" == fail ]] && echo findings-reported || echo passed) 1"
+done
+check "if_absent pass says so" said "Passed: paste is not in the graph, which if_absent: pass accepts."
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_expect.sh PARAM_INVERT=paste "PARAM_EXPECTED=paste@1.0.15"
+check "if_absent fail fails when the edge disappears" failed
+check "saying so" said "ERROR: cargo tree's graph around paste is not the expected one: paste is not in the graph."
+tree_case
+tree_graph
+tree_output webpki.txt "0webpki-roots v0.26.11|" "1webpki-roots v1.0.10|"
+printf '%s\n' "0other v0.1.0 (${CASE}/work)|" "1webpki-roots v0.26.11|" | tr '|' '\t' > "${CASE}/workspace.txt"
+tree_answer '* -p webpki-roots@0.26.11 *' webpki.txt
+tree_answer '* --workspace *' workspace.txt
+run tree_expect.sh PARAM_PACKAGE=webpki-roots@0.26.11 PARAM_EDGES=normal "PARAM_EXPECTED=webpki-roots@0.26.11 webpki-roots@1.0.10"
+check "a workspace graph that starts at a package outside the workspace fails" failed
+check "saying so" said "ERROR: cargo tree's graph starts at other v0.1.0, which is not a member of the workspace."
+tree_case
+tree_output webpki.txt "0webpki-roots v0.26.11|" "1webpki-roots v1.0.10|"
+printf '%s\n' "0work v0.1.0 (${CASE}/work)|" "1webpki-roots v0.26.11|" | tr '|' '\t' > "${CASE}/workspace.txt"
+tree_answer '* -p webpki-roots@0.26.11 *' webpki.txt
+tree_answer '* --workspace *' workspace.txt
+run tree_expect.sh PARAM_PACKAGE=webpki-roots@0.26.11 PARAM_EDGES=normal "PARAM_EXPECTED=webpki-roots@0.26.11 webpki-roots@1.0.10"
+check "runs forward from package" succeeded
+check "finding the package in the workspace's graph first" called_with cargo tree --workspace --edges normal
+check "then reading its tree" called_with cargo tree -p webpki-roots@0.26.11 --edges normal --depth 1
+
+begin "tree_expect: {root} and several manifests"
+tree_case
+mkdir -p "${CASE}/work/fuzz/a" "${CASE}/work/fuzz/b"
+for m in a b; do
+    echo "[package]" > "${CASE}/work/fuzz/${m}/Cargo.toml"
+    echo "# lockfile" > "${CASE}/work/fuzz/${m}/Cargo.lock"
+    tree_output "graph-${m}.txt" "0${m} v0.1.0 (${CASE}/work/fuzz/${m})|" "1libfuzzer-sys v0.4.13|"
+    tree_output "inverted-${m}.txt" "0libfuzzer-sys v0.4.13|" "1${m} v0.1.0 (${CASE}/work/fuzz/${m})|"
+    tree_answer "* --manifest-path fuzz/${m}/Cargo.toml * -i libfuzzer-sys *" "inverted-${m}.txt"
+    tree_answer "* --manifest-path fuzz/${m}/Cargo.toml *" "graph-${m}.txt"
+done
+run tree_expect.sh "PARAM_MANIFEST_PATHS=fuzz/*/Cargo.toml" PARAM_INVERT=libfuzzer-sys "PARAM_EXPECTED=libfuzzer-sys@0.4.13 {root}" \
+    PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "{root} is each manifest's own package" succeeded
+check "resolved per manifest" json_is "${CASE}/out/tree-expect-fuzz-b.json" '.expected | join(" ")' "libfuzzer-sys@0.4.13 path:b@0.1.0"
+check "an index lists them" json_is "${CASE}/out/tree-expect.json" '[.selections[] | "\(.slug) \(.verdict)"] | join(", ")' "fuzz-a passed, fuzz-b passed"
+check "JUnit has a suite each" file_has "${CASE}/out/junit/tree-expect.xml" '<testsuite name="tree-expect-fuzz-a"'
+check "the run record lists every lockfile" json_is "${CASE}/out/tree-expect.run-record.json" '[.inputs[] | select(.role == "lockfile")] | length' 2
+tree_case
+tree_output graph.txt "0work v0.1.0 (${CASE}/work)|" "1x v1.0.0|" "" "0tool v0.1.0 (${CASE}/work/tool)|" "1x v1.0.0|"
+tree_output inverted.txt "0x v1.0.0|" "1work v0.1.0 (${CASE}/work)|" "1tool v0.1.0 (${CASE}/work/tool)|"
+tree_answer '* -i x *' inverted.txt
+tree_answer '*' graph.txt
+mkdir -p "${CASE}/work/tool"
+run tree_expect.sh PARAM_WORKSPACE=true PARAM_INVERT=x "PARAM_EXPECTED=x@1.0.0 {root}" "STUB_MEMBERS=. tool"
+check "{root} with a workspace's several roots fails" failed
+check "saying why" said "{root} needs a selection with one root package"
+tree_case
+tree_output graph.txt "0work v0.1.0 (${CASE}/work)|" "1x v1.0.0|" "" "0tool v0.1.0 (${CASE}/work/tool)|"
+tree_answer '*' graph.txt
+mkdir -p "${CASE}/work/tool" "${CASE}/work/other"
+run tree_expect.sh PARAM_WORKSPACE=true PARAM_INVERT=x "PARAM_EXPECTED=x@1.0.0" "STUB_MEMBERS=. tool other"
+check "a workspace graph that leaves out a member fails" failed
+check "naming it" said "it leaves out other@0.1.0"
+for bad in "PARAM_EXPECTED=" "PARAM_EXPECTED=paste" "PARAM_EXPECTED=crates:x@1.0.0" "PARAM_DEPTH=one" "PARAM_IF_ABSENT=maybe" "PARAM_INVERT=a@b@c"; do
+    tree_case
+    run tree_expect.sh PARAM_INVERT=x PARAM_EXPECTED=x@1.0.0 "${bad}"
+    check "refuses ${bad#PARAM_}" failed
+    check "before running cargo tree" not_called_with cargo tree
+done
+tree_case
+run tree_expect.sh PARAM_INVERT=x PARAM_EXPECTED=x@1.0.0 "PATH=$(path_without cargo)"
+check "needs cargo" failed
+check "saying so" said "ERROR: cargo is not on the PATH"
+
 # --- the helpers
 begin "helpers"
 LIB_TEST() {
@@ -2392,7 +2714,7 @@ check "and escapes what XML needs escaped" python3 -c 'import sys, xml.dom.minid
 begin "run records follow schemas/run-record.v1.json"
 mapfile -t RECORDS < <(find "${WORK}" -name '*.run-record.json' | sort)
 check "the tests wrote run records for every command" test "$(for f in "${RECORDS[@]}"; do jq -r .command "${f}"; done | sort -u | tr '\n' ' ')" \
-    = "audit audit_bin deny licenses sbom verify_auditable vet "
+    = "audit audit_bin deny licenses sbom tree_expect tree_forbid verify_auditable vet "
 OUTPUT=$(python3 -I - "${ROOT}/schemas/run-record.v1.json" "${RECORDS[@]}" 2>&1 << 'PY'
 import json, sys
 try:
