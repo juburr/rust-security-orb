@@ -121,7 +121,7 @@ Command names say what they check (`audit`, `deny`, `vet`) or make (`sbom`, `lic
 
 ## Not yet included
 
-`unsafe_report` (cargo-geiger: experimental, counts vary with features and targets, needs Rust 1.97+ and OpenSSL to build, and runs `cargo clean`), `summarize`, a signed database bundle (the `archive` plus cosign-orb covers it), and macOS executors. The README's "Not Yet Included" section says why; keep it current.
+`unsafe_report` (cargo-geiger: experimental, counts vary with features and targets, needs Rust 1.97+ and OpenSSL to build, and runs `cargo clean`), `summarize`, a signed database bundle (the `archive` plus cosign-orb covers it), an `arch` override on the install commands (the architecture, the smoke test and the cache key come from the executor in the shared install logic, so it is a family-wide change), and macOS executors. The README's "Not Yet Included" section says why; keep it current.
 
 ## Verification
 

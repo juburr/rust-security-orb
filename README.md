@@ -113,7 +113,7 @@ Add the orb, install the tools, check the project. Copy this into `.circleci/con
 version: 2.1
 
 orbs:
-  rust-security: juburr/rust-security-orb@0.1.0
+  rust-security: juburr/rust-security-orb@0.2.0
 
 jobs:
   security:
@@ -724,6 +724,7 @@ Hosts you configure, contacted only by the commands that take them:
 - **`unsafe_report`** with cargo-geiger: its counts change with features and targets, it is marked experimental, needs a newer Rust than the other tools and OpenSSL to build, and runs `cargo clean`, which throws away the job's build. It will come when an inventory of `unsafe` can be made reliable enough to read.
 - **`summarize`** (a Markdown table of findings for a PR comment): the JSON, SARIF and JUnit reports carry the same information for now.
 - **A signed advisory database bundle**: `fetch_advisory_db`'s `archive`, with its commit in every run record, is the shareable snapshot; sign or attest it with [cosign-orb](https://github.com/juburr/cosign-orb) (`sign_blob`) to share one vetted copy across an organization.
+- **Installing for another architecture** (an `arch: amd64 | arm64` override on the install commands, for copying a verified tool into a multi-arch image build): the architecture, the smoke test that runs the installed binary and the cache key all come from the executor, in install code every juburr orb shares, so the change belongs there, made once for the whole family. Until then, install on an executor of the image's architecture (an [Arm resource class](https://circleci.com/docs/using-arm/) for arm64).
 - **macOS executors**.
 
 ## 🤝 Contributing
