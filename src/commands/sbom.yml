@@ -100,7 +100,7 @@ parameters:
       fails.
 steps:
   - run:
-      name: cargo cyclonedx
+      name: cargo cyclonedx (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_ALL_FEATURES: << parameters.all_features >>

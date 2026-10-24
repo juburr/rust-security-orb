@@ -7,7 +7,7 @@
 ### Check Rust dependencies and shipped binaries against RustSec, your policy and your supply chain, straight from CircleCI.
 
 Install checksum-verified [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit), [cargo-deny](https://github.com/EmbarkStudios/cargo-deny), [cargo-auditable](https://github.com/rust-secure-code/cargo-auditable) and friends, and gate builds on what they find:<br>
-advisories, licences, banned crates and sources, the dependency list embedded in each binary you ship, SBOMs and supply-chain audits.<br>
+advisories, licences, banned crates and sources, what may and may not be in each build's dependency graph, the dependency list embedded in each binary you ship, SBOMs and supply-chain audits.<br>
 Your tools' own configs are the policy · SARIF, JUnit and run records · Works offline · Strict SHA-512 verification by default · No `sudo`
 
 [![CircleCI Build Status](https://circleci.com/gh/juburr/rust-security-orb.svg?style=shield "CircleCI Build Status")](https://circleci.com/gh/juburr/rust-security-orb)
@@ -70,6 +70,7 @@ Every tool is checked against a SHA-512 this orb pins: release binaries for x86_
 | **One advisory database** | Each tool fetches its own copy, at its own time, into its own directory | `fetch_advisory_db` puts one copy where both tools read it, to persist and import in later jobs, with its commit in every run record |
 | **SARIF and JUnit** | cargo-deny's SARIF exits 0 whatever it finds; JUnit means writing a converter | Every reporting command writes SARIF (where the tool can), JUnit on request, and stores both |
 | **Shipped binaries** | Hope the lockfile matches what the binary links, and that strip kept the audit data | `verify_auditable` reads the data back from the final file, and `audit_bin` checks that file |
+| **Graph boundaries and exception premises** | `cargo tree \| grep` steps, where a resolve failure, `grep`'s exit code or a `SIGPIPE` reads as "nothing forbidden" | `tree_forbid` and `tree_expect` check cargo tree's own exit code, parse every line, and fail closed |
 
 ## 🔄 How It Works
 
@@ -112,7 +113,7 @@ Add the orb, install the tools, check the project. Copy this into `.circleci/con
 version: 2.1
 
 orbs:
-  rust-security: juburr/rust-security-orb@0.1.0
+  rust-security: juburr/rust-security-orb@0.2.0
 
 jobs:
   security:
@@ -229,6 +230,53 @@ steps:
 
 cargo auditable embeds the resolved dependency list in a `.dep-v0` section of each binary it links, at a cost of a few kilobytes. GNU `strip` keeps it; `llvm-strip`, `strip --strip-section-headers` and some packers remove it without a word, which is why `verify_auditable` reads it back from the file you ship and fails when it is gone. With `cyclonedx`, it also writes a CycloneDX SBOM of exactly what that binary links. `audit_bin` then checks each binary against the advisory database: a binary built without the vulnerable feature passes even when the lockfile lists the crate.
 
+Reading the section back doesn't need rust-audit-info, which has to be built from source with cargo. With `decoder: native`, `verify_auditable` and `audit_bin` read it with the orb's own decoder, a short Python program that needs only `python3` and reads ELF binaries of any architecture, so the job that checks a release needs neither Rust nor a build: a machine executor, or the image the binary ships in. It writes exactly the bytes rust-audit-info writes (the orb's CI compares the two on amd64 and arm64 builds), and with either decoder the list must have the shape cargo auditable writes (packages, exactly one root, dependencies that point at packages), or the binary fails. The default, `auto`, takes rust-audit-info when the install command installed it and the native decoder otherwise. The native decoder doesn't read PE, Mach-O or WebAssembly files; use rust-audit-info for those.
+
+```yaml
+jobs:
+  verify-release:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - rust-security/install:
+          tools: cargo-audit
+      - rust-security/fetch_advisory_db
+      - rust-security/verify_auditable:
+          binaries: /tmp/workspace/dist/*
+          decoder: native
+      - rust-security/audit_bin:
+          binaries: /tmp/workspace/dist/*
+          require_auditable: true
+          decoder: native
+          no_fetch: true
+```
+
+### Check Several Workspaces Under One Policy
+
+Fuzz targets, test harnesses and tools often live in standalone workspaces, each with its own `Cargo.lock`, under the one `deny.toml` and `.cargo/audit.toml` at the repository root. One step checks them all:
+
+```yaml
+steps:
+  - checkout
+  - rust-security/install:
+      tools: cargo-audit cargo-deny
+  - rust-security/fetch_advisory_db
+  - rust-security/audit:
+      lockfiles: Cargo.lock fuzz/*/Cargo.lock crates/diff-tests/Cargo.lock
+      no_fetch: true
+      junit: true
+  - rust-security/deny:
+      manifest_paths: fuzz/*/Cargo.toml crates/diff-tests/Cargo.toml
+      offline: true
+      locked: true
+      allow: license-not-encountered
+      junit: true
+```
+
+Each lockfile or manifest is checked on its own, with the same parameters, and every one is checked before the step fails. Its reports are named after its path: `fuzz/parse/Cargo.lock` gets `cargo-audit-fuzz-parse.json` (and `.sarif`, `.log`), and the working directory's own gets `-root`. `<report_name>.json` is an index of them, with each input's SHA-256, outcome and counts; JUnit has one test suite per input; and one run record lists them all as inputs. Two paths that would get the same report name fail the step. `audit` lets only the first lockfile's audit fetch the database. cargo-deny 0.20 fetches it for every check unless `offline` is true, so fetch it once with `fetch_advisory_db` and set `offline`, as above, which also means cargo's cache must hold each workspace's crates (`cargo fetch --locked` in each, or a `deny` without `offline` first). Workspaces that need different parameters, such as the root workspace with `workspace: true`, take a step of their own.
+
 ### Fetch the Advisory Database Once per Workflow
 
 Fetch the database in one job, persist it, and have every later job check against that very copy:
@@ -293,11 +341,75 @@ The orb adds no exception file. Each tool already has one:
   With `require_ignore_reasons: true`, `deny` fails when an ignore that applied has no reason, or one of only spaces, and lists it. It reads cargo-deny's own report of the ignores it applied, so only entries that matched an advisory count.
 - **`.cargo/audit.toml`** takes bare advisory IDs under `[advisories] ignore`, with no field for a reason. Teams that need justified exceptions should keep them in `deny.toml` and run `deny`'s advisories check, or keep a comment above each entry by convention.
 
+An ignore that no longer matches anything is a latent hole: if its advisory ever matches again, say for another version, it is accepted without a review. cargo-deny reports those itself (`advisory-not-detected`, under `unused-ignored-advisory`, which `deny` lists by advisory ID). cargo-audit doesn't, so `audit` and `audit_bin` take `unused_ignores: warn` (report them) or `deny` (fail on them):
+
+```yaml
+- rust-security/audit:
+    lockfiles: Cargo.lock fuzz/*/Cargo.lock
+    no_fetch: true
+    unused_ignores: deny
+```
+
+cargo audit's report doesn't say which ignores it applied, so the step audits each lockfile once more, offline, with a copy of the config that has no ignores (and `extra_args` without `--ignore`): an ignore is used when its advisory's ID matches a finding there. Its own report is left as it is. One `.cargo/audit.toml` often covers several lockfiles, and an ignore is legitimately unused in those without its crate, so it counts as unused only when no lockfile the step audits has a finding for it: name every lockfile the config covers in `lockfiles`, since with one lockfile, every ignore that belongs to another is reported. cargo-audit matches ignores by advisory ID only, never by alias, so an ignore written as a CVE or GHSA ID ignores nothing; it is reported as unused, with the RUSTSEC ID to ignore instead. `<report_name>.ignores.json` lists every ignore with where it comes from and which lockfiles it matched in, and for an unused one, what the advisory database now says of its advisory (its package, patched and unaffected versions, and whether it was withdrawn), which is usually why it stopped matching. A config the step can't rewrite exactly (an inline `advisories = { ... }` table, a multiline or escaped string, anything but strings in the array) fails it, rather than skip the check.
+
 Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a field only this orb understood would tie every adopter to it.
+
+### Guard Boundaries and Exception Premises in the Graph
+
+`deny.toml` bans whole crates by exact name, for the one graph its run resolves. Two kinds of rule need more, and `tree_forbid` and `tree_expect` check them against the graph `cargo tree` resolves for exactly the selection you name, with no policy file of their own: the parameters are the rule.
+
+**Boundaries**: "the server binary never links an HTTP client, a worker-only crate, or a crate family we're replacing":
+
+```yaml
+- rust-security/tree_forbid:
+    report_name: boundary-server
+    exception: boundary:server
+    package: server
+    edges: no-dev
+    all_features: true
+    forbidden_packages: >-
+      reqwest reqwest-* hyper-tls native-tls ureq curl curl-*
+      ingest replication index-writer
+    forbidden_features: index:writer
+- rust-security/tree_forbid:
+    report_name: boundary-workspace-index
+    workspace: true
+    edges: no-dev
+    all_features: true
+    forbidden_features: index:writer
+    only_if_reachable: index
+    only_if_reachable_from: server
+```
+
+`*` matches any run of characters and `?` any one, against the whole name, so `curl-*` is `curl-sys` but not `curly`: a family is `curl curl-*`. A forbidden feature counts on every occurrence of its crate, since a build dependency's copy can have other features than the normal one. `package` picks the graph `cargo build -p server` resolves; `workspace` picks the one `cargo build --workspace` does, where cargo unifies a shared crate's features across every member, so a feature only `worker` enables is compiled into `server` too. The second step checks that, but only when `server` reaches `index` at all; otherwise it is reported as skipped, never as passed. `target` defaults to `all`, so a crate behind a `cfg` the CI host doesn't match still counts. Each violation is reported with the path from the root to it.
+
+**Exception premises**: an ignored advisory or a licence exception was reviewed for one shape of the graph, and should be reviewed again when that shape changes:
+
+```yaml
+- rust-security/tree_expect:
+    report_name: premise-paste
+    exception: RUSTSEC-2024-0436
+    workspace: true
+    all_features: true
+    invert: paste
+    depth: 1
+    expected: paste@1.0.15 utoipa-axum@0.2.0
+- rust-security/tree_expect:
+    report_name: premise-libfuzzer-licence
+    exception: licence:NCSA
+    manifest_paths: fuzz/*/Cargo.toml
+    invert: libfuzzer-sys
+    depth: 1
+    expected: "libfuzzer-sys@0.4.13 {root}"
+```
+
+`expected` is the exact set of packages within `depth` of the subject (`invert`, or `package` forward), compared as a set: a new dependent, a changed version, or a dependent gone fails it, listing what is missing and what is unexpected. Write a registry package as `name@version`, a path package as `path:name@version`, a git one as `git:name@version`, and `{root}` for the selection's root package, which lets one expectation cover several standalone workspaces. When the subject isn't in the graph at all, `if_absent` decides: `fail` (the default: the reviewed edge is gone, so review the exception, or drop it) or `pass`, for a premise whose healthy state is "absent", such as an advisory's crate that only a disabled backend would link (`tree_forbid` says the same more directly). Whether the subject is there is read from the full graph of the same selection, never from `cargo tree -i`'s error, whose exit code is the same as for a graph that didn't resolve.
+
+Both commands run `cargo tree --locked` by default, check its exit code before reading its output, parse every line (one that doesn't parse is an error, as is a graph that doesn't start where the selection says), and fail closed: a stale lockfile, a wrong `manifest_path` or a typo in `package` stops the step even with `report_only`. `exception` names what each check is a premise of, in its JSON report and run record. Each keeps what `cargo tree` printed (`<report_name>.tree.txt`, and `.graph.txt` or `.reachability.txt` for the full graph they also read), so an assessor sees exactly what was evaluated.
 
 ### Keep Evidence for an Assessor
 
-`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, and for `deny`, `licenses` and `sbom` those packages' licence files (`LICENSE*`, `COPYING*` and `license-file`), which the tools read, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
+`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well, or for the native decoder, `python3` and the decoder's SHA-256), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, and for `deny`, `licenses` and `sbom` those packages' licence files (`LICENSE*`, `COPYING*` and `license-file`), which the tools read, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
 
 ### Inventory Licences for Legal Review
 
@@ -310,7 +422,7 @@ Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a f
 
 ## 🧰 Commands
 
-Run `install` before the other commands in the same job. Each reporting command writes to `output_dir` (default `/tmp/rust-security-reports`) and stores it as job artifacts under `rust-security-reports/`, even when the step fails. Give each run in a job its own `report_name`, so they don't overwrite each other's reports.
+Run `install` before the other commands in the same job. Each reporting command writes to `output_dir` (default `/tmp/rust-security-reports`) and stores it as job artifacts under `rust-security-reports/`, even when the step fails. Give each run in a job its own `report_name`, so they don't overwrite each other's reports: it is also in the step's name, such as `cargo deny check bans (deny-fuzz)`, and each step logs the whole command it runs. In a job with several reporting commands, set `store_artifacts: false` on each and end the job with [`store_reports`](#rust-securitystore_reports), so each report is uploaded once.
 
 ### `rust-security/install`
 
@@ -351,12 +463,14 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | --- | --- | --- |
 | `working_dir` | `.` | Directory to run in. |
 | `lockfile` | `Cargo.lock` | The lockfile to audit. It must exist: the step fails rather than let cargo audit generate one. |
+| `lockfiles` | *(empty)* | Several lockfiles to audit instead, separated by commas, spaces or newlines; shell patterns such as `crates/*/fuzz/Cargo.lock` are expanded, and one that matches nothing fails the step. See [Check Several Workspaces Under One Policy](#check-several-workspaces-under-one-policy). |
 | `db_path` | *(empty)* | The advisory database. Defaults to the one `fetch_advisory_db` exported, or else cargo audit's own, `$CARGO_HOME/advisory-db`. |
 | `no_fetch` | `false` | Use the database without updating it. cargo audit checks a database's age only when it fetches, so `audit` then applies cargo audit's 90-day rule itself, as it does when `.cargo/audit.toml` sets `[database] fetch = false` (or `database.fetch = false`; an inline `database = { ... }` table fails the step, since its settings would go unchecked). |
 | `allow_stale` | `false` | Accept a database whose newest commit is 90 days old or more. |
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |
 | `no_yanked` | `false` | Skip the yanked-crate check, which queries the crates.io index (cargo-audit 0.22.2 and later). |
+| `unused_ignores` | `allow` | What to do about an ignore that matches no finding, with the levels of cargo-deny's `unused-ignored-advisory`: `allow` doesn't check, `warn` reports it, `deny` fails the step. See [Keep Exceptions Reviewed](#keep-exceptions-reviewed). |
 | `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch`, `--db` and `--stale` (`-n`, `-d`): use `no_fetch`, `db_path` and `allow_stale`, which the staleness check and run record follow. `--deny` (`-D`) is refused too: use `deny`, which the counts and JUnit report follow. Only options and their values are taken: cargo audit would read any other word as a subcommand, such as `bin`, or its argument, and audit something else. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit`. |
 
@@ -367,8 +481,9 @@ Checks built binaries with `cargo audit bin`, which reads the dependency list ca
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `binaries` | *required* | The binaries to audit, separated by spaces or commas. Shell patterns such as `dist/*` are expanded, and everything they match must be a binary (`target/release/*` also matches directories and `.d` files); a pattern that matches nothing fails the step. Name the files you ship, after stripping and packaging. |
-| `require_auditable` | `false` | Count a binary without cargo-auditable data as a finding: without it, cargo audit can only guess a binary's dependencies from its panic messages. Needs rust-audit-info. |
-| `working_dir`, `db_path`, `no_fetch`, `allow_stale`, `deny`, `target_arch`, `target_os`, `no_yanked`, `extra_args` | | As for `audit`. |
+| `require_auditable` | `false` | Count a binary without cargo-auditable data as a finding: without it, cargo audit can only guess a binary's dependencies from its panic messages. A binary whose data doesn't decode, or doesn't have the shape cargo auditable writes, counts too. |
+| `decoder` | `auto` | What reads the data for `require_auditable`, as for `verify_auditable`. |
+| `working_dir`, `db_path`, `no_fetch`, `allow_stale`, `deny`, `target_arch`, `target_os`, `no_yanked`, `unused_ignores`, `extra_args` | | As for `audit`. An ignore is unused when no binary has a finding for it. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit-bin`. |
 
 ### `rust-security/deny`
@@ -380,7 +495,8 @@ Runs `cargo deny check` against the project's `deny.toml`: advisories, bans, lic
 | `checks` | *(all four)* | The checks to run, separated by commas or spaces: `advisories`, `bans`, `licenses`, `sources`. |
 | `config_path` | *(empty)* | The config to use. Defaults to the first `deny.toml`, `.deny.toml` or `.cargo/deny.toml` in the manifest's directory or above. A path that doesn't exist fails the step, where cargo deny would fall back to its default config. |
 | `manifest_path` | *(empty)* | The `Cargo.toml` to check, relative to `working_dir`. |
-| `metadata_path` | *(empty)* | Check this saved `cargo metadata --format-version 1` output instead of running cargo metadata. |
+| `manifest_paths` | *(empty)* | Several `Cargo.toml` files to check instead, each with the same config and parameters, separated by commas, spaces or newlines; shell patterns are expanded. See [Check Several Workspaces Under One Policy](#check-several-workspaces-under-one-policy). |
+| `metadata_path` | *(empty)* | Check this saved `cargo metadata --format-version 1` output instead of running cargo metadata. Not with `manifest_paths`. |
 | `features`, `all_features`, `no_default_features` | | The feature set to check. |
 | `target` | *(empty)* | Check only this target triple's dependencies. `deny.toml`'s `[graph] targets` lists several. |
 | `workspace`, `exclude`, `exclude_dev` | `false`, *(empty)*, `false` | Check every workspace member, leave members out, leave out dev-dependencies. |
@@ -415,11 +531,12 @@ Runs `cargo auditable build` (or `install`, or `rustc`), which builds as cargo d
 
 ### `rust-security/verify_auditable`
 
-Reads each binary's embedded dependency list back with `rust-audit-info`, writes it as `<report_name>-<binary>.audit.json`, and fails when a binary has none or it doesn't decode. Every binary is checked before the step fails, and the index, `<report_name>.json`, lists each with its SHA-256.
+Reads each binary's embedded dependency list back, writes it as `<report_name>-<binary>.audit.json`, and fails when a binary has none, it doesn't decode, or it doesn't have the shape cargo auditable writes: packages, exactly one root, and dependencies that are indices into the packages. Every binary is checked before the step fails, and the index, `<report_name>.json`, lists each with its SHA-256 and names the decoder.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `binaries` | *required* | The binaries to check, separated by spaces or commas; shell patterns are expanded. Name the final files. |
+| `decoder` | `auto` | What reads each `.dep-v0` section. `rust-audit-info`; `native`, the orb's own decoder, which needs only `python3` (no cargo, no build), reads ELF binaries of any architecture and writes exactly what rust-audit-info writes; or `auto`, which takes a rust-audit-info the install command verified, or else `native`, or else an unverified rust-audit-info, with a warning. `native` reads ELF only, and fails the step on another format. The run record names the decoder, and for `native`, `python3` with the decoder's SHA-256. |
 | `cyclonedx` | `false` | Also write a CycloneDX 1.3 SBOM of each binary, from its embedded list, with `auditable2cdx`, to `<report_name>-<binary>.cdx.json`. |
 | `working_dir` | `.` | Directory the binaries are relative to. |
 | `output_dir`, `report_name`, `junit`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `auditable`. |
@@ -455,6 +572,61 @@ Runs `cargo vet check`: every third-party crate must be covered by an audit, an 
 | `working_dir`, `manifest_path`, `extra_args` | | As for `deny`. `--store-path` and `--manifest-path` are refused in `extra_args`, and so is `--manifest-path` passed to cargo with `--cargo-arg`: use `store_path` and `manifest_path`, which the run record follows. |
 | `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-vet`. |
 
+### `rust-security/tree_forbid`
+
+Fails when the dependency graph `cargo tree` resolves for a selection holds a forbidden package, or a package with a forbidden feature enabled. Writes `<report_name>.tree.txt` (what cargo tree printed) and `<report_name>.json` (the parsed packages, each violation with the path from the root to it, and the exceptions). A graph cargo tree can't resolve, or output this command can't parse, fails the step even with `report_only`. Needs cargo. See [Guard Boundaries and Exception Premises in the Graph](#guard-boundaries-and-exception-premises-in-the-graph).
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `forbidden_packages` | *(empty)* | Crate names that must not be in the graph, separated by commas, spaces or newlines. `*` matches any run of characters and `?` any one, against the whole name. |
+| `forbidden_features` | *(empty)* | Features that must not be enabled, as `crate:feature`, with the same wildcards on both sides, such as `rpc-kit:transport-*-client*`. Every occurrence of the crate counts. |
+| `only_if_reachable`, `only_if_reachable_from` | *(empty)* | Run the check only when the package `only_if_reachable` names is in the graph of `only_if_reachable_from` (or of the selection), with the same features, target and edges. Otherwise the check is skipped, and the JSON report, JUnit and run record (`outcome: skipped`) say so. |
+| `package`, `workspace` | *(empty)*, `false` | The graph's root: a package (`cargo tree -p`, as `name` or `name@version`), every workspace member together (`--workspace`), or the manifest's package. |
+| `features`, `all_features`, `no_default_features` | | The feature set. |
+| `target` | `all` | The target whose dependencies count; `all` covers every one. Empty is the host's. |
+| `edges` | *(empty)* | The dependency kinds to follow: `all`, `normal`, `build`, `dev`, `no-normal`, `no-build`, `no-dev`, `no-proc-macro`. Defaults to cargo tree's (normal, build and dev). |
+| `locked`, `offline`, `frozen` | `true`, `false`, `false` | As for `deny`, but `locked` defaults to `true`. |
+| `exception` | *(empty)* | The exceptions or boundaries the check guards, such as `RUSTSEC-2023-0071` or `boundary:server`, carried into the JSON report and the run record. |
+| `working_dir`, `manifest_path`, `manifest_paths` | | As for `deny`. With `manifest_paths`, each manifest gets its own reports and an index lists them. |
+| `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `tree-forbid`. JUnit has a test case per pattern. |
+
+### `rust-security/tree_expect`
+
+Fails unless a depth-bounded tree from `cargo tree` is exactly the expected set of packages. Writes `<report_name>.tree.txt` and `<report_name>.graph.txt` (the tree compared, and the full graph the subject's presence was read from) and `<report_name>.json` (the parsed packages, `missing`, `unexpected`, and the exceptions). Fails closed as `tree_forbid` does. Needs cargo.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `invert` | *(empty)* | The package to invert the tree on (`cargo tree -i`), as `name` or `name@version`: the tree lists what depends on it. Empty, the tree runs forward from `package`, or the manifest's package. |
+| `depth` | *required* | How many levels to compare (`--depth`); `1` is the subject and its direct dependents or dependencies. A package is within `depth` when some path to it is, so cargo tree runs with `--no-dedupe` (by default it expands a shared dependency only where it first meets it, which can hide what lies below a shorter path to it); its output lists every path, so keep `depth` small. |
+| `expected` | *required* | Every package the tree holds, the subject included: `name@version` (registry), `path:name@version`, `git:name@version`, and `{root}` for the selection's root package. Quote a YAML value that starts with `{root}`. |
+| `if_absent` | `fail` | When the subject isn't in the graph: `fail`, or `pass`. |
+| `package`, `workspace`, `features`, `all_features`, `no_default_features`, `target`, `edges`, `locked`, `offline`, `frozen`, `exception`, `working_dir`, `manifest_path`, `manifest_paths` | | As for `tree_forbid`. |
+| `output_dir`, `report_name`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `tree-expect`. JUnit has a test case per manifest. |
+
+### `rust-security/store_reports`
+
+Stores `output_dir` as job artifacts under `rust-security-reports/`, even when an earlier step failed. Each reporting command stores `output_dir` after itself by default, so a job with several of them uploads the shared directory once per command, each time with more in it. Turn that off on each and store the reports once, at the end:
+
+```yaml
+steps:
+  - rust-security/deny:
+      store_artifacts: false
+      report_name: deny-app
+  - rust-security/deny:
+      manifest_path: fuzz/Cargo.toml
+      store_artifacts: false
+      report_name: deny-fuzz
+  - rust-security/audit:
+      store_artifacts: false
+  - rust-security/store_reports
+```
+
+JUnit results need nothing of the kind: each command stores only its own `junit/<report_name>.xml`.
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `output_dir` | `/tmp/rust-security-reports` | The `output_dir` the reporting commands wrote into. |
+
 String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except `output_dir`, `report_name` and `install`'s `tools`, which CircleCI reads when it compiles the config, before the job's environment exists. In `extra_args` and the lists, that happens before the value is split, so quote a variable that may hold spaces.
 
 ## 📄 Reports and Evidence
@@ -467,16 +639,19 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 | `junit` | `false` | Also write `junit/<report_name>.xml` and store it with `store_test_results`, for CircleCI's Tests tab. |
 | `report_only` | `false` | Report findings without failing the step. A tool that can't complete still fails it. |
 | `run_record` | `false` | Also write `<report_name>.run-record.json`. |
-| `store_artifacts` | `true` | Store `output_dir` as artifacts under `rust-security-reports/`, even when the step fails. |
+| `store_artifacts` | `true` | Store `output_dir` as artifacts under `rust-security-reports/`, even when the step fails. With several reporting commands in a job, set it to `false` on each and end the job with `store_reports`. |
 
 | Report | Written by |
 | --- | --- |
 | Native JSON | `audit`, `audit_bin` (cargo audit's `--json`), `deny` (cargo-deny's JSON diagnostics, one per line, `.jsonl`), `licenses`, `verify_auditable`, `vet` |
+| Unused ignores | `audit` and `audit_bin` with `unused_ignores`: `<report_name>.ignores.json` |
+| Index | `audit` with `lockfiles`, `deny` with `manifest_paths`, `audit_bin` and `verify_auditable`: `<report_name>.json`, listing each input with its SHA-256, its report and its result |
 | SARIF 2.1.0 | `audit`, `audit_bin`, `deny`. cargo-deny's SARIF output exits 0 whatever it finds, so `deny` writes it in a second, offline pass after the JSON pass has decided. |
-| JUnit XML | `audit`, `audit_bin`, `deny`, `vet`: one test case per finding, so the Tests tab lists each advisory with its crate. Errors fail; warnings that don't fail the step are skipped, and a clean run has one passing case. `verify_auditable`: one test case per binary. |
+| JUnit XML | `audit`, `audit_bin`, `deny`, `vet`: one test case per finding, so the Tests tab lists each advisory with its crate (for `deny`, an ignore in `deny.toml` that matched nothing by its advisory ID, or its crate for a yanked crate). Errors fail; warnings that don't fail the step are skipped, and a clean run has one passing case. `verify_auditable`: one test case per binary. |
 | CycloneDX | `sbom`, and `verify_auditable` with `cyclonedx` |
 | Licence inventory | `licenses` (JSON and TSV) |
-| Run record | every reporting command except `fetch_advisory_db`, with `run_record` (see [Keep Evidence for an Assessor](#keep-evidence-for-an-assessor)) |
+| Dependency graph | `tree_forbid` and `tree_expect`: what `cargo tree` printed (`.tree.txt`, and `.graph.txt` or `.reachability.txt`), and a JSON report of the parsed packages and the verdict |
+| Run record | every reporting command except `fetch_advisory_db` and `store_reports`, with `run_record` (see [Keep Evidence for an Assessor](#keep-evidence-for-an-assessor)) |
 
 ## 🔒 Secure by Design
 
@@ -491,9 +666,9 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 
 ## 💻 Supported Platforms
 
-Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including CircleCI [Arm resource classes](https://circleci.com/docs/using-arm/). macOS and Windows executors aren't supported yet: `install` fails on them rather than install a binary that can't run. The arm64 releases of cargo-audit and cargo-cyclonedx link glibc (2.18 and 2.34 or newer), so on arm64 they need a glibc-based image such as `cimg/rust`; on Alpine and other musl-based arm64 images, their install fails before downloading anything. The other release binaries are static, and the tools built from crates build wherever cargo runs. CI runs every command on `cimg/rust` (Docker, amd64), installs every tool on an Arm Docker executor, and runs the offline checks on a machine executor with no Rust toolchain.
+Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including CircleCI [Arm resource classes](https://circleci.com/docs/using-arm/). macOS and Windows executors aren't supported yet: `install` fails on them rather than install a binary that can't run. The arm64 releases of cargo-audit and cargo-cyclonedx link glibc (2.18 and 2.34 or newer), so on arm64 they need a glibc-based image such as `cimg/rust`; on Alpine and other musl-based arm64 images, their install fails before downloading anything. The other release binaries are static, and the tools built from crates build wherever cargo runs. CI runs every command on `cimg/rust` (Docker, amd64), installs every tool and builds an auditable binary on an Arm Docker executor, and runs the offline checks, the native decoder's on both builds included, on a machine executor with no Rust toolchain.
 
-The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. `cimg/rust` has all of them.
+The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `realpath`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet`, `tree_forbid`, `tree_expect` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. The native `.dep-v0` decoder of `verify_auditable` and `audit_bin` needs `python3` (3.8 or newer, standard library only) instead. `cimg/rust` has all of them.
 
 The cache is keyed by tool, version, executor architecture and home directory, so amd64 and arm64 jobs never share a cached download. On executors whose `PATH` doesn't already include `install_path` (for example, machine executors), `install` adds it for later steps through `BASH_ENV`.
 
@@ -529,8 +704,8 @@ Hosts to allow (HTTPS, port 443) when running on a locked-down, self-hosted runn
 | --- | --- | --- | --- |
 | `github.com` | `install` (cargo-audit, cargo-deny, cargo-auditable, cargo-cyclonedx); `fetch_advisory_db`; `audit` and `audit_bin`; `deny` | Release downloads; the RustSec advisory database, which cargo-audit and cargo-deny also update themselves; cargo-deny's `std-replacement-data` repository | `download_base_url` is set; `fetch_advisory_db` imports, or `url` names a mirror; `audit` and `audit_bin` run with `no_fetch`; `deny` runs with `offline` |
 | `release-assets.githubusercontent.com`, `objects.githubusercontent.com` | `install`, for the same tools | Where GitHub redirects release downloads | `download_base_url` is set |
-| `index.crates.io` | `install` (cargo-vet, rust-audit-info, auditable2cdx); `audit` and `audit_bin`; `deny`, `licenses`, `sbom`, `vet`, `auditable_build` | crates.io's index: resolving dependencies, and yanked-crate checks | The crates come from a [source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html); `audit` and `audit_bin` run with `no_yanked`; `deny` and `licenses` run with `offline` or `metadata_path`; `sbom` with `offline` |
-| `static.crates.io` | `install` (the same three); `deny`, `licenses`, `sbom`, `vet`, `auditable_build` | Crate archives, for builds and for `cargo metadata` | As for `index.crates.io`, or when cargo's cache already holds the crates |
+| `index.crates.io` | `install` (cargo-vet, rust-audit-info, auditable2cdx); `audit` and `audit_bin`; `deny`, `licenses`, `sbom`, `vet`, `auditable_build`, `tree_forbid`, `tree_expect` | crates.io's index: resolving dependencies, and yanked-crate checks | The crates come from a [source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html); `audit` and `audit_bin` run with `no_yanked`; `deny` and `licenses` run with `offline` or `metadata_path`; `sbom`, `tree_forbid` and `tree_expect` with `offline` |
+| `static.crates.io` | `install` (the same three); `deny`, `licenses`, `sbom`, `vet`, `auditable_build`, `tree_forbid`, `tree_expect` | Crate archives, for builds and for `cargo metadata` and `cargo tree` | As for `index.crates.io`, or when cargo's cache already holds the crates |
 | The hosts in `supply-chain/config.toml`'s `[imports]` | `vet` with `locked: false` | Audits imported from other organizations | `locked` is `true` (the default) |
 | `circleci-tasks-prod.s3.us-east-1.amazonaws.com` | The install commands with `caching: true` (the default), on CircleCI cloud with self-hosted runners | CircleCI's cache storage, used by the built-in `restore_cache` and `save_cache` steps (see the [runner FAQ](https://circleci.com/docs/guides/execution-runner/runner-faqs/#what-connectivity-is-required)) | `caching` is `false` |
 
@@ -549,6 +724,7 @@ Hosts you configure, contacted only by the commands that take them:
 - **`unsafe_report`** with cargo-geiger: its counts change with features and targets, it is marked experimental, needs a newer Rust than the other tools and OpenSSL to build, and runs `cargo clean`, which throws away the job's build. It will come when an inventory of `unsafe` can be made reliable enough to read.
 - **`summarize`** (a Markdown table of findings for a PR comment): the JSON, SARIF and JUnit reports carry the same information for now.
 - **A signed advisory database bundle**: `fetch_advisory_db`'s `archive`, with its commit in every run record, is the shareable snapshot; sign or attest it with [cosign-orb](https://github.com/juburr/cosign-orb) (`sign_blob`) to share one vetted copy across an organization.
+- **Installing for another architecture** (an `arch: amd64 | arm64` override on the install commands, for copying a verified tool into a multi-arch image build): the architecture, the smoke test that runs the installed binary and the cache key all come from the executor, in install code every juburr orb shares, so the change belongs there, made once for the whole family. Until then, install on an executor of the image's architecture (an [Arm resource class](https://circleci.com/docs/using-arm/) for arm64).
 - **macOS executors**.
 
 ## 🤝 Contributing

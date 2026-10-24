@@ -141,6 +141,7 @@ JSON="${RS_BASE}.json"
 RS_REPORTS=()
 
 echo "Running cargo vet with ${RS_TOOL_VERSION:-cargo-vet}..."
+rs_show_command "${RS_TOOL##*/}" "${RS_ARGS[@]}" --output-format json --output-file "${JSON}"
 # cargo vet opens the report only once it runs, so a report left by an
 # earlier run must not be read as this one's.
 rm -f "${JSON}"

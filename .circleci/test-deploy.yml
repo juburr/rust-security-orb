@@ -164,7 +164,8 @@ jobs:
               echo "FAIL: install accepted a misspelled tool."
               exit 1
             fi
-  # Installs every tool on an Arm machine: native release binaries, and the crates built there.
+  # Installs every tool on an Arm machine: native release binaries, and the crates built there. Builds
+  # the fixture with cargo auditable there too, for offline-test to read on x86_64.
   arm64-test:
     docker:
       - image: cimg/rust:1.99
@@ -199,6 +200,23 @@ jobs:
       - run:
           name: Verify The Audit Found The Advisory
           command: jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' /tmp/reports/arm64/cargo-audit.json
+      - rust-security-orb/auditable_build:
+          working_dir: *fixture
+          extra_args: --release --locked
+      - run:
+          name: Strip And Keep The arm64 Build
+          working_directory: *fixture
+          command: |
+            mkdir -p /tmp/workspace/dist-arm64
+            cp target/release/rso-fixture /tmp/workspace/dist-arm64/rso-fixture-arm64
+            strip /tmp/workspace/dist-arm64/rso-fixture-arm64
+      - rust-security-orb/verify_auditable:
+          binaries: /tmp/workspace/dist-arm64/rso-fixture-arm64
+          output_dir: /tmp/workspace/reports/arm64
+          report_name: auditable-arm64
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [dist-arm64, reports/arm64]
   # Detection: audit and deny fail on the fixture's advisory by default, pass with report_only while
   # still reporting it, and fail even with report_only when the tool can't run. Also deny's
   # require_ignore_reasons and the licence inventory, and the advisory database archive and cargo
@@ -215,19 +233,54 @@ jobs:
           name: Write The Fixture's cargo metadata
           working_directory: *fixture
           command: cargo metadata --format-version 1 --locked > /tmp/workspace/metadata.json
+      # The reports are stored once, by store_reports at the end of the job.
       - rust-security-orb/audit:
           working_dir: *fixture
           no_fetch: true
           report_only: true
           junit: true
           run_record: true
+          store_artifacts: false
           output_dir: /tmp/workspace/reports/detection
       - rust-security-orb/deny:
           working_dir: *fixture
           report_only: true
           junit: true
           run_record: true
+          store_artifacts: false
           output_dir: /tmp/workspace/reports/detection
+      # Several lockfiles and manifests in one step: the fixture and its standalone workspace.
+      - rust-security-orb/audit:
+          working_dir: *fixture
+          lockfiles: Cargo.lock standalone/Cargo.lock
+          no_fetch: true
+          report_only: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: audit-lockfiles
+          output_dir: /tmp/workspace/reports/detection
+      - rust-security-orb/deny:
+          working_dir: *fixture
+          manifest_paths: Cargo.toml standalone/Cargo.toml
+          checks: bans licenses sources
+          locked: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: deny-manifests
+          output_dir: /tmp/workspace/reports/detection
+      - run:
+          name: Verify Each Lockfile And Manifest Has Its Reports
+          command: |
+            cd /tmp/workspace/reports/detection
+            jq -e '[.lockfiles[] | "\(.slug) \(.vulnerabilities) \(.outcome)"] == ["root 1 findings-reported", "standalone 1 findings-reported"]' audit-lockfiles.json
+            jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' audit-lockfiles-standalone.json
+            jq -e '.version == "2.1.0"' audit-lockfiles-standalone.sarif
+            jq -e '[.manifests[] | "\(.slug) \(.outcome)"] == ["root passed", "standalone passed"]' deny-manifests.json
+            [[ "$(grep -c '<testsuite ' junit/audit-lockfiles.xml)" -eq 2 ]]
+            jq -e '([.inputs[] | select(.role == "lockfile")] | length) == 2 and .counts.lockfiles == 2' audit-lockfiles.run-record.json
+            jq -e '.counts.manifests == 2 and .counts.bans.errors == 0' deny-manifests.run-record.json
       - run:
           name: Verify report_only Reported The Advisory
           command: |
@@ -256,6 +309,10 @@ jobs:
             }
             expect_failure "ERROR: cargo audit found 1 vulnerabilities" audit working_dir=tests/fixtures/app no_fetch=true
             expect_failure "ERROR: cargo deny failed: advisories." deny working_dir=tests/fixtures/app
+            expect_failure "ERROR: cargo deny failed in 2 of 2 manifests: Cargo.toml (advisories); standalone/Cargo.toml (advisories)." \
+              deny working_dir=tests/fixtures/app manifest_paths="Cargo.toml standalone/Cargo.toml"
+            expect_failure "Findings in: Cargo.lock, standalone/Cargo.lock." audit working_dir=tests/fixtures/app no_fetch=true \
+              lockfiles="Cargo.lock standalone/Cargo.lock"
             # A tool that can't run fails the step even with report_only.
             expect_failure "ERROR: cargo audit did not complete" audit working_dir=tests/fixtures/app no_fetch=true \
               lockfile=Cargo.toml report_only=true
@@ -270,10 +327,46 @@ jobs:
             expect_failure "ignored advisories have no reason in deny.toml (require_ignore_reasons)" deny \
               working_dir=tests/fixtures/app config_path=deny-ignore-bare.toml require_ignore_reasons=true
             bash tests/run_command.sh deny working_dir=tests/fixtures/app config_path=deny-ignore-reason.toml require_ignore_reasons=true
+      - run:
+          name: Verify Unused Ignores Are Found
+          command: |
+            # tests/fixtures/audit-ignores/.cargo/audit.toml ignores RUSTSEC-2021-0003, which the fixture's smallvec
+            # 1.6.0 has, and RUSTSEC-2023-0071, which nothing there has. Its own Cargo.lock has neither.
+            run() { bash tests/run_command.sh audit working_dir=tests/fixtures/audit-ignores no_fetch=true "$@" > /tmp/run.log 2>&1; }
+            if run lockfile=../app/Cargo.lock unused_ignores=deny output_dir=/tmp/ignores-deny; then
+              cat /tmp/run.log
+              echo "FAIL: an unused ignore passed with unused_ignores: deny."
+              exit 1
+            fi
+            cat /tmp/run.log
+            grep -q "1 ignores match no finding: RUSTSEC-2023-0071." /tmp/run.log
+            run lockfile=../app/Cargo.lock unused_ignores=warn junit=true run_record=true report_name=audit-ignores \
+              output_dir=/tmp/workspace/reports/detection
+            cat /tmp/run.log
+            grep -q "WARN: unused ignore: RUSTSEC-2023-0071 (from .cargo/audit.toml) matches no finding" /tmp/run.log
+            R=/tmp/workspace/reports/detection
+            jq -e '[.ignores[] | "\(.id) \(.used)"] == ["RUSTSEC-2021-0003 true", "RUSTSEC-2023-0071 false"]
+              and .ignores[1].advisory.package == "rsa"' "${R}/audit-ignores.ignores.json"
+            jq -e '.counts.unused_ignores == 1 and .outcome == "passed"' "${R}/audit-ignores.run-record.json"
+            run lockfile=../app/Cargo.lock output_dir=/tmp/ignores-allow
+            [[ ! -e /tmp/ignores-allow/cargo-audit.ignores.json ]]
+            # Used in one of two lockfiles that share the config is used.
+            if run lockfiles="Cargo.lock ../app/Cargo.lock" unused_ignores=deny output_dir=/tmp/ignores-two; then
+              cat /tmp/run.log
+              echo "FAIL: an ignore unused in both lockfiles passed with unused_ignores: deny."
+              exit 1
+            fi
+            jq -e '.ignores[0].matched_in == ["../app/Cargo.lock"] and ([.ignores[] | select(.used | not) | .id] == ["RUSTSEC-2023-0071"])' \
+              /tmp/ignores-two/cargo-audit.ignores.json
+            # cargo audit matches ignores by advisory ID only: one written as an alias ignores nothing.
+            bash tests/run_command.sh audit working_dir=tests/fixtures/app no_fetch=true unused_ignores=warn report_only=true \
+              extra_args="--ignore GHSA-43w2-9j62-hq99" output_dir=/tmp/ignores-alias > /tmp/run.log 2>&1
+            jq -e '.ignores[0] | .used == false and .alias_of == ["RUSTSEC-2021-0003"]' /tmp/ignores-alias/cargo-audit.ignores.json
       - rust-security-orb/licenses:
           working_dir: *fixture
           all_features: true
           run_record: true
+          store_artifacts: false
           output_dir: /tmp/workspace/reports/detection
       - run:
           name: Verify The Licence Inventory Lists Every Crate
@@ -284,6 +377,8 @@ jobs:
             [[ "$(wc -l < /tmp/crates.txt)" -eq 4 ]]
             jq -r 'keys[] | split(" ")[:2] | join(" ")' /tmp/workspace/reports/detection/licenses.json | sort | diff /tmp/crates.txt -
             tail -n +2 /tmp/workspace/reports/detection/licenses.tsv | cut -f 1 | tr '@' ' ' | sort | diff /tmp/crates.txt -
+      - rust-security-orb/store_reports:
+          output_dir: /tmp/workspace/reports/detection
       - persist_to_workspace:
           root: /tmp/workspace
           paths: [advisory-db.tar.gz, metadata.json, reports/detection]
@@ -326,6 +421,8 @@ jobs:
             strip /tmp/workspace/dist/rso-fixture-clean
             cargo build --release --locked --target-dir target/plain
             cp target/plain/release/rso-fixture /tmp/rso-fixture-plain
+            mkdir -p /tmp/workspace/plain
+            cp /tmp/rso-fixture-plain /tmp/workspace/plain/rso-fixture-plain
       - rust-security-orb/verify_auditable:
           binaries: /tmp/workspace/dist/rso-fixture-vulnerable /tmp/workspace/dist/rso-fixture-clean
           cyclonedx: true
@@ -374,7 +471,7 @@ jobs:
             grep -q "carry no cargo-auditable data that decodes: /tmp/rso-fixture-plain" /tmp/run.log
       - persist_to_workspace:
           root: /tmp/workspace
-          paths: [dist, reports/auditable]
+          paths: [dist, plain, reports/auditable]
   # Bans per configuration: with the config for one backend, a build of that backend passes the bans
   # check, and the other backend, or both, fail it. The workflow runs it for each backend.
   bans-test:
@@ -419,10 +516,127 @@ jobs:
       - persist_to_workspace:
           root: /tmp/workspace
           paths: [reports/bans-<< parameters.backend >>]
+  # Dependency-graph assertions with the real cargo tree, on the fixture: backend b must never ship
+  # in the backend-a build, as a package and as a feature, and smallvec's only dependent is the
+  # fixture (in the standalone workspace too, through {root}), until the default feature that links
+  # it is off. A skipped check says so, and a stale lockfile is an error for both commands.
+  graph-test:
+    docker:
+      - image: cimg/rust:1.99
+    steps:
+      - checkout
+      - rust-security-orb/tree_forbid:
+          working_dir: *fixture
+          features: backend-a
+          forbidden_packages: rso-backend-b
+          forbidden_features: rso-fixture:backend-b
+          exception: boundary:backend-a
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: forbid-backend-b
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_forbid:
+          working_dir: *fixture
+          workspace: true
+          all_features: true
+          forbidden_features: rso-fixture:backend-b
+          only_if_reachable: rso-backend-b
+          only_if_reachable_from: rso-backend-a
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: forbid-skipped
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_expect:
+          working_dir: *fixture
+          invert: smallvec
+          depth: 1
+          expected: smallvec@1.6.0 path:rso-fixture@0.1.0
+          exception: RUSTSEC-2021-0003
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_expect:
+          working_dir: *fixture
+          manifest_paths: Cargo.toml standalone/Cargo.toml
+          invert: smallvec
+          depth: 1
+          expected: "smallvec@1.6.0 {root}"
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec-root
+          output_dir: /tmp/workspace/reports/graph
+      - rust-security-orb/tree_expect:
+          working_dir: *fixture
+          no_default_features: true
+          invert: smallvec
+          depth: 1
+          expected: smallvec@1.6.0 path:rso-fixture@0.1.0
+          if_absent: pass
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec-absent
+          output_dir: /tmp/workspace/reports/graph
+      - run:
+          name: Verify The Graph Reports
+          command: |
+            cd /tmp/workspace/reports/graph
+            jq -e '.verdict == "passed" and .exceptions == ["boundary:backend-a"] and ([.nodes[].name] | index("rso-backend-a"))' forbid-backend-b.json
+            jq -e '.verdict == "skipped"' forbid-skipped.json
+            jq -e '.outcome == "skipped"' forbid-skipped.run-record.json
+            grep -q '<skipped message="rso-backend-b is not in the graph of rso-backend-a' junit/forbid-skipped.xml
+            jq -e '.verdict == "passed" and ([.nodes[].key] | sort) == ["path:rso-fixture@0.1.0", "smallvec@1.6.0"]' expect-smallvec.json
+            jq -e '.exceptions == ["RUSTSEC-2021-0003"] and .outcome == "passed"' expect-smallvec.run-record.json
+            jq -e '[.selections[] | "\(.slug) \(.verdict)"] == ["root passed", "standalone passed"]' expect-smallvec-root.json
+            jq -e '.expected == ["path:rso-standalone@0.1.0", "smallvec@1.6.0"]' expect-smallvec-root-standalone.json
+            jq -e '.present == false and .verdict == "passed"' expect-smallvec-absent.json
+      - run:
+          name: Verify What Must Fail Fails
+          command: |
+            expect_failure() {
+              local says=$1
+              shift
+              if bash tests/run_command.sh "$@" > /tmp/run.log 2>&1; then
+                cat /tmp/run.log
+                echo "FAIL: $* passed."
+                exit 1
+              fi
+              cat /tmp/run.log
+              grep -qF -- "${says}" /tmp/run.log
+            }
+            # backend b with every feature on, as a package and as a feature.
+            expect_failure "forbidden: path:rso-backend-b@0.1.0 (rso-backend-b), reached by rso-fixture v0.1.0 -> rso-backend-b v0.1.0" \
+              tree_forbid working_dir=tests/fixtures/app all_features=true forbidden_packages=rso-backend-b
+            expect_failure "forbidden: path:rso-fixture@0.1.0 with feature backend-b (rso-fixture:backend-b)" \
+              tree_forbid working_dir=tests/fixtures/app all_features=true forbidden_features=rso-fixture:backend-b
+            # smallvec gone without the default feature, with if_absent fail.
+            expect_failure "smallvec is not in the graph" tree_expect working_dir=tests/fixtures/app no_default_features=true \
+              invert=smallvec depth=1 expected="smallvec@1.6.0 path:rso-fixture@0.1.0"
+            # A lockfile cargo would have to update, under locked, is an error even with report_only.
+            STALE=$(mktemp -d)
+            cp -a tests/fixtures/app/. "${STALE}/"
+            sed -i '0,/^version = "0.1.0"/s//version = "0.1.1"/' "${STALE}/Cargo.toml"
+            expect_failure "cargo tree failed (exit code 101)" tree_forbid working_dir="${STALE}" forbidden_packages=x \
+              report_only=true run_record=true output_dir=/tmp/stale
+            expect_failure "cargo tree failed (exit code 101)" tree_expect working_dir="${STALE}" invert=smallvec depth=1 \
+              expected=smallvec@1.6.0 report_only=true run_record=true output_dir=/tmp/stale
+            jq -e '.outcome == "error" and .exit_code == 101' /tmp/stale/tree-forbid.run-record.json /tmp/stale/tree-expect.run-record.json
+      - rust-security-orb/store_reports:
+          output_dir: /tmp/workspace/reports/graph
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths: [reports/graph]
   # Offline: on a machine with no Rust toolchain, after the tools are installed, github.com and
   # crates.io stop resolving. audit, deny, licenses and audit_bin then run against the advisory
   # database detection-test archived, the cargo metadata it wrote and the binaries auditable-test
-  # built. A database 90 days old fails unless allow_stale is true.
+  # built. A database 90 days old fails unless allow_stale is true. verify_auditable and audit_bin's
+  # require_auditable read the binaries' .dep-v0 sections with the native decoder, arm64-test's
+  # aarch64 binary included, writing what rust-audit-info wrote in auditable-test byte for byte, and
+  # fail on sections that are removed or broken.
   offline-test:
     machine:
       image: ubuntu-2204:current
@@ -472,6 +686,71 @@ jobs:
           no_fetch: true
           report_only: true
           output_dir: /tmp/workspace/reports/offline
+      - rust-security-orb/verify_auditable:
+          binaries: /tmp/workspace/dist/rso-fixture-vulnerable /tmp/workspace/dist/rso-fixture-clean /tmp/workspace/dist-arm64/rso-fixture-arm64
+          decoder: native
+          junit: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/offline
+          report_name: native
+      - rust-security-orb/audit_bin:
+          binaries: /tmp/workspace/dist/rso-fixture-vulnerable /tmp/workspace/dist-arm64/rso-fixture-arm64
+          require_auditable: true
+          decoder: native
+          no_fetch: true
+          report_only: true
+          run_record: true
+          output_dir: /tmp/workspace/reports/offline
+          report_name: audit-bin-native
+      - run:
+          name: Verify The Native Decoder
+          command: |
+            R=/tmp/workspace/reports
+            command -v rust-audit-info && { echo "FAIL: rust-audit-info is on the PATH."; exit 1; }
+            # The bytes rust-audit-info wrote for the same binaries in auditable-test and arm64-test.
+            cmp "${R}/offline/native-rso-fixture-vulnerable.audit.json" "${R}/auditable/auditable-rso-fixture-vulnerable.audit.json"
+            cmp "${R}/offline/native-rso-fixture-clean.audit.json" "${R}/auditable/auditable-rso-fixture-clean.audit.json"
+            cmp "${R}/offline/native-rso-fixture-arm64.audit.json" "${R}/arm64/auditable-arm64-rso-fixture-arm64.audit.json"
+            jq -e '.decoder == "native" and ([.binaries[] | select(.auditable)] | length) == 3' "${R}/offline/native.json"
+            jq -e '.tool.name == "python3" and .tool.program.name == "dep_v0.py"' "${R}/offline/native.run-record.json"
+            [[ "$(jq -r .tool.program.sha256 "${R}/offline/native.run-record.json")" == "$(sha256sum src/scripts/lib/dep_v0.py | cut -d' ' -f1)" ]]
+            jq -e '.without_auditable_data == [] and (.binaries | length) == 2' "${R}/offline/audit-bin-native.json"
+            jq -e '.other_tools[0].program.name == "dep_v0.py"' "${R}/offline/audit-bin-native.run-record.json"
+      - run:
+          name: Verify Missing And Broken .dep-v0 Sections Fail
+          command: |
+            B=/tmp/broken
+            mkdir -p "${B}"
+            SOURCE=/tmp/workspace/dist/rso-fixture-vulnerable
+            objcopy --remove-section .dep-v0 "${SOURCE}" "${B}/removed"
+            # Sections that decode to something else than one dependency list: a zlib stream cut
+            # short, text that isn't JSON, no packages, and every package a root.
+            GOOD=/tmp/workspace/reports/auditable/auditable-rso-fixture-vulnerable.audit.json
+            python3 -c 'import json, sys, zlib
+            good = open(sys.argv[1], "rb").read()
+            roots = json.loads(good)
+            for package in roots["packages"]:
+                package["root"] = True
+            payloads = {
+                "truncated": zlib.compress(good)[:-6],
+                "not-json": zlib.compress(b"not json"),
+                "no-packages": zlib.compress(json.dumps({"packages": [], "format": 1}).encode()),
+                "two-roots": zlib.compress(json.dumps(roots).encode()),
+            }
+            for name, payload in payloads.items():
+                open(sys.argv[2] + "/" + name + ".z", "wb").write(payload)' "${GOOD}" "${B}"
+            for name in truncated not-json no-packages two-roots; do
+              objcopy --update-section ".dep-v0=${B}/${name}.z" "${SOURCE}" "${B}/${name}"
+            done
+            for binary in "${B}/removed" "${B}/truncated" "${B}/not-json" "${B}/no-packages" "${B}/two-roots" /tmp/workspace/plain/rso-fixture-plain; do
+              if bash tests/run_command.sh verify_auditable binaries="${binary}" decoder=native > /tmp/run.log 2>&1; then
+                cat /tmp/run.log
+                echo "FAIL: verify_auditable passed ${binary}."
+                exit 1
+              fi
+              cat /tmp/run.log
+              grep -q "carry no cargo-auditable data that decodes: ${binary}" /tmp/run.log
+            done
       - run:
           name: Verify Each Command Found The Advisory Offline
           command: |
@@ -594,13 +873,15 @@ workflows:
             parameters:
               backend: ["a", "b"]
           filters: *filters
+      - graph-test:
+          filters: *filters
       - offline-test:
-          requires: [detection-test, auditable-test]
+          requires: [detection-test, auditable-test, arm64-test]
           filters: *filters
       - supply-chain-test:
           filters: *filters
       - reports-test:
-          requires: [detection-test, auditable-test, bans-test, offline-test, supply-chain-test]
+          requires: [detection-test, auditable-test, bans-test, graph-test, offline-test, supply-chain-test]
           filters: *filters
       # The orb must be re-packed for publishing, and saved to the workspace.
       - orb-tools/pack:
@@ -618,6 +899,7 @@ workflows:
             - detection-test
             - auditable-test
             - bans-test
+            - graph-test
             - offline-test
             - supply-chain-test
             - reports-test

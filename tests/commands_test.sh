@@ -17,7 +17,10 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPTS="${ROOT}/src/scripts"
 WORK=$(mktemp -d)
-trap 'rm -rf "${WORK}"' EXIT
+# Only the test's own shell cleans up: bash 4.0 runs the EXIT trap in a
+# subshell that dies on an unbound variable too, which would remove WORK
+# while the tests still run.
+trap '[[ "${BASHPID}" != "$$" ]] || rm -rf "${WORK}"' EXIT
 STUBS="${WORK}/stubs"
 CALLS="${WORK}/calls"
 mkdir -p "${STUBS}" "${CALLS}"
@@ -120,7 +123,12 @@ EOF
 # crash, nodata (bin: no dependency information), empty (a lockfile with no
 # packages), exit1 (exits 1, reporting nothing), yanked-unchecked (the
 # crates.io index was unreachable) or vuln-warn (a vulnerability and an
-# unmaintained crate).
+# unmaintained crate). A lockfile that holds "STUB_VULN" is vuln whatever
+# STUB_AUDIT says. Like cargo audit, it drops the findings whose advisory ID
+# the config's advisories.ignore (read with Python's tomllib, from
+# .cargo/audit.toml in the directory it runs in, or else CARGO_HOME's) or an
+# --ignore names, and reports both in settings.ignore. STUB_EXTRA_IGNORE
+# adds one it reports, and STUB_PASS=crash fails a run with --no-yanked.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -128,7 +136,29 @@ EOF
 if [[ "$1" == --version ]]; then echo "cargo-audit 0.22.2"; exit 0; fi
 mode=${STUB_AUDIT:-clean}
 args=" $* "
+prev=""
+for a in "$@"; do
+    if [[ "${prev}" == --file ]] && grep -q STUB_VULN -- "${a}" 2> /dev/null; then mode=vuln; fi
+    prev=${a}
+done
 if [[ "${mode}" == crash ]]; then echo "error: couldn't load the advisory database" >&2; exit 1; fi
+if [[ "${STUB_PASS:-}" == crash && "${args}" == *" --no-yanked "* ]]; then echo "error: the second pass failed" >&2; exit 1; fi
+config=.cargo/audit.toml
+[[ -f "${config}" ]] || config="${CARGO_HOME:-${HOME}/.cargo}/audit.toml"
+ignores="[]"
+if [[ -f "${config}" ]] && grep -q ignore "${config}"; then
+    if ! ignores=$(python3 -I -c 'import json, sys, tomllib; print(json.dumps(tomllib.load(open(sys.argv[1], "rb")).get("advisories", {}).get("ignore", [])))' "${config}" 2>&1); then
+        echo "error: invalid config ${config}: ${ignores}" >&2; exit 1
+    fi
+fi
+prev=""
+for a in "$@"; do
+    if [[ "${prev}" == --ignore ]]; then ignores=$(jq -c --arg id "${a}" '. + [$id]' <<< "${ignores}"); fi
+    if [[ "${a}" == --ignore=* ]]; then ignores=$(jq -c --arg id "${a#--ignore=}" '. + [$id]' <<< "${ignores}"); fi
+    prev=${a}
+done
+reported=${ignores}
+if [[ -n "${STUB_EXTRA_IGNORE:-}" ]]; then reported=$(jq -c --arg id "${STUB_EXTRA_IGNORE}" '. + [$id]' <<< "${ignores}"); fi
 if [[ "${mode}" == nodata && "${args}" == *" bin "* ]]; then
     echo "error: parse error: No dependency information found! Is this a Rust executable built with cargo?" >&2; exit 2
 fi
@@ -140,7 +170,7 @@ if [[ "${mode}" == vuln-warn ]]; then
     mode=vuln
 fi
 if [[ "${mode}" == vuln ]]; then
-    vulns='{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2021-0003","package":"smallvec","title":"Buffer overflow <in> SmallVec & co","url":"https://example.test/252"},"versions":{"patched":[">=1.6.1"]},"package":{"name":"smallvec","version":"1.6.0"}}]}'
+    vulns='{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2021-0003","aliases":["CVE-2021-25900","GHSA-43w2-9j62-hq99"],"package":"smallvec","title":"Buffer overflow <in> SmallVec & co","url":"https://example.test/252"},"versions":{"patched":[">=1.6.1"]},"package":{"name":"smallvec","version":"1.6.0"}}]}'
     rc=1
 elif [[ "${mode}" == warn || "${mode}" == warn-config ]]; then
     warnings='{"unmaintained":[{"kind":"unmaintained","package":{"name":"ansi_term","version":"0.12.1"},"advisory":{"id":"RUSTSEC-2021-0139","title":"ansi_term is unmaintained"}}]}'
@@ -158,14 +188,23 @@ fi
 count=4
 [[ "${mode}" == empty ]] && count=0
 printf '{"database":{"advisory-count":3,"last-commit":null,"last-updated":null},"lockfile":{"dependency-count":%s},"vulnerabilities":%s,"warnings":%s}\n' \
-    "${count}" "${vulns}" "${warnings}"
+    "${count}" "${vulns}" "${warnings}" | jq -c --argjson ignore "${ignores}" --argjson reported "${reported}" '.settings = {ignore: $reported}
+        | .vulnerabilities.list |= map(select(.advisory.id as $id | $ignore | index($id) | not))
+        | .vulnerabilities.count = (.vulnerabilities.list | length) | .vulnerabilities.found = (.vulnerabilities.count > 0)
+        | .warnings |= (map_values(map(select((.advisory.id // "") as $id | $ignore | index($id) | not))) | with_entries(select(.value | length > 0)))' \
+    > "${TMPDIR:-/tmp}/stub-audit.$$"
+if [[ "${mode}" == vuln && "$(jq '.vulnerabilities.count' "${TMPDIR:-/tmp}/stub-audit.$$")" -eq 0 ]]; then rc=0; fi
+cat "${TMPDIR:-/tmp}/stub-audit.$$"
+rm -f "${TMPDIR:-/tmp}/stub-audit.$$"
 exit "${rc}"
 EOF
 } > "${STUBS}/cargo-audit"
 
 # cargo-deny: STUB_DENY is clean, vuln, banned, crash, ignored-bare,
-# ignored-reason, warn, nolabel (a warning about no crate or advisory) or
-# nostd (std-replacement-data that couldn't be loaded).
+# ignored-reason, yanked-reason (a yanked crate ignored with a reason),
+# yanked-bare (one ignored without), not-detected (an ignored advisory and an
+# ignored yanked crate that matched nothing), warn, nolabel (a warning about no
+# crate or advisory) or nostd (std-replacement-data that couldn't be loaded).
 # "list" prints an inventory.
 {
     echo '#!/usr/bin/env bash'
@@ -174,6 +213,8 @@ EOF
 if [[ "$1" == --version ]]; then echo "cargo-deny 0.20.2"; exit 0; fi
 mode=${STUB_DENY:-clean}
 args=" $* "
+# STUB_DENY_ONLY: STUB_DENY applies to that manifest's check only.
+if [[ -n "${STUB_DENY_ONLY:-}" && "${args}" != *" --manifest-path ${STUB_DENY_ONLY} "* ]]; then mode=clean; fi
 format=human
 prev=""
 for a in "$@"; do [[ "${prev}" == --format ]] && format=${a}; prev=${a}; done
@@ -231,6 +272,16 @@ case "${mode}" in
     nolabel)
         echo '{"type":"diagnostic","fields":{"severity":"warning","code":"license-not-encountered","message":"license was not encountered","labels":[]}}' >&2
         ;;
+    # As cargo-deny 0.20.2 labels them: the ignore's ID, or the yanked crate's
+    # spec, is the first label's span, and a yanked crate's reason is "reason".
+    not-detected)
+        echo '{"type":"diagnostic","fields":{"severity":"warning","code":"advisory-not-detected","message":"advisory was not encountered","graphs":[],"labels":[{"message":"no crate matched advisory criteria","span":"RUSTSEC-2023-0071"},{"message":"ignore reason","span":"rsa is not linked"}]}}' >&2
+        echo '{"type":"diagnostic","fields":{"severity":"warning","code":"yanked-not-detected","message":"yanked crate was not encountered","graphs":[],"labels":[{"message":"yanked crate not detected","span":"gone@1.0.0"},{"message":"reason","span":"pinned"}]}}' >&2
+        adv='{"errors":0,"warnings":2,"notes":0,"helps":0}' ;;
+    yanked-reason)
+        echo '{"type":"diagnostic","fields":{"severity":"note","code":"yanked-ignored","message":"yanked crate '"'"'old 0.1.0'"'"' detected, but ignored","labels":[{"message":"yanked ignore","span":"old@0.1.0"},{"message":"reason","span":"no fixed release yet"}]}}' >&2 ;;
+    yanked-bare)
+        echo '{"type":"diagnostic","fields":{"severity":"note","code":"yanked-ignored","message":"yanked crate '"'"'old 0.1.0'"'"' detected, but ignored","labels":[{"message":"yanked ignore","span":"old@0.1.0"}]}}' >&2 ;;
     # The ignore reason label's span is the reason's text: STUB_REASON, or else "never called".
     ignored-reason)
         printf '{"type":"diagnostic","fields":{"severity":"note","code":"advisory-ignored","message":"advisory was not encountered","labels":[{"message":"advisory ignored here","span":"RUSTSEC-2021-0003"},{"message":"ignore reason","span":"%s"}]}}\n' \
@@ -342,8 +393,10 @@ EOF
 # STUB_LICENSE_FILE as the license-file of each but the root package, and the
 # workspace's and root package's metadata tables STUB_WORKSPACE_METADATA and
 # STUB_PACKAGE_METADATA), pkgid (STUB_PKGIDS lists "name@version=URL path"
-# pairs), locate-project, and auditable, which prints help, as cargo does when
-# a .cargo/config.toml sets [alias] auditable = "help".
+# pairs), locate-project, tree (STUB_TREE_MAP names a file of
+# "PATTERN<TAB>OUTPUT<TAB>CODE" lines: the first PATTERN that matches " ARGS "
+# decides what cargo tree prints and exits with), and auditable, which prints
+# help, as cargo does when a .cargo/config.toml sets [alias] auditable = "help".
 {
     echo '#!/usr/bin/env bash'
     record
@@ -386,6 +439,18 @@ case "$1" in
         done
         echo "error: package ID specification \`${!#}\` did not match any packages" >&2
         exit 101 ;;
+    tree)
+        while IFS=$'\t' read -r pattern output code; do
+            [[ -z "${pattern}" ]] && continue
+            # shellcheck disable=SC2053 # the pattern is a glob
+            if [[ " $* " == ${pattern} ]]; then
+                [[ -n "${output}" ]] && cat "${output}"
+                [[ "${code}" -ne 0 ]] && echo "error: the lock file needs to be updated but --locked was passed to prevent this" >&2
+                exit "${code}"
+            fi
+        done < "${STUB_TREE_MAP:-/dev/null}"
+        echo "cargo stand-in: no tree for $*" >&2
+        exit 2 ;;
     locate-project)
         manifest="$(pwd)/Cargo.toml"
         [[ "$2 $3 $4" == "--message-format plain --manifest-path" ]] && manifest=$(cd "$(dirname "$5")" && pwd)/${5##*/}
@@ -432,11 +497,17 @@ for stub in "${STUBS}"/*; do
 done
 
 SCRIPT_RUST_SECURITY_LIB=$(cat "${SCRIPTS}/lib/rust_security.sh")
-export SCRIPT_RUST_SECURITY_LIB
+SCRIPT_CARGO_TREE_LIB=$(cat "${SCRIPTS}/lib/cargo_tree.sh")
+SCRIPT_DEP_V0_PY=$(cat "${SCRIPTS}/lib/dep_v0.py")
+export SCRIPT_RUST_SECURITY_LIB SCRIPT_CARGO_TREE_LIB SCRIPT_DEP_V0_PY
 
 # new_case: a fresh HOME, working directory, output_dir and record of calls.
 new_case() {
-    CASE=$(mktemp -d "${WORK}/case.XXXXXX")
+    # Without WORK, every path a test writes would be relative to /.
+    if ! CASE=$(mktemp -d "${WORK}/case.XXXXXX") || [[ -z "${CASE}" ]]; then
+        echo "FAIL: could not make a directory for the next test case in ${WORK}"
+        exit 1
+    fi
     mkdir -p "${CASE}/home" "${CASE}/work"
     : > "${CASE}/bash_env"
     rm -f "${CALLS}"/*
@@ -873,9 +944,9 @@ check "refuses a file that isn't a .tar.gz" failed
 check "saying so" said "Could not unpack"
 
 # --- audit
-DEFAULTS=(PARAM_LOCKFILE=Cargo.lock PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false PARAM_NO_YANKED=false
+DEFAULTS=(PARAM_LOCKFILE= PARAM_LOCKFILES= PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false PARAM_NO_YANKED=false
     PARAM_DENY= PARAM_TARGET_ARCH= PARAM_TARGET_OS= PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set
-    PARAM_REPORT_NAME=cargo-audit PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0)
+    PARAM_REPORT_NAME=cargo-audit PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0 PARAM_UNUSED_IGNORES=allow)
 audit_case() {
     new_case
     echo "# lockfile" > "${CASE}/work/Cargo.lock"
@@ -1064,6 +1135,193 @@ audit_case
 run audit.sh 'PARAM_LOCKFILE=${LOCK_NAME}' LOCK_NAME=Cargo.lock
 check "expands variables in lockfile" called_with cargo-audit --file Cargo.lock
 
+begin "audit: several lockfiles"
+lockfiles_case() {
+    audit_case
+    mkdir -p "${CASE}/work/crates/a" "${CASE}/work/crates/b"
+    echo "# lockfile" > "${CASE}/work/crates/a/Cargo.lock"
+    echo "# lockfile" > "${CASE}/work/crates/b/Cargo.lock"
+}
+lockfiles_case
+run audit.sh "PARAM_LOCKFILES=Cargo.lock, crates/*/Cargo.lock" PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "succeeds" succeeded
+check "audits each lockfile on its own, the first one fetching" called cargo-audit audit --file Cargo.lock --json
+check "and the others reading that copy" called cargo-audit audit --file crates/a/Cargo.lock --no-fetch --json
+check "with SARIF passes that don't fetch either" called cargo-audit audit --file crates/b/Cargo.lock --no-fetch --format sarif
+check "and the first one's SARIF pass too" called cargo-audit audit --file Cargo.lock --no-fetch --format sarif
+check "writes each one's reports under its slug" exists "${CASE}/out/cargo-audit-crates-a.sarif"
+check "root for the working directory's own" json_is "${CASE}/out/cargo-audit-root.json" '.vulnerabilities.count' 0
+check "lists them in an index" json_is "${CASE}/out/cargo-audit.json" '[.lockfiles[] | "\(.lockfile)=\(.slug)"] | join(" ")' \
+    "Cargo.lock=root crates/a/Cargo.lock=crates-a crates/b/Cargo.lock=crates-b"
+check "with each one's SHA-256, report and outcome" json_is "${CASE}/out/cargo-audit.json" \
+    '.lockfiles[1] | "\(.sha256 | length) \(.report | split("/")[-1]) \(.outcome)"' "64 cargo-audit-crates-a.json passed"
+check "one JUnit file with a suite per lockfile" \
+    test "$(grep -o '<testsuite name="[^"]*"' "${CASE}/out/junit/cargo-audit.xml" | tr '\n' ' ')" \
+    = '<testsuite name="cargo-audit-root" <testsuite name="cargo-audit-crates-a" <testsuite name="cargo-audit-crates-b" '
+check "one run record, with every lockfile as an input" \
+    json_is "${CASE}/out/cargo-audit.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path | split("/")[-2:] | join("/")] | join(" ")' \
+    "work/Cargo.lock a/Cargo.lock b/Cargo.lock"
+check "the arguments they share" json_is "${CASE}/out/cargo-audit.run-record.json" '.arguments | join(" ")' "audit"
+check "and the counts over all of them" json_is "${CASE}/out/cargo-audit.run-record.json" '.counts | "\(.lockfiles) \(.vulnerabilities)"' "3 0"
+check "says so" said "Passed: cargo audit found 0 vulnerabilities and 0 denied warnings in 3 lockfiles."
+lockfiles_case
+echo "# STUB_VULN" >> "${CASE}/work/crates/a/Cargo.lock"
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock crates/b/Cargo.lock" PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "findings in one lockfile fail the step" failed
+check "after every lockfile is audited (and asked for its version)" call_count cargo-audit 5
+check "naming the lockfile" said "ERROR: cargo audit found 1 vulnerabilities and 0 denied warnings in 2 lockfiles. Findings in: crates/a/Cargo.lock."
+check "the index says which" json_is "${CASE}/out/cargo-audit.json" '[.lockfiles[].outcome] | join(" ")' "findings passed"
+check "and JUnit, in its suite" file_has "${CASE}/out/junit/cargo-audit.xml" '<testsuite name="cargo-audit-crates-a" tests="1" failures="1"'
+check "the run record says findings, with cargo audit's exit code" \
+    json_is "${CASE}/out/cargo-audit.run-record.json" '"\(.outcome) \(.exit_code) \(.counts.vulnerabilities)"' "findings 1 1"
+lockfiles_case
+make_db "${CASE}/db" 10
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock crates/b/Cargo.lock" PARAM_NO_FETCH=true "PARAM_DB_PATH=${CASE}/db"
+check "no_fetch passes --no-fetch to each audit once" called cargo-audit audit --file crates/b/Cargo.lock --db "${CASE}/db" --no-fetch --json
+lockfiles_case
+run audit.sh PARAM_LOCKFILE=Cargo.lock PARAM_LOCKFILES=crates/a/Cargo.lock
+check "lockfile and lockfiles together fail" failed
+check "saying so" said "ERROR: lockfile and lockfiles are both set."
+lockfiles_case
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock fuzz/*/Cargo.lock"
+check "a pattern that matches nothing fails" failed
+check "saying so" said "ERROR: lockfiles names fuzz/*/Cargo.lock, which matches no file"
+check "before running cargo audit" call_count cargo-audit 0
+lockfiles_case
+mkdir -p "${CASE}/work/crates-a"
+echo "# lockfile" > "${CASE}/work/crates-a/Cargo.lock"
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock crates-a/Cargo.lock"
+check "two lockfiles whose reports would share a name fail" failed
+check "saying which" said "ERROR: lockfiles names crates/a/Cargo.lock and crates-a/Cargo.lock, whose reports would both be named cargo-audit-crates-a."
+lockfiles_case
+printf '# lockfile\n' > "${CASE}/work/crates/a/Cargo.lock"
+run audit.sh "PARAM_LOCKFILES=crates/a/Cargo.lock
+crates/b/Cargo.lock
+crates/a/Cargo.lock"
+check "lockfiles takes newlines, and audits a lockfile named twice once" call_count cargo-audit 5
+
+begin "audit: unused ignores"
+# ignores_case: a lockfile whose smallvec RUSTSEC-2021-0003 affects, and a
+# .cargo/audit.toml that ignores it and an advisory that matches nothing,
+# in an array that spans lines and holds comments.
+ignores_case() {
+    audit_case
+    echo "# STUB_VULN" >> "${CASE}/work/Cargo.lock"
+    mkdir -p "${CASE}/work/.cargo"
+    cat > "${CASE}/work/.cargo/audit.toml" << 'TOML'
+[advisories]
+ignore = [
+    # smallvec: insert_many is never called [reviewed]
+    "RUSTSEC-2021-0003",
+    'RUSTSEC-2023-0071', # rsa, which this project doesn't use
+]
+informational_warnings = ["unmaintained"]
+
+[output]
+quiet = false
+TOML
+}
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=deny PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "an unused ignore fails the step with deny" failed
+check "naming it, and where it is" said "unused ignore: RUSTSEC-2023-0071 (from .cargo/audit.toml) matches no finding"
+check "and why the step failed" said "ERROR: cargo audit found 0 vulnerabilities and 0 denied warnings in Cargo.lock. 1 ignores match no finding: RUSTSEC-2023-0071."
+check "after auditing again, offline, without the ignores" \
+    called_with cargo-audit audit --no-fetch --no-yanked --json --file "${CASE}/work/Cargo.lock"
+check "from a directory whose .cargo/audit.toml, a copy without the ignores, cargo audit read: it found the ignored advisory" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0] | "\(.id) \(.used) \(.matched_in | join(","))"' "RUSTSEC-2021-0003 true Cargo.lock"
+check "the report says which is unused" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[1] | "\(.id) \(.used) \(.source)"' \
+    "RUSTSEC-2023-0071 false .cargo/audit.toml"
+check "leaving cargo audit's own report alone" json_is "${CASE}/out/cargo-audit.json" '.vulnerabilities.count' 0
+check "JUnit fails it, in a suite of its own" \
+    file_has "${CASE}/out/junit/cargo-audit.xml" '<testsuite name="cargo-audit-ignores" tests="1" failures="1"'
+check "the run record counts it" json_is "${CASE}/out/cargo-audit.run-record.json" '"\(.outcome) \(.counts.unused_ignores)"' "findings 1"
+check "and lists the ignores report" json_is "${CASE}/out/cargo-audit.run-record.json" '[.reports[].path | split("/")[-1]] | index("cargo-audit.ignores.json") != null' true
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn PARAM_JUNIT=true
+check "warn passes" succeeded
+check "with a warning" said "WARN: unused ignore: RUSTSEC-2023-0071 (from .cargo/audit.toml) matches no finding"
+check "and a skipped JUnit case" file_has "${CASE}/out/junit/cargo-audit.xml" '<testsuite name="cargo-audit-ignores" tests="1" failures="0" skipped="1"'
+ignores_case
+run audit.sh
+check "allow, the default, doesn't check" succeeded
+check "auditing once" call_count cargo-audit 3
+check "and writing no ignores report" absent "${CASE}/out/cargo-audit.ignores.json"
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn "PARAM_EXTRA_ARGS=--ignore GHSA-43w2-9j62-hq99 --ignore=RUSTSEC-2021-0139"
+check "takes --ignore and --ignore= from extra_args" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '[.ignores[] | "\(.id)=\(.source)"] | join(" ")' \
+    "RUSTSEC-2021-0003=.cargo/audit.toml RUSTSEC-2023-0071=.cargo/audit.toml GHSA-43w2-9j62-hq99=extra_args RUSTSEC-2021-0139=extra_args"
+check "leaving them out of the second pass" not_called_with cargo-audit --no-yanked --ignore
+check "an ignore that names an advisory by an alias is unused, since cargo audit matches IDs only" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[2] | "\(.used) \(.alias_of | join(","))"' "false RUSTSEC-2021-0003"
+check "saying which advisory to ignore instead" said "it names RUSTSEC-2021-0003 by an alias, and cargo audit matches ignores by advisory ID only"
+ignores_case
+printf 'advisories.ignore = ["RUSTSEC-2021-0003", "RUSTSEC-2023-0071"]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh PARAM_UNUSED_IGNORES=warn
+check "reads advisories.ignore written as a dotted key" said "WARN: unused ignore: RUSTSEC-2023-0071"
+check "and still finds the used one" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0].used' true
+for config in 'advisories = { ignore = ["RUSTSEC-2021-0003"] }' $'[advisories]\nignore = ["RUSTSEC\\u002d2021-0003"]' \
+    $'[advisories]\nignore = ["""RUSTSEC-2021-0003"""]' $'[advisories]\nignore = [ { id = "x" } ]' $'[advisories]\nignore = [\n  "RUSTSEC-2021-0003",' \
+    $'[advisories]\nignore = "RUSTSEC-2021-0003"'; do
+    ignores_case
+    printf '%s\n' "${config}" > "${CASE}/work/.cargo/audit.toml"
+    run audit.sh PARAM_UNUSED_IGNORES=warn
+    check "a config it can't rewrite exactly fails the step ($(head -c 40 <<< "${config//$'\n'/ }"))" failed
+    check "saying so" said "ERROR: unused_ignores can't read .cargo/audit.toml's advisories.ignore exactly"
+    check "before running cargo audit" call_count cargo-audit 0
+done
+ignores_case
+mkdir -p "${CASE}/cargo"
+mv "${CASE}/work/.cargo/audit.toml" "${CASE}/cargo/audit.toml"
+run audit.sh PARAM_UNUSED_IGNORES=warn "CARGO_HOME=${CASE}/cargo"
+check "reads the ignores of a config only in CARGO_HOME" said "WARN: unused ignore: RUSTSEC-2023-0071 (from ${CASE}/cargo/audit.toml)"
+check "and shadows it in the second pass" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0].used' true
+ignores_case
+mkdir -p "${CASE}/work/crates/a"
+echo "# lockfile" > "${CASE}/work/crates/a/Cargo.lock"
+run audit.sh PARAM_UNUSED_IGNORES=deny "PARAM_LOCKFILES=Cargo.lock crates/a/Cargo.lock"
+check "an ignore used in one of several lockfiles isn't unused" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0] | "\(.used) \(.matched_in | join(","))"' "true Cargo.lock"
+check "while one used in none is" said "unused ignore: RUSTSEC-2023-0071"
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn STUB_EXTRA_IGNORE=RUSTSEC-2099-0001 PARAM_RUN_RECORD=true
+check "ignores cargo audit applied that the config reader missed fail the step" failed
+check "saying so" said "ERROR: cargo audit applied the ignores"
+check "with an error run record" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn STUB_PASS=crash
+check "a second pass that doesn't complete fails the step" failed
+check "saying so" said "ERROR: cargo audit did not complete without the ignores"
+ignores_case
+make_db "${CASE}/db" 3
+mkdir -p "${CASE}/db/crates/rsa"
+cat > "${CASE}/db/crates/rsa/RUSTSEC-2023-0071.md" << 'ADVISORY'
+```toml
+[advisory]
+id = "RUSTSEC-2023-0071"
+package = "rsa"
+aliases = ["CVE-2023-49092"]
+
+[versions]
+patched = []
+unaffected = [
+    "< 0.1.0", # before the timing side channel
+]
+```
+
+# Marvin Attack
+ADVISORY
+"${REAL_GIT}" -C "${CASE}/db" add -A && "${REAL_GIT}" -C "${CASE}/db" -c user.name=t -c user.email=t@example.test commit -q -m rsa
+run audit.sh PARAM_UNUSED_IGNORES=warn "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=true
+check "names what the database says of an unused ignore's advisory" said "the database's RUSTSEC-2023-0071 is for rsa, with no patched version, and leaves out < 0.1.0"
+check "in the report too" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[1].advisory | "\(.package) \(.unaffected | join(","))"' "rsa < 0.1.0"
+check "passing the second pass that database" called_with cargo-audit --db "${CASE}/db" --no-fetch --no-yanked
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=never
+check "unused_ignores refuses another value" failed
+check "saying which it takes" said "unused_ignores must be allow, warn or deny"
+
 begin "audit: the advisory database"
 audit_case
 run audit.sh "RUSTSEC_ADVISORY_DB=${CASE}/db"
@@ -1233,6 +1491,9 @@ check "records a URL in the arguments without its credentials, query or fragment
     json_is "${CASE}/out/cargo-audit.run-record.json" '.arguments[3:] | join(" ")' \
     "--url https://mirror.example.test/advisory-db -uhttps://mirror.example.test/db"
 check "which reach the run record nowhere" not_file_has "${CASE}/out/cargo-audit.run-record.json" "s3cret-token"
+check "the log shows the command with the URL stripped the same way" \
+    said "Running: cargo-audit audit --file Cargo.lock --url https://mirror.example.test/advisory-db -uhttps://mirror.example.test/db --json"
+check "and never the credentials" not_said "s3cret-token"
 audit_case
 mkdir -p "${CASE}/nosha"
 printf '#!/bin/sh\necho "sha512sum: not available" >&2\nexit 127\n' > "${CASE}/nosha/sha512sum"
@@ -1242,9 +1503,10 @@ check "without a working sha512sum, the step still passes" succeeded
 check "and the run record has no SHA-512 for the tool" json_is "${CASE}/out/cargo-audit.run-record.json" .tool.sha512 null
 
 # --- audit_bin
-DEFAULTS=(PARAM_BINARIES="app" PARAM_REQUIRE_AUDITABLE=0 PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false
+AUDIT_BIN_DEFAULTS=(PARAM_BINARIES="app" PARAM_REQUIRE_AUDITABLE=0 PARAM_DECODER=auto PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false
     PARAM_NO_YANKED=false PARAM_DENY= PARAM_TARGET_ARCH= PARAM_TARGET_OS= PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set
-    PARAM_REPORT_NAME=cargo-audit-bin PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0)
+    PARAM_REPORT_NAME=cargo-audit-bin PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0 PARAM_UNUSED_IGNORES=allow)
+DEFAULTS=("${AUDIT_BIN_DEFAULTS[@]}")
 bin_case() {
     new_case
     mkdir -p "${CASE}/work/target/release" "${CASE}/work/dist"
@@ -1323,13 +1585,13 @@ bin_case
 mkdir -p "${CASE}/bin"
 cp "${STUBS}/rust-audit-info" "${CASE}/bin/rust-audit-info"
 echo "# changed" >> "${CASE}/bin/rust-audit-info"
-run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 "PATH=${CASE}/bin:${STUBS}:${PATH}"
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=rust-audit-info "PATH=${CASE}/bin:${STUBS}:${PATH}"
 check "and warns about one the install command didn't verify" \
     said "WARN: ${CASE}/bin/rust-audit-info is not the rust-audit-info this orb's install command verified"
 bin_case
-run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 "PATH=$(path_without rust-audit-info)"
-check "require_auditable needs rust-audit-info" failed
-check "saying how to install it" said "require_auditable needs rust-audit-info"
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=rust-audit-info "PATH=$(path_without rust-audit-info)"
+check "decoder rust-audit-info needs rust-audit-info" failed
+check "saying how to install it" said "ERROR: decoder rust-audit-info needs rust-audit-info, which is not on the PATH."
 bin_case
 run audit_bin.sh "PARAM_BINARIES=missing/*"
 check "a pattern that matches nothing fails" failed
@@ -1337,6 +1599,15 @@ check "saying so" said "matches no file"
 bin_case
 run audit_bin.sh PARAM_BINARIES=
 check "no binaries fails" failed
+bin_case
+mkdir -p "${CASE}/work/.cargo"
+printf '[advisories]\nignore = ["RUSTSEC-2021-0003", "RUSTSEC-2023-0071"]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit_bin.sh STUB_AUDIT=vuln "PARAM_BINARIES=app target/release/tool" PARAM_UNUSED_IGNORES=deny PARAM_JUNIT=true
+check "unused_ignores audits each binary again without the ignores" called_with cargo-audit --no-yanked --json bin "${CASE}/work/target/release/tool"
+check "and fails on an ignore no binary needs" failed
+check "naming it" said "unused ignore: RUSTSEC-2023-0071"
+check "while the used one isn't" json_is "${CASE}/out/cargo-audit-bin.ignores.json" '.ignores[0] | "\(.used) \(.matched_in | join(","))"' "true app,target/release/tool"
+check "in a JUnit suite of its own" file_has "${CASE}/out/junit/cargo-audit-bin.xml" '<testsuite name="cargo-audit-bin-ignores" tests="1" failures="1"'
 bin_case
 run audit_bin.sh STUB_SARIF=crash PARAM_RUN_RECORD=1
 check "a SARIF pass that fails fails the step" failed
@@ -1346,7 +1617,7 @@ check "with the SARIF pass's exit code" json_is "${CASE}/out/cargo-audit-bin.run
 check "and its log" json_is "${CASE}/out/cargo-audit-bin.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' "cargo-audit-bin-app.json cargo-audit-bin-app.sarif.log"
 
 # --- deny
-DEFAULTS=(PARAM_CHECKS= PARAM_MANIFEST_PATH= PARAM_CONFIG_PATH= PARAM_METADATA_PATH= PARAM_FEATURES= PARAM_ALL_FEATURES=false
+DEFAULTS=(PARAM_CHECKS= PARAM_MANIFEST_PATH= PARAM_MANIFEST_PATHS= PARAM_CONFIG_PATH= PARAM_METADATA_PATH= PARAM_FEATURES= PARAM_ALL_FEATURES=false
     PARAM_NO_DEFAULT_FEATURES=false PARAM_TARGET= PARAM_OFFLINE=false PARAM_LOCKED=false PARAM_FROZEN=false PARAM_WORKSPACE=false
     PARAM_EXCLUDE= PARAM_EXCLUDE_DEV=false PARAM_ALLOW= PARAM_WARN= PARAM_DENY= PARAM_REQUIRE_IGNORE_REASONS=false
     PARAM_AUDIT_COMPATIBLE_OUTPUT=false PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set PARAM_REPORT_NAME=cargo-deny
@@ -1504,8 +1775,29 @@ deny_case
 run deny.sh STUB_DENY=ignored-bare
 check "an ignore without a reason passes unless require_ignore_reasons is true" succeeded
 check "quietly" not_said "Ignored without a reason"
+deny_case
+run deny.sh STUB_DENY=yanked-reason PARAM_REQUIRE_IGNORE_REASONS=true
+check "a yanked crate ignored with a reason, which cargo deny labels \"reason\", passes" succeeded
+deny_case
+run deny.sh STUB_DENY=yanked-bare PARAM_REQUIRE_IGNORE_REASONS=true
+check "and one without a reason fails" failed
+check "naming the crate" said "Ignored without a reason in deny.toml: old@0.1.0"
+deny_case
+run deny.sh STUB_DENY=not-detected PARAM_JUNIT=true
+check "an ignore that matched nothing" succeeded
+check "is listed with its advisory's ID, which cargo deny puts in a label" said "warning[advisory-not-detected] RUSTSEC-2023-0071: advisory was not encountered"
+check "and a yanked crate's ignore with its crate spec" said "warning[yanked-not-detected] gone@1.0.0: yanked crate was not encountered"
+check "named so in JUnit" file_has "${CASE}/out/junit/cargo-deny.xml" 'classname="cargo-deny.advisory-not-detected" name="RUSTSEC-2023-0071"><skipped'
+check "both of them" file_has "${CASE}/out/junit/cargo-deny.xml" 'classname="cargo-deny.yanked-not-detected" name="gone@1.0.0"><skipped'
+deny_case
+run deny.sh STUB_DENY=nolabel
+check "a diagnostic about no crate or advisory is listed by its code alone" said "  warning[license-not-encountered]: license was not encountered"
 
 begin "deny: options"
+deny_case
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_ALL_FEATURES=true "PARAM_EXTRA_ARGS=--hide-inclusion-graph"
+check "logs the whole command, the options before check included" \
+    said "Running: cargo-deny --format json --log-level info --manifest-path app/Cargo.toml --all-features check --hide-inclusion-graph"
 deny_case
 run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_CONFIG_PATH=deny.toml "PARAM_FEATURES=a, b" PARAM_WORKSPACE=true \
     "PARAM_EXCLUDE=x y" PARAM_EXCLUDE_DEV=true PARAM_TARGET=x86_64-unknown-linux-gnu PARAM_OFFLINE=true PARAM_LOCKED=true \
@@ -1527,6 +1819,81 @@ deny_case
 run deny.sh PARAM_AUDIT_COMPATIBLE_OUTPUT=true
 check "audit_compatible_output passes --audit-compatible-output" called_with cargo-deny --audit-compatible-output
 check "and keeps that report" json_is "${CASE}/out/cargo-deny.audit.json" '.vulnerabilities | length' 0
+
+begin "deny: several manifests"
+manifests_case() {
+    deny_case
+    mkdir -p "${CASE}/work/fuzz"
+    echo "[package]" > "${CASE}/work/fuzz/Cargo.toml"
+    echo "# lockfile" > "${CASE}/work/fuzz/Cargo.lock"
+}
+manifests_case
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_CHECKS=bans PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "succeeds" succeeded
+check "checks each manifest on its own" called cargo-deny --format json --log-level info --manifest-path fuzz/Cargo.toml check bans
+check "with a SARIF pass each" called cargo-deny --format sarif --manifest-path app/Cargo.toml --offline check bans
+check "writes each one's reports under its slug" exists "${CASE}/out/cargo-deny-fuzz.sarif"
+check "lists them in an index" json_is "${CASE}/out/cargo-deny.json" '[.manifests[] | "\(.manifest)=\(.slug) \(.outcome)"] | join(", ")' \
+    "app/Cargo.toml=app passed, fuzz/Cargo.toml=fuzz passed"
+check "with each manifest's SHA-256" json_is "${CASE}/out/cargo-deny.json" '.manifests[1].sha256' "$(sha256sum "${CASE}/work/fuzz/Cargo.toml" | awk '{ print $1 }')"
+check "one JUnit suite per manifest" file_has "${CASE}/out/junit/cargo-deny.xml" '<testsuite name="cargo-deny-fuzz"'
+check "one run record, with each manifest's lockfile" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "lockfile") | .path | split("/")[-2:] | join("/")] | join(" ")' \
+    "app/Cargo.lock fuzz/Cargo.lock"
+check "and the deny.toml they share once" json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "config")] | length' 1
+check "the arguments they share" json_is "${CASE}/out/cargo-deny.run-record.json" '.arguments | join(" ")' "check bans"
+check "and the counts summed" json_is "${CASE}/out/cargo-deny.run-record.json" '.counts | "\(.manifests) \(.bans.errors)"' "2 0"
+check "says so" said "Passed: cargo deny found no errors in 2 manifests."
+manifests_case
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" STUB_DENY=banned STUB_DENY_ONLY=app/Cargo.toml PARAM_RUN_RECORD=true
+check "findings in one manifest fail the step" failed
+check "after every manifest is checked" called_with cargo-deny --format json --manifest-path fuzz/Cargo.toml
+check "naming the manifest and the check" said "ERROR: cargo deny failed in 1 of 2 manifests: app/Cargo.toml (bans)."
+check "the run record says findings, with cargo deny's exit code" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '"\(.outcome) \(.exit_code) \(.counts.bans.errors)"' "findings 2 1"
+manifests_case
+run deny.sh PARAM_MANIFEST_PATH=app/Cargo.toml PARAM_MANIFEST_PATHS=fuzz/Cargo.toml
+check "manifest_path and manifest_paths together fail" failed
+check "saying so" said "ERROR: manifest_path and manifest_paths are both set."
+manifests_case
+echo '{}' > "${CASE}/work/metadata.json"
+run deny.sh PARAM_METADATA_PATH=metadata.json PARAM_MANIFEST_PATHS=fuzz/Cargo.toml
+check "and so do metadata_path and manifest_paths" failed
+manifests_case
+run deny.sh "PARAM_MANIFEST_PATHS=*/Nothing.toml"
+check "a pattern that matches nothing fails" failed
+check "before running cargo deny" not_called_with cargo-deny check
+manifests_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+mkdir -p "${CASE}/work/fuzz/dbs"
+make_db "${CASE}/work/fuzz/dbs/${DB_NAME}" 5
+printf '[advisories]\ndb-path = "fuzz/dbs"\n' > "${CASE}/work/fuzz/deny.toml"
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_RUN_RECORD=true
+check "manifests whose checks read different databases" succeeded
+check "get a run record that names none" json_is "${CASE}/out/cargo-deny.run-record.json" .advisory_db null
+check "with a warning" said "WARN: The manifests' checks read different advisory databases"
+manifests_case
+make_db "${CASE}/home/.cargo/advisory-dbs/${DB_NAME}" 2
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_RUN_RECORD=true
+check "and those that read the same one name it" json_is "${CASE}/out/cargo-deny.run-record.json" '.advisory_db.path | split("/")[-1]' "${DB_NAME}"
+manifests_case
+# Each workspace has a path dependency outside it: app the lockfile's
+# outside and smallvec, fuzz its own fuzzdep, which has a licence file.
+path_lockfile "${CASE}/work/app/Cargo.lock"
+printf 'version = 4\n\n[[package]]\nname = "fuzz"\nversion = "0.1.0"\ndependencies = [\n "fuzzdep",\n]\n\n[[package]]\nname = "fuzzdep"\nversion = "0.1.0"\n' \
+    > "${CASE}/work/fuzz/Cargo.lock"
+for dir in outside patched fuzzdep; do
+    mkdir -p "${CASE}/${dir}"
+    echo "[package]" > "${CASE}/${dir}/Cargo.toml"
+done
+echo "MIT" > "${CASE}/fuzzdep/LICENSE"
+run deny.sh "PARAM_MANIFEST_PATHS=app/Cargo.toml fuzz/Cargo.toml" PARAM_RUN_RECORD=true \
+    "STUB_PKGIDS=outside@0.1.0=${CASE}/outside smallvec@1.99.0=${CASE}/patched fuzzdep@0.1.0=${CASE}/fuzzdep"
+check "the run record has the path dependencies of every manifest's workspace, not only the last one's" \
+    json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "manifest") | .path | split("/")[-2:] | join("/")] | join(" ")' \
+    "app/Cargo.toml fuzz/Cargo.toml outside/Cargo.toml patched/Cargo.toml fuzzdep/Cargo.toml"
+check "each looked up in its own workspace" called cargo pkgid --offline --manifest-path "${CASE}/work/fuzz/Cargo.toml" fuzzdep@0.1.0
+check "and their licence files" json_is "${CASE}/out/cargo-deny.run-record.json" '[.inputs[] | select(.role == "license") | .path] | join(" ")' "${CASE}/fuzzdep/LICENSE"
 
 begin "deny: run records"
 deny_case
@@ -1810,7 +2177,7 @@ run auditable_build.sh 'PARAM_EXTRA_ARGS=--release; rm -rf /'
 check "refuses shell operators in extra_args" failed
 
 # --- verify_auditable
-DEFAULTS=(PARAM_BINARIES=app PARAM_CYCLONEDX=false PARAM_OUTPUT_DIR=/will/be/set PARAM_REPORT_NAME=auditable PARAM_JUNIT=false
+DEFAULTS=(PARAM_BINARIES=app PARAM_DECODER=auto PARAM_CYCLONEDX=false PARAM_OUTPUT_DIR=/will/be/set PARAM_REPORT_NAME=auditable PARAM_JUNIT=false
     PARAM_RUN_RECORD=false)
 
 begin "verify_auditable"
@@ -1884,6 +2251,120 @@ bin_case
 run verify_auditable.sh PARAM_BINARIES=target
 check "a directory fails" failed
 check "saying it isn't a file" said "target is not a file"
+
+begin "the native .dep-v0 decoder"
+# make_elf FILE BITS ORDER MODE: an ELF file of BITS (32 or 64) and byte ORDER
+# (le or be) with a .text section and, unless MODE is none, a .dep-v0 section:
+# good (the dependency list cargo auditable writes), truncated, notzlib,
+# notjson, empty (no packages), tworoots, badindex or nobits.
+cat > "${WORK}/make_elf.py" << 'PY'
+import json, struct, sys, zlib
+path, bits, order, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+e = "<" if order == "le" else ">"
+good = json.dumps({"packages": [{"name": "app", "version": "0.1.0", "source": "local", "dependencies": [1], "root": True},
+                                {"name": "smallvec", "version": "1.6.0", "source": "crates.io"}], "format": 1},
+                  separators=(",", ":")).encode()
+lists = {
+    "good": good, "nobits": good, "notjson": b"not json",
+    "empty": b'{"packages":[],"format":1}',
+    "tworoots": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true},{"name":"b","version":"1.0.0","source":"local","root":true}],"format":1}',
+    "badindex": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true,"dependencies":[5]}],"format":1}',
+    "badformat": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true}],"format":"1"}',
+    # cargo auditable before 0.7 writes no format.
+    "noformat": b'{"packages":[{"name":"a","version":"1.0.0","source":"local","root":true}]}',
+}
+payload = {"none": None, "notzlib": b"plain bytes", "truncated": zlib.compress(good)[:-6]}.get(mode)
+if mode in lists:
+    payload = zlib.compress(lists[mode])
+names = b"\0.text\0.shstrtab\0" + (b".dep-v0\0" if payload is not None else b"")
+ehsize, shentsize = (64, 64) if bits == 64 else (52, 40)
+text = b"\x90" * 4
+sections = [(0, 0, b""), (1, 1, text)]
+if payload is not None:
+    sections.append((17, 8 if mode == "nobits" else 1, payload))
+sections.append((7, 3, names))
+body, offsets = b"", []
+for _, _, data in sections:
+    offsets.append(ehsize + len(body) if data else 0)
+    body += data
+shoff = ehsize + len(body)
+ident = b"\x7fELF" + bytes([2 if bits == 64 else 1, 1 if order == "le" else 2, 1]) + bytes(9)
+fmt = "HHIQQQIHHHHHH" if bits == 64 else "HHIIIIIHHHHHH"
+header = ident + struct.pack(e + fmt, 2, 0xB7, 1, 0, 0, shoff, 0, ehsize, 0, 0, shentsize, len(sections), len(sections) - 1)
+entry = "IIQQQQIIQQ" if bits == 64 else "IIIIIIIIII"
+table = b"".join(struct.pack(e + entry, name, kind, 0, 0, offset, len(data), 0, 0, 1, 0)
+                 for (name, kind, data), offset in zip(sections, offsets))
+open(path, "wb").write(header + body + table)
+if mode == "good":
+    open(path + ".json", "wb").write(good)
+PY
+make_elf() { python3 -I "${WORK}/make_elf.py" "$@"; }
+bin_case
+for spec in 64-le 32-be 64-be 32-le; do
+    make_elf "${CASE}/work/elf-${spec}" "${spec%-*}" "${spec#*-}" good
+done
+run verify_auditable.sh "PARAM_BINARIES=elf-64-le elf-32-be elf-64-be elf-32-le" PARAM_DECODER=native PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "reads 32- and 64-bit ELF of either byte order, with no Rust tool" succeeded
+check "saying which decoder it used" said "with the native decoder"
+check "and never runs rust-audit-info" call_count rust-audit-info 0
+check "writing the dependency list exactly as it is stored" cmp -s "${CASE}/out/auditable-elf-32-be.audit.json" "${CASE}/work/elf-32-be.json"
+check "the index names the decoder" json_is "${CASE}/out/auditable.json" '"\(.decoder) \([.binaries[] | select(.auditable)] | length)"' "native 4"
+check "and the run record python3, with the decoder by its SHA-256 as stored in the orb's source" \
+    json_is "${CASE}/out/auditable.run-record.json" '.tool | "\(.name) \(.program.name) \(.program.sha256)"' \
+    "python3 dep_v0.py $(sha256sum "${SCRIPTS}/lib/dep_v0.py" | awk '{ print $1 }')"
+bin_case
+for mode in none truncated notzlib notjson empty tworoots badindex badformat nobits; do
+    make_elf "${CASE}/work/bad-${mode}" 64 le "${mode}"
+done
+make_elf "${CASE}/work/fine" 64 be good
+make_elf "${CASE}/work/old" 64 le noformat
+run verify_auditable.sh "PARAM_BINARIES=bad-* fine old" PARAM_DECODER=native PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "fails on every binary whose data is missing or broken" said "ERROR: 9 of 11 binaries carry no cargo-auditable data that decodes"
+check "after checking them all, passing a list with no format, as cargo auditable before 0.7 writes" \
+    json_is "${CASE}/out/auditable.json" '[.binaries[] | select(.auditable) | .binary] | join(" ")' "fine old"
+for reason in "bad-none: FAILED: No usable audit data: it has no .dep-v0 section" \
+    "bad-truncated: FAILED: No usable audit data: its .dep-v0 section's zlib stream is cut short" \
+    "bad-notzlib: FAILED: No usable audit data: its .dep-v0 section is not a zlib stream that decodes" \
+    "bad-nobits: FAILED: No usable audit data: its .dep-v0 section holds no data" \
+    "bad-tworoots: FAILED: Its dependency list is not the JSON cargo auditable writes" \
+    "bad-badformat: FAILED: Its dependency list is not the JSON cargo auditable writes"; do
+    check "saying why (${reason%%:*})" said "${reason}"
+done
+check "the run record says findings" json_is "${CASE}/out/auditable.run-record.json" .outcome findings
+bin_case
+make_elf "${CASE}/work/tworoots" 64 le tworoots
+run verify_auditable.sh PARAM_BINARIES=tworoots
+check "rust-audit-info's output must have the shape cargo auditable writes too" failed
+bin_case
+run verify_auditable.sh PARAM_BINARIES=app PARAM_DECODER=native PARAM_RUN_RECORD=true
+check "a file the native decoder can't read fails the step" failed
+check "as an error, not a finding" json_is "${CASE}/out/auditable.run-record.json" .outcome error
+check "saying to use rust-audit-info" said "is not an ELF file, and the native decoder reads only ELF; use decoder: rust-audit-info"
+bin_case
+make_elf "${CASE}/work/elf" 64 le good
+mkdir -p "${CASE}/bin"
+cp "${STUBS}/rust-audit-info" "${CASE}/bin/rust-audit-info"
+echo "# not the verified one" >> "${CASE}/bin/rust-audit-info"
+run verify_auditable.sh PARAM_BINARIES=elf "PATH=${CASE}/bin:${STUBS}:${PATH}"
+check "auto takes the native decoder over a rust-audit-info the install command didn't verify" said "with the native decoder"
+check "without warning about it" not_said "WARN"
+bin_case
+run verify_auditable.sh PARAM_BINARIES=app
+check "and a verified rust-audit-info over the native decoder" said "with the rust-audit-info decoder"
+bin_case
+run verify_auditable.sh PARAM_DECODER=objdump
+check "decoder refuses another value" said "ERROR: decoder must be auto, native or rust-audit-info, not 'objdump'."
+DEFAULTS=("${AUDIT_BIN_DEFAULTS[@]}")
+bin_case
+make_elf "${CASE}/work/elf" 32 be good
+make_elf "${CASE}/work/stripped" 64 le none
+run audit_bin.sh "PARAM_BINARIES=elf stripped" PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=native PARAM_RUN_RECORD=1
+check "audit_bin's require_auditable reads the data with the native decoder too" said "stripped: no cargo-auditable data (No usable audit data: it has no .dep-v0 section"
+check "telling the two binaries apart" json_is "${CASE}/out/cargo-audit-bin.json" '.without_auditable_data | join(" ")' stripped
+check "and names it in the run record" json_is "${CASE}/out/cargo-audit-bin.run-record.json" '.other_tools[0].program.name' dep_v0.py
+bin_case
+run audit_bin.sh PARAM_REQUIRE_AUDITABLE=1 PARAM_DECODER=native PARAM_RUN_RECORD=1
+check "and fails, as an error, on a file it can't read" json_is "${CASE}/out/cargo-audit-bin.run-record.json" .outcome error
 
 # --- sbom
 DEFAULTS=(PARAM_MANIFEST_PATH= PARAM_FORMAT=json PARAM_SPEC_VERSION=1.5 PARAM_DESCRIBE=crate PARAM_FEATURES= PARAM_ALL_FEATURES=false
@@ -2139,6 +2620,307 @@ run vet.sh "PATH=$(path_without cargo)"
 check "needs cargo" failed
 check "saying so" said "cargo is not on the PATH"
 
+# --- tree_forbid and tree_expect
+TREE_DEFAULTS=(PARAM_MANIFEST_PATH= PARAM_MANIFEST_PATHS= PARAM_PACKAGE= PARAM_WORKSPACE=false PARAM_FEATURES= PARAM_ALL_FEATURES=false
+    PARAM_NO_DEFAULT_FEATURES=false PARAM_TARGET=all PARAM_EDGES= PARAM_LOCKED=true PARAM_OFFLINE=false PARAM_FROZEN=false
+    PARAM_EXCEPTION= PARAM_OUTPUT_DIR=/will/be/set PARAM_JUNIT=false PARAM_REPORT_ONLY=false PARAM_RUN_RECORD=false)
+# tree_case: a workspace whose one member, work, is the root of every graph,
+# and an empty map of cargo tree's answers.
+tree_case() {
+    new_case
+    echo "[package]" > "${CASE}/work/Cargo.toml"
+    echo "# lockfile" > "${CASE}/work/Cargo.lock"
+    : > "${CASE}/tree.map"
+    set_default "PARAM_OUTPUT_DIR=${CASE}/out"
+    set_default "STUB_TREE_MAP=${CASE}/tree.map"
+}
+# tree_output NAME LINE...: writes what cargo tree prints to CASE/NAME, a
+# LINE per line, with | for the tab between a package and its features.
+tree_output() {
+    local file="${CASE}/$1"
+    shift
+    : > "${file}"
+    # Bash 4.0 calls an empty "$@" unbound under set -u.
+    if [[ $# -gt 0 ]]; then
+        printf '%s\n' "$@" | tr '|' '\t' > "${file}"
+    fi
+}
+# tree_answer PATTERN [NAME [CODE]]: cargo tree prints CASE/NAME and exits
+# with CODE (0) when " ARGS " matches PATTERN, the first such line winning.
+tree_answer() {
+    printf '%s\t%s\t%s\n' "$1" "${2:+${CASE}/$2}" "${3:-0}" >> "${CASE}/tree.map"
+}
+# The graph of work: crates whose names a family pattern must tell apart,
+# a proc macro with and without a path source, a repeated subtree, a git and
+# an alternative registry source, and index twice, the second time (as a
+# build dependency) with the writer feature.
+tree_graph() {
+    tree_output graph.txt \
+        "0work v0.1.0 (${CASE}/work)|default" \
+        "1acme-sys v1.0.0|" \
+        "1acmes v2.0.0|" \
+        "1serde v1.0.200|default,derive,std" \
+        "2serde_derive v1.0.200 (proc-macro)|default" \
+        "3proc-macro2 v1.0.80|proc-macro" \
+        "2proc-macro2 v1.0.80|proc-macro (*)" \
+        "1index v0.1.0 (${CASE}/work/crates/index)|default" \
+        "1local-macro v0.2.0 (proc-macro) (${CASE}/work/macro)|" \
+        "1itoa v1.0.11 (https://github.com/dtolnay/itoa?tag=1.0.11#8f392032)|" \
+        "1alt v0.1.0 (my-registry)|" \
+        "1index v0.1.0 (${CASE}/work/crates/index)|default,writer"
+}
+
+DEFAULTS=("${TREE_DEFAULTS[@]}" PARAM_REPORT_NAME=tree-forbid PARAM_FORBIDDEN_PACKAGES= PARAM_FORBIDDEN_FEATURES=
+    PARAM_ONLY_IF_REACHABLE= PARAM_ONLY_IF_REACHABLE_FROM=)
+
+begin "tree_forbid"
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_PACKAGES=acme acme-*" PARAM_EXCEPTION=boundary:server PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "a forbidden package fails the step" failed
+check "reading the whole graph, for every target" \
+    called cargo tree --target all --locked --prefix depth --format $'{p}\t{f}' --color never
+check "matching a family pattern against the whole name: acme-* is acme-sys" said "forbidden: acme-sys@1.0.0 (acme-*), reached by work v0.1.0 -> acme-sys v1.0.0"
+check "and not acmes" not_said "forbidden: acmes"
+check "saying how many" said "ERROR: cargo tree's graph holds 1 forbidden packages or features."
+REPORT="${CASE}/out/tree-forbid.json"
+check "the report names the violation and the path to it" \
+    json_is "${REPORT}" '.violations[0] | "\(.rule) \(.package) \(.path | join(" > "))"' "acme-* acme-sys@1.0.0 work v0.1.0 > acme-sys v1.0.0"
+check "and the exceptions it guards" json_is "${REPORT}" '.exceptions | join(" ")' "boundary:server"
+check "and keeps what cargo tree printed" cmp -s "${CASE}/out/tree-forbid.tree.txt" "${CASE}/graph.txt"
+check "with its SHA-256 among the calls" json_is "${REPORT}" '.runs[0].sha256' "$(sha256sum "${CASE}/graph.txt" | awk '{ print $1 }')"
+check "and the lockfile's" json_is "${REPORT}" '.lockfile.sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
+check "reads a path source relative to the working directory" json_is "${REPORT}" '.nodes[] | select(.name == "index") | .source' crates/index
+check "a proc macro with a path source" json_is "${REPORT}" '.nodes[] | select(.name == "local-macro") | "\(.kind) \(.proc_macro) \(.source)"' "path true macro"
+check "a git source" json_is "${REPORT}" '.nodes[] | select(.name == "itoa") | .key' "git:itoa@1.0.11"
+check "and another registry's" json_is "${REPORT}" '.nodes[] | select(.name == "alt") | .key' "alt@0.1.0"
+check "each package once, a repeated one included" json_is "${REPORT}" '[.nodes[] | select(.name == "proc-macro2")] | length' 1
+check "with every feature set it has" json_is "${REPORT}" '.nodes[] | select(.name == "index") | .features | map(join(",")) | join(" ")' "default default,writer"
+check "JUnit has a case per pattern, the one that matched failing" \
+    file_has "${CASE}/out/junit/tree-forbid.xml" '<testcase classname="tree-forbid.package" name="acme-*"><failure message="forbidden: acme-sys@1.0.0">work v0.1.0 -&gt; acme-sys v1.0.0</failure>'
+check "and the other passing" file_has "${CASE}/out/junit/tree-forbid.xml" '<testcase classname="tree-forbid.package" name="acme"></testcase>'
+RECORD="${CASE}/out/tree-forbid.run-record.json"
+check "the run record says findings" json_is "${RECORD}" '"\(.command) \(.outcome)"' "tree_forbid findings"
+check "names cargo as the tool" json_is "${RECORD}" '.tool.version' "cargo 1.99.0 (stand-in)"
+check "with the exceptions" json_is "${RECORD}" '.exceptions | join(" ")' "boundary:server"
+check "the lockfile and manifest" json_is "${RECORD}" '[.inputs[].role] | join(" ")' "lockfile manifest"
+check "and the graph cargo tree printed among the reports" json_is "${RECORD}" '[.reports[].path | split("/")[-1]] | join(" ")' "tree-forbid.tree.txt tree-forbid.json tree-forbid.xml"
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_FEATURES=index:writer serde:no-std" PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
+check "a forbidden feature on any occurrence of the crate is found" said "forbidden: path:index@0.1.0 with feature writer (index:writer), reached by work v0.1.0 -> index v0.1.0"
+check "report_only passes" succeeded
+check "with a warning" said "WARN: cargo tree's graph holds 1 forbidden packages or features."
+check "the run record says findings-reported" json_is "${CASE}/out/tree-forbid.run-record.json" .outcome findings-reported
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_PACKAGES=acme-sy? s*de" "PARAM_FORBIDDEN_FEATURES=*:derive*"
+check "? matches one character, * any run, on both sides of crate:feature" \
+    test "$(grep -c '^  forbidden:' <<< "${OUTPUT}")" -eq 3
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=nothing-like-it PARAM_PACKAGE=work PARAM_EDGES=no-dev "PARAM_FEATURES=a b" \
+    PARAM_ALL_FEATURES=true PARAM_TARGET= PARAM_OFFLINE=true
+check "passes when nothing forbidden is there" succeeded
+check "saying so" said "Passed: cargo tree's graph holds no forbidden package or feature."
+check "with the selection's options" called cargo tree -p work --features a,b --all-features --edges no-dev --offline --locked \
+    --prefix depth --format $'{p}\t{f}' --color never
+tree_case
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=x PARAM_FROZEN=true PARAM_TARGET=x86_64-unknown-linux-gnu
+check "frozen stands for locked and offline" called_with cargo tree --frozen --target x86_64-unknown-linux-gnu
+
+begin "tree_forbid: a graph that can't be read"
+tree_case
+tree_output partial.txt "0work v0.1.0 (${CASE}/work)|"
+tree_answer '*' partial.txt 101
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=acme PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
+check "a cargo tree that fails (a stale lockfile under --locked) fails the step, even with report_only" failed
+check "rather than read what it printed as a graph without acme" said "ERROR: cargo tree failed (exit code 101), so there is no graph to check."
+check "with cargo's error" said "needs to be updated but --locked was passed"
+check "an error run record with cargo tree's exit code" json_is "${CASE}/out/tree-forbid.run-record.json" '"\(.outcome) \(.exit_code)"' "error 101"
+check "and the call that failed" json_is "${CASE}/out/tree-forbid.run-record.json" '.arguments[:4] | join(" ")' "tree --target all --locked"
+check "listing cargo's log" json_is "${CASE}/out/tree-forbid.run-record.json" '[.reports[].path | split("/")[-1]] | join(" ")' "tree-forbid.tree.txt tree-forbid.cargo.log"
+for broken in empty garbage depth source root; do
+    tree_case
+    case "${broken}" in
+        empty) tree_output out.txt ;;
+        garbage) tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1[build-dependencies]" ;;
+        depth) tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "2acme v1.0.0|" ;;
+        source) tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1acme v1.0.0 (a source cargo never prints)|" ;;
+        root) tree_output out.txt "0elsewhere v0.1.0 (/elsewhere)|" "1acme v1.0.0|" ;;
+    esac
+    tree_answer '*' out.txt
+    run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=nothing-like-it PARAM_REPORT_ONLY=true PARAM_RUN_RECORD=true
+    check "output cargo tree shouldn't print (${broken}) fails the step, even with report_only" failed
+    check "with an error run record" json_is "${CASE}/out/tree-forbid.run-record.json" .outcome error
+done
+check "naming a graph that starts elsewhere" said "ERROR: cargo tree's graph starts at elsewhere v0.1.0, which is not a member of the workspace."
+tree_case
+tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1acme v1.0.0|"
+tree_answer '*' out.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=acme PARAM_PACKAGE=server
+check "and one that doesn't start at package" failed
+check "saying so" said "ERROR: cargo tree's graph starts at work v0.1.0, not at server."
+tree_case
+tree_output out.txt "0work v0.1.0 (${CASE}/work)|" "1[build-dependencies]"
+tree_answer '*' out.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=x
+check "a line that doesn't parse is named" said "ERROR: cargo tree printed a line this command cannot read: 1[build-dependencies]"
+for bad in "PARAM_FORBIDDEN_PACKAGES=" "PARAM_FORBIDDEN_PACKAGES=a/b" "PARAM_FORBIDDEN_FEATURES=writer" "PARAM_EDGES=features" \
+    "PARAM_PACKAGE=https://example.test/x" "PARAM_ONLY_IF_REACHABLE_FROM=server" "PARAM_WORKSPACE=true PARAM_PACKAGE=server"; do
+    tree_case
+    # shellcheck disable=SC2086 # some cases set two parameters
+    run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=x ${bad}
+    check "refuses ${bad#PARAM_}" failed
+    check "before running cargo tree" not_called_with cargo tree
+done
+
+begin "tree_forbid: only_if_reachable"
+tree_case
+tree_output server.txt "0server v0.1.0 (${CASE}/work)|" "1http v1.0.0|"
+tree_graph
+tree_answer '* -p server *' server.txt
+tree_answer '* --workspace *' graph.txt
+run tree_forbid.sh PARAM_WORKSPACE=true PARAM_FORBIDDEN_FEATURES=index:writer PARAM_ONLY_IF_REACHABLE=index \
+    PARAM_ONLY_IF_REACHABLE_FROM=server STUB_MEMBERS=. PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "is skipped when the package isn't reachable from the binary" succeeded
+check "saying so" said "Skipped: index is not in the graph of server, so nothing was checked."
+check "without reading the workspace's graph" not_called_with cargo tree --workspace
+check "the report says skipped, with the reason" json_is "${CASE}/out/tree-forbid.json" '"\(.verdict): \(.reason)"' \
+    "skipped: index is not in the graph of server, so the check does not apply"
+check "JUnit skips the check" file_has "${CASE}/out/junit/tree-forbid.xml" '<skipped message="index is not in the graph of server, so the check does not apply"/>'
+check "and the run record says skipped, not passed" json_is "${CASE}/out/tree-forbid.run-record.json" .outcome skipped
+check "naming the call that decided it" json_is "${CASE}/out/tree-forbid.run-record.json" '.arguments[:3] | join(" ")' "tree -p server"
+tree_case
+tree_output server.txt "0server v0.1.0 (${CASE}/work)|" "1index v0.1.0 (${CASE}/work/crates/index)|default"
+tree_graph
+tree_answer '* -p server *' server.txt
+tree_answer '* --workspace *' graph.txt
+run tree_forbid.sh PARAM_WORKSPACE=true PARAM_FORBIDDEN_FEATURES=index:writer PARAM_ONLY_IF_REACHABLE=index \
+    PARAM_ONLY_IF_REACHABLE_FROM=server
+check "and runs when it is, on the workspace's unified features" failed
+check "finding the feature" said "forbidden: path:index@0.1.0 with feature writer (index:writer)"
+
+DEFAULTS=("${TREE_DEFAULTS[@]}" PARAM_REPORT_NAME=tree-expect PARAM_INVERT= PARAM_DEPTH=1 PARAM_EXPECTED= PARAM_IF_ABSENT=fail)
+
+begin "tree_expect"
+tree_case
+tree_graph
+tree_output paste.txt "0paste v1.0.15 (proc-macro)|" "1utoipa-axum v0.2.0|" "1serde v1.0.200|default (*)"
+tree_answer '* -i paste *' paste.txt
+tree_answer '*' graph.txt
+printf '%s\n' "0work v0.1.0 (${CASE}/work)|default" "1paste v1.0.15 (proc-macro)|" | tr '|' '\t' >> "${CASE}/graph.txt"
+run tree_expect.sh PARAM_INVERT=paste "PARAM_EXPECTED=paste@1.0.15, utoipa-axum@0.2.0 serde@1.0.200" PARAM_EXCEPTION=RUSTSEC-2024-0436 \
+    PARAM_RUN_RECORD=true PARAM_JUNIT=true
+check "passes when the inverted tree is exactly the expected set, in any order" succeeded
+check "reading whether the subject is there from the full graph" called cargo tree --target all --locked --prefix depth --format $'{p}\t{f}' --color never
+check "then the tree around it, down to depth, without deduplication, which can hide a package within depth" \
+    called cargo tree --target all --locked -i paste --depth 1 --no-dedupe --prefix depth --format $'{p}\t{f}' --color never
+check "saying so" said "Passed: cargo tree's graph around paste is the expected one."
+check "keeping both graphs" exists "${CASE}/out/tree-expect.graph.txt"
+check "the report lists the nodes" json_is "${CASE}/out/tree-expect.json" '[.nodes[].key] | join(" ")' "paste@1.0.15 serde@1.0.200 utoipa-axum@0.2.0"
+check "the run record names the call that decided" json_is "${CASE}/out/tree-expect.run-record.json" '.arguments[4:8] | join(" ")' "-i paste --depth 1"
+check "and the exceptions" json_is "${CASE}/out/tree-expect.run-record.json" '.exceptions[0]' RUSTSEC-2024-0436
+tree_case
+tree_graph
+printf '%s\n' "0work v0.1.0 (${CASE}/work)|default" "1paste v1.0.15 (proc-macro)|" | tr '|' '\t' >> "${CASE}/graph.txt"
+tree_output paste.txt "0paste v1.0.15 (proc-macro)|" "1utoipa-axum v0.2.0|" "1new-consumer v0.3.0|"
+tree_answer '* -i paste@1.0.15 *' paste.txt
+tree_answer '*' graph.txt
+run tree_expect.sh PARAM_INVERT=paste@1.0.15 "PARAM_EXPECTED=paste@1.0.15 utoipa-axum@0.2.0 path:gone@0.1.0" PARAM_JUNIT=true
+check "a new dependent, and one that's gone, fail the step" failed
+check "listing them" said "  missing: path:gone@0.1.0"
+check "both kinds" said "  unexpected: new-consumer@0.3.0"
+check "saying how many" said "ERROR: cargo tree's graph around paste@1.0.15 is not the expected one: 1 missing, 1 unexpected."
+check "in the report" json_is "${CASE}/out/tree-expect.json" '"\(.missing | join(",")) \(.unexpected | join(","))"' "path:gone@0.1.0 new-consumer@0.3.0"
+check "and JUnit" file_has "${CASE}/out/junit/tree-expect.xml" '<failure message="missing: path:gone@0.1.0; unexpected: new-consumer@0.3.0">'
+for absent in fail pass; do
+    tree_case
+    tree_graph
+    tree_answer '* -i paste *' "" 101
+    tree_answer '*' graph.txt
+    run tree_expect.sh PARAM_INVERT=paste "PARAM_EXPECTED=paste@1.0.15" "PARAM_IF_ABSENT=${absent}" PARAM_RUN_RECORD=true PARAM_REPORT_ONLY=true
+    check "a subject not in the full graph, with if_absent ${absent}, is read from that graph, not from cargo tree -i's error" \
+        not_called_with cargo tree -i paste
+    check "and the report says absent" json_is "${CASE}/out/tree-expect.json" '"\(.present) \(.verdict)"' "false $([[ "${absent}" == fail ]] && echo failed || echo passed)"
+    check "the run record too" json_is "${CASE}/out/tree-expect.run-record.json" '"\(.outcome) \(.counts.absent)"' \
+        "$([[ "${absent}" == fail ]] && echo findings-reported || echo passed) 1"
+done
+check "if_absent pass says so" said "Passed: paste is not in the graph, which if_absent: pass accepts."
+tree_case
+tree_graph
+tree_answer '*' graph.txt
+run tree_expect.sh PARAM_INVERT=paste "PARAM_EXPECTED=paste@1.0.15"
+check "if_absent fail fails when the edge disappears" failed
+check "saying so" said "ERROR: cargo tree's graph around paste is not the expected one: paste is not in the graph."
+tree_case
+tree_graph
+tree_output webpki.txt "0webpki-roots v0.26.11|" "1webpki-roots v1.0.10|"
+printf '%s\n' "0other v0.1.0 (${CASE}/work)|" "1webpki-roots v0.26.11|" | tr '|' '\t' > "${CASE}/workspace.txt"
+tree_answer '* -p webpki-roots@0.26.11 *' webpki.txt
+tree_answer '* --workspace *' workspace.txt
+run tree_expect.sh PARAM_PACKAGE=webpki-roots@0.26.11 PARAM_EDGES=normal "PARAM_EXPECTED=webpki-roots@0.26.11 webpki-roots@1.0.10"
+check "a workspace graph that starts at a package outside the workspace fails" failed
+check "saying so" said "ERROR: cargo tree's graph starts at other v0.1.0, which is not a member of the workspace."
+tree_case
+tree_output webpki.txt "0webpki-roots v0.26.11|" "1webpki-roots v1.0.10|"
+printf '%s\n' "0work v0.1.0 (${CASE}/work)|" "1webpki-roots v0.26.11|" | tr '|' '\t' > "${CASE}/workspace.txt"
+tree_answer '* -p webpki-roots@0.26.11 *' webpki.txt
+tree_answer '* --workspace *' workspace.txt
+run tree_expect.sh PARAM_PACKAGE=webpki-roots@0.26.11 PARAM_EDGES=normal "PARAM_EXPECTED=webpki-roots@0.26.11 webpki-roots@1.0.10"
+check "runs forward from package" succeeded
+check "finding the package in the workspace's graph first" called_with cargo tree --workspace --edges normal
+check "then reading its tree" called_with cargo tree -p webpki-roots@0.26.11 --edges normal --depth 1
+
+begin "tree_expect: {root} and several manifests"
+tree_case
+mkdir -p "${CASE}/work/fuzz/a" "${CASE}/work/fuzz/b"
+for m in a b; do
+    echo "[package]" > "${CASE}/work/fuzz/${m}/Cargo.toml"
+    echo "# lockfile" > "${CASE}/work/fuzz/${m}/Cargo.lock"
+    tree_output "graph-${m}.txt" "0${m} v0.1.0 (${CASE}/work/fuzz/${m})|" "1libfuzzer-sys v0.4.13|"
+    tree_output "inverted-${m}.txt" "0libfuzzer-sys v0.4.13|" "1${m} v0.1.0 (${CASE}/work/fuzz/${m})|"
+    tree_answer "* --manifest-path fuzz/${m}/Cargo.toml * -i libfuzzer-sys *" "inverted-${m}.txt"
+    tree_answer "* --manifest-path fuzz/${m}/Cargo.toml *" "graph-${m}.txt"
+done
+run tree_expect.sh "PARAM_MANIFEST_PATHS=fuzz/*/Cargo.toml" PARAM_INVERT=libfuzzer-sys "PARAM_EXPECTED=libfuzzer-sys@0.4.13 {root}" \
+    PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "{root} is each manifest's own package" succeeded
+check "resolved per manifest" json_is "${CASE}/out/tree-expect-fuzz-b.json" '.expected | join(" ")' "libfuzzer-sys@0.4.13 path:b@0.1.0"
+check "an index lists them" json_is "${CASE}/out/tree-expect.json" '[.selections[] | "\(.slug) \(.verdict)"] | join(", ")' "fuzz-a passed, fuzz-b passed"
+check "JUnit has a suite each" file_has "${CASE}/out/junit/tree-expect.xml" '<testsuite name="tree-expect-fuzz-a"'
+check "the run record lists every lockfile" json_is "${CASE}/out/tree-expect.run-record.json" '[.inputs[] | select(.role == "lockfile")] | length' 2
+tree_case
+tree_output graph.txt "0work v0.1.0 (${CASE}/work)|" "1x v1.0.0|" "" "0tool v0.1.0 (${CASE}/work/tool)|" "1x v1.0.0|"
+tree_output inverted.txt "0x v1.0.0|" "1work v0.1.0 (${CASE}/work)|" "1tool v0.1.0 (${CASE}/work/tool)|"
+tree_answer '* -i x *' inverted.txt
+tree_answer '*' graph.txt
+mkdir -p "${CASE}/work/tool"
+run tree_expect.sh PARAM_WORKSPACE=true PARAM_INVERT=x "PARAM_EXPECTED=x@1.0.0 {root}" "STUB_MEMBERS=. tool"
+check "{root} with a workspace's several roots fails" failed
+check "saying why" said "{root} needs a selection with one root package"
+tree_case
+tree_output graph.txt "0work v0.1.0 (${CASE}/work)|" "1x v1.0.0|" "" "0tool v0.1.0 (${CASE}/work/tool)|"
+tree_answer '*' graph.txt
+mkdir -p "${CASE}/work/tool" "${CASE}/work/other"
+run tree_expect.sh PARAM_WORKSPACE=true PARAM_INVERT=x "PARAM_EXPECTED=x@1.0.0" "STUB_MEMBERS=. tool other"
+check "a workspace graph that leaves out a member fails" failed
+check "naming it" said "it leaves out other@0.1.0"
+for bad in "PARAM_EXPECTED=" "PARAM_EXPECTED=paste" "PARAM_EXPECTED=crates:x@1.0.0" "PARAM_DEPTH=one" "PARAM_IF_ABSENT=maybe" "PARAM_INVERT=a@b@c"; do
+    tree_case
+    run tree_expect.sh PARAM_INVERT=x PARAM_EXPECTED=x@1.0.0 "${bad}"
+    check "refuses ${bad#PARAM_}" failed
+    check "before running cargo tree" not_called_with cargo tree
+done
+tree_case
+run tree_expect.sh PARAM_INVERT=x PARAM_EXPECTED=x@1.0.0 "PATH=$(path_without cargo)"
+check "needs cargo" failed
+check "saying so" said "ERROR: cargo is not on the PATH"
+
 # --- the helpers
 begin "helpers"
 LIB_TEST() {
@@ -2226,7 +3008,7 @@ check "and escapes what XML needs escaped" python3 -c 'import sys, xml.dom.minid
 begin "run records follow schemas/run-record.v1.json"
 mapfile -t RECORDS < <(find "${WORK}" -name '*.run-record.json' | sort)
 check "the tests wrote run records for every command" test "$(for f in "${RECORDS[@]}"; do jq -r .command "${f}"; done | sort -u | tr '\n' ' ')" \
-    = "audit audit_bin deny licenses sbom verify_auditable vet "
+    = "audit audit_bin deny licenses sbom tree_expect tree_forbid verify_auditable vet "
 OUTPUT=$(python3 -I - "${ROOT}/schemas/run-record.v1.json" "${RECORDS[@]}" 2>&1 << 'PY'
 import json, sys
 try:

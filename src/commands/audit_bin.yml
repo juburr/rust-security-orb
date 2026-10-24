@@ -23,9 +23,18 @@ parameters:
     type: boolean
     default: false
     description: >
-      Count a binary without cargo-auditable data that decodes as a finding, since cargo audit
-      can only guess its dependencies from panic messages. Needs rust-audit-info (in the
-      install command's tools).
+      Count a binary without cargo-auditable data that decodes, with the shape cargo auditable
+      writes, as a finding, since cargo audit can only guess its dependencies from panic
+      messages. Reads it with decoder: rust-audit-info (in the install command's tools), or
+      the native decoder, which needs only python3.
+  decoder:
+    type: enum
+    enum: ["auto", "native", "rust-audit-info"]
+    default: auto
+    description: >
+      What reads each binary's .dep-v0 section for require_auditable, as for verify_auditable:
+      rust-audit-info, native (python3, no Rust toolchain, ELF of any architecture), or auto,
+      a verified rust-audit-info or else native.
   db_path:
     type: string
     default: ""
@@ -70,6 +79,15 @@ parameters:
     description: >
       Skip the check for yanked crates (cargo audit --no-yanked, cargo-audit 0.22.2 and
       later), which otherwise queries the crates.io index.
+  unused_ignores:
+    type: enum
+    enum: ["allow", "warn", "deny"]
+    default: allow
+    description: >
+      What to do about an ignore (in the audit.toml cargo audit reads, or --ignore in extra_args)
+      that matches no finding in any of the binaries: allow, the default, doesn't check; warn
+      reports each one; deny also fails the step. Each binary is audited again, offline, without
+      the ignores, as audit's unused_ignores does. Writes <report_name>.ignores.json.
   extra_args:
     type: string
     default: ""
@@ -125,12 +143,13 @@ parameters:
       fails.
 steps:
   - run:
-      name: cargo audit bin
+      name: cargo audit bin (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_ALLOW_STALE: << parameters.allow_stale >>
         PARAM_BINARIES: << parameters.binaries >>
         PARAM_DB_PATH: << parameters.db_path >>
+        PARAM_DECODER: << parameters.decoder >>
         PARAM_DENY: << parameters.deny >>
         PARAM_EXTRA_ARGS: << parameters.extra_args >>
         PARAM_JUNIT: << parameters.junit >>
@@ -144,6 +163,8 @@ steps:
         PARAM_SARIF: << parameters.sarif >>
         PARAM_TARGET_ARCH: << parameters.target_arch >>
         PARAM_TARGET_OS: << parameters.target_os >>
+        PARAM_UNUSED_IGNORES: << parameters.unused_ignores >>
+        SCRIPT_DEP_V0_PY: << include(scripts/lib/dep_v0.py) >>
         SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
       command: << include(scripts/audit_bin.sh) >>
   - when:

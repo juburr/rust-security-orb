@@ -204,12 +204,115 @@ rs_tool() {
 # rs_tool_verified NAME PATH: warns unless PATH is a NAME this orb's install
 # command verified, as the install record it leaves beside the binary says.
 rs_tool_verified() {
+    if ! rs_is_verified "$1" "$2"; then
+        echo "WARN: $2 is not the $1 this orb's install command verified against its checksum table." >&2
+        echo "WARN: Install $1 with the install command, and put its install_path first on the PATH, to run a verified one." >&2
+    fi
+}
+
+# rs_is_verified NAME PATH: whether PATH is a NAME this orb's install command
+# verified.
+rs_is_verified() {
     local record sha
     record="$(dirname "$2")/.$1.install.json"
     sha=$(sha512sum -- "$2" 2> /dev/null | awk '{ print $1 }') || sha=""
-    if [[ -z "${sha}" || ! -f "${record}" ]] || ! grep -qF "\"binary_sha512\":\"${sha}\"" "${record}"; then
-        echo "WARN: $2 is not the $1 this orb's install command verified against its checksum table." >&2
-        echo "WARN: Install $1 with the install command, and put its install_path first on the PATH, to run a verified one." >&2
+    [[ -n "${sha}" && -f "${record}" ]] && grep -qF "\"binary_sha512\":\"${sha}\"" "${record}"
+}
+
+# The shape cargo auditable's dependency list has, as jq: a format, when there
+# is one, that is a whole number (cargo auditable before 0.7 writes none, and
+# never writes 0); a non-empty packages array of objects with a name, version
+# and source, exactly one of them the root; and dependencies that are indices
+# into packages. rust-audit-info checks none of it, so it is checked here for
+# both decoders.
+# shellcheck disable=SC2016 # jq program, not shell
+RS_DEP_V0_SHAPE='type == "object" and ((has("format") | not) or (.format | type == "number" and . == floor and . >= 0))
+    and (.packages | type == "array" and length > 0)
+    and all(.packages[]; type == "object" and (.name | type == "string") and (.version | type == "string") and (.source | type == "string"))
+    and ([.packages[] | select(.root == true)] | length == 1)
+    and ((.packages | length) as $n | all(.packages[]; (.dependencies // []) | type == "array"
+        and all(.[]; type == "number" and . == floor and . >= 0 and . < $n)))'
+
+# rs_decoder VALUE: picks how the dependency list cargo auditable embeds in a
+# binary (its .dep-v0 section) is read: decoder VALUE is rust-audit-info, the
+# tool the install command builds from source; native, the orb's own decoder
+# (scripts/lib/dep_v0.py, passed as SCRIPT_DEP_V0_PY), which needs only
+# python3 and reads ELF binaries of any architecture; or auto, which takes a
+# rust-audit-info the install command verified, or else native, or else an
+# unverified rust-audit-info, with a warning. Sets RS_DECODER (native or
+# rust-audit-info) and RS_DECODER_TOOL (the binary that runs), and for native,
+# RS_PROGRAM_PATH, RS_PROGRAM_NAME and RS_PROGRAM_SHA256 for the run record.
+rs_decoder() {
+    local tool python
+    RS_DECODER=""
+    RS_DECODER_TOOL=""
+    case "$1" in
+        auto | native | rust-audit-info) ;;
+        *)
+            echo "ERROR: decoder must be auto, native or rust-audit-info, not '$1'." >&2
+            exit 1
+            ;;
+    esac
+    tool=$(command -v rust-audit-info) || tool=""
+    python=$(command -v python3) || python=""
+    # rust-audit-info when asked for, or with auto when the install command
+    # verified it.
+    if [[ -n "${tool}" ]] && { [[ "$1" == rust-audit-info ]] || { [[ "$1" == auto ]] && rs_is_verified rust-audit-info "${tool}"; }; }; then
+        rs_tool_verified rust-audit-info "${tool}"
+        RS_DECODER=rust-audit-info
+        RS_DECODER_TOOL=${tool}
+        return 0
+    fi
+    if [[ "$1" != rust-audit-info && -n "${python}" ]]; then
+        if [[ -z "${SCRIPT_DEP_V0_PY:-}" ]]; then
+            echo "ERROR: The native decoder was not loaded: SCRIPT_DEP_V0_PY is empty." >&2
+            exit 1
+        fi
+        RS_DECODER=native
+        RS_DECODER_TOOL=${python}
+        RS_PROGRAM_PATH=${python}
+        # shellcheck disable=SC2034 # read by rs_tool_json
+        RS_PROGRAM_NAME=dep_v0.py
+        # shellcheck disable=SC2034 # read by rs_tool_json
+        # As the file is in the orb's source, ending in one newline, whatever
+        # the step's environment kept of it.
+        RS_PROGRAM_SHA256=$(printf '%s\n' "$(printf '%s' "${SCRIPT_DEP_V0_PY}")" | sha256sum | awk '{ print $1 }')
+        return 0
+    fi
+    # auto without python3 takes the rust-audit-info there is, verified or not.
+    if [[ "$1" == auto && -n "${tool}" ]]; then
+        rs_tool_verified rust-audit-info "${tool}"
+        RS_DECODER=rust-audit-info
+        RS_DECODER_TOOL=${tool}
+        return 0
+    fi
+    case "$1" in
+        rust-audit-info) echo "ERROR: decoder rust-audit-info needs rust-audit-info, which is not on the PATH. Add" >&2 ;;
+        native) echo "ERROR: decoder native needs python3, which is not on the PATH. Install Python 3 in an earlier step, or add" >&2 ;;
+        *) echo "ERROR: Reading cargo-auditable data needs rust-audit-info or python3, and neither is on the PATH. Add" >&2 ;;
+    esac
+    echo "  rust-audit-info to the install command's tools (it builds with cargo), or install Python 3 for decoder: native." >&2
+    exit 1
+}
+
+# rs_decode BINARY OUTPUT LOG: writes the dependency list BINARY carries to
+# OUTPUT with RS_DECODER, and returns 0 when it decodes and has the shape
+# cargo auditable writes, 1 (with the reason in LOG) when there is none or it
+# doesn't, and 2 (with the reason in LOG) when the decoder can't tell, such as
+# for a file the native decoder can't read (it reads ELF only).
+rs_decode() {
+    local rc=0
+    if [[ "${RS_DECODER}" == native ]]; then
+        "${RS_DECODER_TOOL}" -I -c "${SCRIPT_DEP_V0_PY}" "$1" > "$2" 2> "$3" || rc=$?
+        if [[ "${rc}" -ne 0 ]]; then
+            return $((rc == 1 ? 1 : 2))
+        fi
+    elif ! "${RS_DECODER_TOOL}" "$1" > "$2" 2> "$3"; then
+        return 1
+    fi
+    if ! rs_json_is "$2" "${RS_DEP_V0_SHAPE}"; then
+        echo "Its dependency list is not the JSON cargo auditable writes: packages, one root, dependencies within them." > "$3"
+        return 1
     fi
 }
 
@@ -256,6 +359,77 @@ rs_list() {
     fi
     # shellcheck disable=SC2034 # read by the script that evals this file
     read -r -a RS_LIST <<< "${value//,/ }"
+}
+
+# rs_list_lines PARAMETER VALUE: as rs_list, but newlines separate items too,
+# for lists that run long, such as files and dependency-graph node sets.
+rs_list_lines() {
+    local value
+    RS_LIST=()
+    value=$(rs_subst "$2")
+    value=${value//[$'\n\r\t']/ }
+    # shellcheck disable=SC2034 # read by the script that evals this file
+    read -r -a RS_LIST <<< "${value//,/ }"
+}
+
+# rs_files PARAMETER: sets RS_FILES to the files RS_LIST names, with shell
+# patterns expanded, each file once, in order. A pattern that matches
+# nothing, and a name that isn't a file, stop the step: a file that isn't
+# there can't pass a check. A name that starts with "-" becomes ./<name>,
+# which no tool reads as an option.
+rs_files() {
+    local pattern file restore=false
+    local -a matches=()
+    local -A seen=()
+    RS_FILES=()
+    if ! shopt -q nullglob; then
+        restore=true
+        shopt -s nullglob
+    fi
+    for pattern in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        # The pattern is expanded here on purpose.
+        # shellcheck disable=SC2206
+        matches=(${pattern})
+        if [[ ${#matches[@]} -eq 0 ]]; then
+            echo "ERROR: $1 names ${pattern}, which matches no file (in $(pwd))." >&2
+            exit 1
+        fi
+        for file in "${matches[@]}"; do
+            if [[ ! -f "${file}" ]]; then
+                echo "ERROR: $1 names ${file}, which is not a file (in $(pwd))." >&2
+                exit 1
+            fi
+            if [[ "${file}" == -* ]]; then
+                file="./${file}"
+            fi
+            if [[ -z "${seen[${file}]:-}" ]]; then
+                seen[${file}]=1
+                RS_FILES+=("${file}")
+            fi
+        done
+    done
+    if [[ "${restore}" == true ]]; then
+        shopt -u nullglob
+    fi
+}
+
+# rs_slug PATH NAME: sets RS_SLUG to the name the reports for the input PATH
+# get in a run over several inputs, <report_name>-<slug>: PATH relative to
+# the working directory, without a last component NAME (Cargo.lock or
+# Cargo.toml), with / as -, characters a report name can't hold as _, and
+# root for the working directory itself.
+rs_slug() {
+    # In other locales [^A-Za-z0-9] can leave letters such as é alone.
+    local path LC_ALL=C
+    path=$(realpath -m -s --relative-to=. -- "$1" 2> /dev/null) || path=$1
+    if [[ "${path}" == "$2" ]]; then
+        path=""
+    fi
+    path=${path%/"$2"}
+    path=${path//\//-}
+    path=${path//[^A-Za-z0-9._-]/_}
+    # shellcheck disable=SC2034 # read by the script that evals this file
+    RS_SLUG=${path:-root}
 }
 
 # rs_sha256 FILE: prints FILE's SHA-256.
@@ -313,23 +487,31 @@ rs_db_fresh() {
 #    "message": ..., "detail": ...}
 # A run with no cases gets one passing case, so the tab shows it ran.
 rs_junit() {
+    # shellcheck disable=SC2016 # jq program, not shell
+    rs_junit_suites "$1" "$(jq -c --arg suite "$2" '[{name: $suite, cases: .}]' <<< "$3")"
+}
+
+# rs_junit_suites FILE SUITES: writes JUnit XML as rs_junit does, with one
+# test suite per input of a command that checks several: SUITES is a JSON
+# array of {"name": ..., "cases": CASES}.
+rs_junit_suites() {
     local dir=${1%/*}
     mkdir -p "${dir}"
-    # shellcheck disable=SC2016 # jq program, not shell
-    jq -r --arg suite "$2" '
-        (if length == 0 then [{classname: $suite, name: "no findings", status: "passed"}] else . end) as $cases
-        | "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-          "<testsuites>",
-          "  <testsuite name=\"\($suite | @html)\" tests=\"\($cases | length)\" failures=\"\([$cases[] | select(.status == "failed")] | length)\" skipped=\"\([$cases[] | select(.status == "skipped")] | length)\">",
-          ($cases[] |
-            "    <testcase classname=\"\(.classname | @html)\" name=\"\(.name | @html)\">"
-            + (if .status == "failed" then "<failure message=\"\((.message // "") | @html)\">\((.detail // "") | @html)</failure>"
-               elif .status == "skipped" then "<skipped message=\"\((.message // "") | @html)\"/>"
-               else "" end)
-            + "</testcase>"),
-          "  </testsuite>",
-          "</testsuites>"
-    ' <<< "$3" > "$1"
+    jq -r '
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<testsuites>",
+        (.[] | .name as $suite
+          | (if (.cases | length) == 0 then [{classname: $suite, name: "no findings", status: "passed"}] else .cases end) as $cases
+          | "  <testsuite name=\"\($suite | @html)\" tests=\"\($cases | length)\" failures=\"\([$cases[] | select(.status == "failed")] | length)\" skipped=\"\([$cases[] | select(.status == "skipped")] | length)\">",
+            ($cases[] |
+              "    <testcase classname=\"\(.classname | @html)\" name=\"\(.name | @html)\">"
+              + (if .status == "failed" then "<failure message=\"\((.message // "") | @html)\">\((.detail // "") | @html)</failure>"
+                 elif .status == "skipped" then "<skipped message=\"\((.message // "") | @html)\"/>"
+                 else "" end)
+              + "</testcase>"),
+            "  </testsuite>"),
+        "</testsuites>"
+    ' <<< "$2" > "$1"
 }
 
 # rs_gate FINDINGS REPORT_ONLY SUMMARY: ends a check. Without findings it
@@ -363,10 +545,13 @@ rs_gate() {
 #   RS_REPORTS       the report files written
 #   RS_DB            the advisory database directory used, if any
 #   RS_COUNTS        a JSON object of the command's counts
-# OUTCOME is passed, findings, findings-reported (findings with report_only)
-# or error.
+#   RS_EXCEPTIONS    the exceptions a check guards, as a JSON array (the
+#                    tree commands); the record has no exceptions without it
+# OUTCOME is passed, findings, findings-reported (findings with report_only),
+# skipped (a check whose precondition didn't hold) or error.
 rs_run_record() {
     local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url match
+    local -A listed=()
     rs_path_manifest_inputs
     case "$2" in
         deny | licenses | sbom) rs_license_inputs ;;
@@ -379,11 +564,18 @@ rs_run_record() {
             sha=$(rs_sha256 "${path}")
             path=$(cd "$(dirname "${path}")" && pwd)/${path##*/}
         fi
+        # A command that checks several inputs can find the same file for
+        # more than one, such as a shared config.
+        if [[ -n "${listed[${role}:${path}]:-}" ]]; then
+            continue
+        fi
+        listed[${role}:${path}]=1
         inputs=$(jq -c --arg role "${role}" --arg path "${path}" --arg sha "${sha}" \
             '. + [{role: $role, path: $path, sha256: (if $sha == "" then null else $sha end)}]' <<< "${inputs}")
     done
     for path in ${RS_REPORTS[@]+"${RS_REPORTS[@]}"}; do
-        if [[ -f "${path}" ]]; then
+        if [[ -f "${path}" && -z "${listed[report:${path}]:-}" ]]; then
+            listed[report:${path}]=1
             reports=$(jq -c --arg path "${path}" --arg sha "$(rs_sha256 "${path}")" '. + [{path: $path, sha256: $sha}]' <<< "${reports}")
         fi
     done
@@ -414,18 +606,9 @@ rs_run_record() {
             '{path: $path, url: (if $url == "" then null else $url end), commit: (if $commit == "" then null else $commit end),
                 commit_time: (if $time == "" then null else $time end), files_match_commit: $match}')
     fi
-    # NUL-separated, so arguments that start with "-" never reach jq's own
-    # option parsing. A URL among them, such as cargo audit's --url from
-    # extra_args, loses its userinfo, query and fragment, as the database's
-    # URL does.
-    args="[]"
-    if [[ -n "${RS_ARGS[*]+set}" ]]; then
-        # Ended by a word rather than a NUL, which jq 1.6 drops from the
-        # end of raw input.
-        args=$({ printf '%s\0' "${RS_ARGS[@]}"; printf 'end'; } | jq -Rsc 'split("\u0000") | .[:-1]
-            | map(gsub("(?<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/?#\\s]*@"; "\(.scheme)")
-                | gsub("(?<url>[A-Za-z][A-Za-z0-9+.-]*://[^?#\\s]*)[?#]\\S*"; "\(.url)"))')
-    fi
+    # A URL among the arguments, such as cargo audit's --url from extra_args,
+    # loses its userinfo, query and fragment, as the database's URL does.
+    args=$(rs_public_args ${RS_ARGS[@]+"${RS_ARGS[@]}"})
     toolchain=$(jq -cn --arg cargo "$(cargo --version 2> /dev/null || true)" --arg rustc "$(rustc --version 2> /dev/null || true)" \
         '{cargo: (if $cargo == "" then null else $cargo end), rustc: (if $rustc == "" then null else $rustc end)}')
     if ! jq -n --arg command "$2" --arg outcome "$3" --argjson code "$4" --arg started "$5" \
@@ -433,7 +616,7 @@ rs_run_record() {
         --argjson tool "${tool_json}" --argjson others "${others}" --argjson toolchain "${toolchain}" --argjson db "${db_json}" \
         --argjson inputs "${inputs}" --argjson reports "${reports}" --argjson counts "${RS_COUNTS:-null}" \
         --arg build_url "${CIRCLE_BUILD_URL:-}" --arg sha1 "${CIRCLE_SHA1:-}" --arg job "${CIRCLE_JOB:-}" \
-        --argjson args "${args}" '{
+        --argjson args "${args}" --argjson exceptions "${RS_EXCEPTIONS:-null}" '{
             schema: "https://github.com/juburr/rust-security-orb/blob/main/schemas/run-record.v1.json",
             command: $command, outcome: $outcome, exit_code: $code,
             started_at: $started, finished_at: $finished,
@@ -441,18 +624,43 @@ rs_run_record() {
             working_directory: $cwd,
             tool: $tool, other_tools: $others, arguments: $args, toolchain: $toolchain,
             advisory_db: $db, inputs: $inputs, counts: $counts, reports: $reports
-        }' > "${file}"; then
+        } + (if $exceptions == null then {} else {exceptions: $exceptions} end)' > "${file}"; then
         echo "WARN: Could not write the run record ${file}." >&2
         return 0
     fi
     echo "Run record: ${file}"
 }
 
+# rs_public_args ARG...: prints the arguments as a JSON array, with every URL
+# in them stripped of its userinfo, query and fragment, which can hold
+# credentials (https://user:token@host/... or ?access_token=...). They reach
+# jq NUL-separated, so an argument that starts with "-" never reaches jq's
+# own option parsing.
+rs_public_args() {
+    # Bash 4.0 calls an empty "$@" unbound under set -u.
+    if [[ $# -eq 0 ]]; then
+        echo "[]"
+        return 0
+    fi
+    # Ended by a word rather than a NUL, which jq 1.6 drops from the end of
+    # raw input.
+    { printf '%s\0' "$@"; printf 'end'; } | jq -Rsc 'split("\u0000") | .[:-1]
+        | map(gsub("(?<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/?#\\s]*@"; "\(.scheme)")
+            | gsub("(?<url>[A-Za-z][A-Za-z0-9+.-]*://[^?#\\s]*)[?#]\\S*"; "\(.url)"))'
+}
+
+# rs_show_command PROGRAM ARG...: prints the command a step runs, as one line
+# a shell would read back, with URLs stripped as in run records, so a failed
+# job's log says exactly what ran.
+rs_show_command() {
+    echo "Running: $(rs_public_args "$@" | jq -r 'map(if test("^[A-Za-z0-9_@%+=:,./{}-]+$") then . else @sh end) | join(" ")')"
+}
+
 # rs_tool_json PATH VERSION: describes a binary that ran for the run record:
 # its SHA-512, and how the orb installed it, from the install record beside
 # it when that record describes this very binary.
 rs_tool_json() {
-    local sha="" install="null" entry
+    local sha="" install="null" entry program="null"
     if [[ -n "$1" && -f "$1" ]]; then
         # Without sha512sum the record says so with a null SHA-512, as rs_tool
         # only warns.
@@ -463,8 +671,14 @@ rs_tool_json() {
             install=$(jq -c 'del(.binary_sha512)' "${entry}")
         fi
     fi
+    # An interpreter that ran a program of the orb's, such as python3 the
+    # native .dep-v0 decoder: the program, by its SHA-256.
+    if [[ -n "$1" && "$1" == "${RS_PROGRAM_PATH:-}" ]]; then
+        program=$(jq -cn --arg name "${RS_PROGRAM_NAME}" --arg sha "${RS_PROGRAM_SHA256}" '{name: $name, sha256: $sha}')
+    fi
     jq -cn --arg name "${1##*/}" --arg path "$1" --arg version "$2" --arg sha "${sha}" --argjson install "${install}" \
-        '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end), install: $install}'
+        --argjson program "${program}" '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end),
+            install: $install} + (if $program == null then {} else {program: $program} end)'
 }
 
 # rs_manifest_inputs METADATA: adds the workspace's manifests to RS_INPUTS,
@@ -544,67 +758,80 @@ rs_db_files_match() {
     fi
 }
 
-# rs_path_manifest_inputs: when RS_INPUTS lists manifests, adds those of the
-# lockfile's other path packages: path dependencies outside the workspace,
-# and [patch] and [replace] paths. Their package metadata (licence, publish,
-# description) shapes what the tools report, and changing it changes neither
-# the lockfile nor the workspace's manifests. cargo pkgid finds each one's
-# directory from the lockfile alone, without the network. rs_run_record runs
-# it, since cargo can write the lockfile during the run.
+# rs_path_manifest_inputs: when RS_INPUTS lists manifests, adds those of
+# each lockfile's other path packages: path dependencies outside its
+# workspace, and [patch] and [replace] paths. Their package metadata
+# (licence, publish, description) shapes what the tools report, and changing
+# it changes neither the lockfile nor the workspace's manifests. cargo pkgid
+# finds each one's directory from the lockfile alone, without the network.
+# rs_run_record runs it, since cargo can write the lockfile during the run.
 rs_path_manifest_inputs() {
-    local entry lockfile="" manifests=false root spec id encoded dir byte
-    local -A known=() members=()
+    local entry lockfile manifests=false root spec id encoded dir byte
+    local -a lockfiles=()
+    local -A known=() seen=() members=()
     for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
         case "${entry}" in
             manifest:*)
                 manifests=true
                 known[${entry#manifest:}]=1
                 ;;
-            lockfile:*) lockfile=${entry#lockfile:} ;;
+            lockfile:*)
+                # Several with deny's and the tree commands' manifest_paths,
+                # one per workspace.
+                if [[ -z "${seen[${entry#lockfile:}]:-}" ]]; then
+                    seen[${entry#lockfile:}]=1
+                    lockfiles+=("${entry#lockfile:}")
+                fi
+                ;;
         esac
     done
-    if [[ "${manifests}" != true || ! -f "${lockfile}" ]] || ! command -v cargo > /dev/null 2>&1; then
+    if [[ "${manifests}" != true ]] || ! command -v cargo > /dev/null 2>&1; then
         return 0
     fi
-    root=$(cd "$(dirname "${lockfile}")" && pwd) || return 0
-    # The workspace's own packages are listed already, and cargo pkgid takes
-    # a while, so it only looks up the others.
-    while IFS= read -r spec; do
-        if [[ -n "${spec}" ]]; then
-            members[${spec}]=1
-        fi
-    done < <(cargo metadata --no-deps --format-version 1 --manifest-path "${root}/Cargo.toml" 2> /dev/null \
-        | jq -r '.packages[]? | "\(.name)@\(.version)"' 2> /dev/null)
-    # Packages without a source are path packages; [[patch.unused]] entries
-    # are not packages.
-    while IFS= read -r spec; do
-        if [[ -n "${members[${spec}]:-}" ]] \
-            || ! id=$(cargo pkgid --offline --manifest-path "${root}/Cargo.toml" "${spec}" 2> /dev/null) \
-            || ! rs_match "${id}" '^(path\+)?file://(/[^#]*)'; then
+    for lockfile in ${lockfiles[@]+"${lockfiles[@]}"}; do
+        if [[ ! -f "${lockfile}" ]] || ! root=$(cd "$(dirname "${lockfile}")" && pwd); then
             continue
         fi
-        encoded=${BASH_REMATCH[2]}
-        dir=""
-        while rs_match "${encoded}" '^([^%]*)%([0-9A-Fa-f]{2})(.*)$'; do
-            printf -v byte '%b' "\\x${BASH_REMATCH[2]}"
-            dir+=${BASH_REMATCH[1]}${byte}
-            encoded=${BASH_REMATCH[3]}
-        done
-        dir+=${encoded}
-        if [[ -z "${known[${dir%/}/Cargo.toml]:-}" ]]; then
-            known[${dir%/}/Cargo.toml]=1
-            RS_INPUTS+=("manifest:${dir%/}/Cargo.toml")
-        fi
-    done < <(awk '
-        function flush() {
-            if (package && name != "" && source == "") print name "@" version
-            package = 0; name = version = source = ""
-        }
-        /^\[/ { flush(); package = ($0 ~ /^\[\[package\]\][ \t]*$/); next }
-        package && /^name = "/ { name = $0; sub(/^name = "/, "", name); sub(/"[ \t]*$/, "", name) }
-        package && /^version = "/ { version = $0; sub(/^version = "/, "", version); sub(/"[ \t]*$/, "", version) }
-        package && /^source = / { source = "yes" }
-        END { flush() }' "${lockfile}")
+        # The workspace's own packages are listed already, and cargo pkgid
+        # takes a while, so it only looks up the others.
+        members=()
+        while IFS= read -r spec; do
+            if [[ -n "${spec}" ]]; then
+                members[${spec}]=1
+            fi
+        done < <(cargo metadata --no-deps --format-version 1 --manifest-path "${root}/Cargo.toml" 2> /dev/null \
+            | jq -r '.packages[]? | "\(.name)@\(.version)"' 2> /dev/null)
+        # Packages without a source are path packages; [[patch.unused]]
+        # entries are not packages.
+        while IFS= read -r spec; do
+            if [[ -n "${members[${spec}]:-}" ]] \
+                || ! id=$(cargo pkgid --offline --manifest-path "${root}/Cargo.toml" "${spec}" 2> /dev/null) \
+                || ! rs_match "${id}" '^(path\+)?file://(/[^#]*)'; then
+                continue
+            fi
+            encoded=${BASH_REMATCH[2]}
+            dir=""
+            while rs_match "${encoded}" '^([^%]*)%([0-9A-Fa-f]{2})(.*)$'; do
+                printf -v byte '%b' "\\x${BASH_REMATCH[2]}"
+                dir+=${BASH_REMATCH[1]}${byte}
+                encoded=${BASH_REMATCH[3]}
+            done
+            dir+=${encoded}
+            if [[ -z "${known[${dir%/}/Cargo.toml]:-}" ]]; then
+                known[${dir%/}/Cargo.toml]=1
+                RS_INPUTS+=("manifest:${dir%/}/Cargo.toml")
+            fi
+        done < <(awk '
+            function flush() {
+                if (package && name != "" && source == "") print name "@" version
+                package = 0; name = version = source = ""
+            }
+            /^\[/ { flush(); package = ($0 ~ /^\[\[package\]\][ \t]*$/); next }
+            package && /^name = "/ { name = $0; sub(/^name = "/, "", name); sub(/"[ \t]*$/, "", name) }
+            package && /^version = "/ { version = $0; sub(/^version = "/, "", version); sub(/"[ \t]*$/, "", version) }
+            package && /^source = / { source = "yes" }
+            END { flush() }' "${lockfile}")
+    done
 }
 
 # rs_license_inputs: adds to RS_INPUTS the licence files of the local
@@ -1389,6 +1616,272 @@ rs_audit_config() {
                 buf = substr(buf, RSTART + RLENGTH)
             }
         }' "${RS_AUDIT_CONFIG}")
+}
+
+# rs_audit_ignores_prepare MODE DIR: for unused_ignores MODE (allow, warn or
+# deny, as for cargo-deny's unused-ignored-advisory), sets RS_IGNORES to the
+# ignores cargo audit applies, as a JSON array of {id, source}: those in the
+# audit.toml it reads (RS_AUDIT_CONFIG, advisories.ignore by its full dotted
+# name, an array that can span lines and hold comments) and those --ignore in
+# extra_args adds. With MODE allow it does nothing. Writes DIR/.cargo/audit.toml, a copy of that config without
+# advisories.ignore, which shadows $CARGO_HOME/audit.toml for a cargo audit
+# run in DIR, and sets RS_EXTRA_KEEP to extra_args without --ignore. A config
+# it can't rewrite with certainty (an inline advisories table, a multiline or
+# escaped string, anything but strings in the array) stops the step: an
+# unused ignore must never go unreported because the check couldn't run.
+rs_audit_ignores_prepare() {
+    local line value=false word
+    local -a ids=()
+    case "$1" in
+        allow) return 0 ;;
+        warn | deny) ;;
+        *)
+            echo "ERROR: unused_ignores must be allow, warn or deny, not '$1'." >&2
+            exit 1
+            ;;
+    esac
+    mkdir -p "$2/.cargo"
+    : > "$2/.cargo/audit.toml"
+    RS_IGNORES="[]"
+    if [[ -n "${RS_AUDIT_CONFIG}" ]]; then
+        while IFS= read -r line; do
+            case "${line}" in
+                "id "*) ids+=("${line#id }") ;;
+                "error "*)
+                    echo "ERROR: unused_ignores can't read ${RS_AUDIT_CONFIG}'s advisories.ignore exactly: ${line#error }." >&2
+                    echo "  Write it as a list of plain \"...\" or '...' strings under [advisories] (or as advisories.ignore), so the" >&2
+                    echo "  ignores can be checked." >&2
+                    exit 1
+                    ;;
+            esac
+        done < <(awk -v q="'" -v out="$2/.cargo/audit.toml" "${RS_TOML_AWK}"'
+            # scan(text): reads the ignore array from text, printing
+            # "id <string>" for each string, and leaves it when a ] closes it.
+            function scan(text,    c, rest, quote) {
+                while (text != "") {
+                    c = substr(text, 1, 1)
+                    if (c ~ /[[:space:],]/) { text = substr(text, 2); continue }
+                    if (c == "#") { return }
+                    if (c == "]") {
+                        in_ignore = 0
+                        rest = substr(text, 2)
+                        sub(/^[[:space:]]*(#.*)?$/, "", rest)
+                        if (rest != "") { print "error text after the array closes" }
+                        return
+                    }
+                    if (c == "\"" || c == q) {
+                        if (substr(text, 1, 3) == c c c) { print "error a multiline string"; return }
+                        quote = c
+                        text = substr(text, 2)
+                        if (!index(text, quote)) { print "error a string that does not end on its line"; return }
+                        rest = substr(text, 1, index(text, quote) - 1)
+                        if (quote == "\"" && index(rest, "\\")) { print "error a string with escapes"; return }
+                        print "id " rest
+                        text = substr(text, index(text, quote) + 1)
+                        continue
+                    }
+                    print "error something other than a string in the array"
+                    return
+                }
+            }
+            in_ignore { scan($0); next }
+            /^[[:space:]]*\[/ { table = toml_table($0); print > out; next }
+            index($0, "=") {
+                key = toml_key($0)
+                if (key != "" && key != "\\" && table != "\\") {
+                    key = table == "" ? key : table "." key
+                    if (key == "advisories.ignore") {
+                        rest = toml_rest($0)
+                        if (substr(rest, 1, 1) != "[") { print "error a value that is not an array"; next }
+                        in_ignore = 1
+                        scan(substr(rest, 2))
+                        next
+                    }
+                    if (key == "advisories") { print "error an inline advisories table"; next }
+                }
+            }
+            { print > out }
+            END { if (in_ignore) { print "error an array that never closes" } }' "${RS_AUDIT_CONFIG}")
+        for value in ${ids[@]+"${ids[@]}"}; do
+            RS_IGNORES=$(jq -c --arg id "${value}" --arg source "${RS_AUDIT_CONFIG}" '. + [{id: $id, source: $source}]' <<< "${RS_IGNORES}")
+        done
+    fi
+    # --ignore ID and --ignore=ID in extra_args.
+    RS_EXTRA_KEEP=()
+    value=false
+    for word in ${RS_EXTRA[@]+"${RS_EXTRA[@]}"}; do
+        if [[ "${value}" == true ]]; then
+            value=false
+            RS_IGNORES=$(jq -c --arg id "${word}" '. + [{id: $id, source: "extra_args"}]' <<< "${RS_IGNORES}")
+        elif [[ "${word}" == --ignore ]]; then
+            value=true
+        elif [[ "${word}" == --ignore=* ]]; then
+            RS_IGNORES=$(jq -c --arg id "${word#--ignore=}" '. + [{id: $id, source: "extra_args"}]' <<< "${RS_IGNORES}")
+        else
+            RS_EXTRA_KEEP+=("${word}")
+        fi
+    done
+    RS_IGNORE_MATCHES="[]"
+}
+
+# rs_audit_ignores_pass DIR JSON INPUT TARGET...: runs cargo audit once more
+# for one input, from DIR (see rs_audit_ignores_prepare), with no ignores, no
+# fetch and no yanked check (yanked findings carry no advisory ID), against
+# the database the audit read, and records in RS_IGNORE_MATCHES which ignores
+# matched a finding there: its advisory's ID, or only one of its aliases,
+# which cargo-audit 0.22 doesn't match ignores against. TARGET is the
+# lockfile (--file ABS) or binary (bin ABS) part of the arguments; JSON is
+# the audit's own report, whose settings.ignore must be the ignores
+# rs_audit_ignores_prepare read, or the step stops. Returns 1, saying why,
+# when the pass doesn't complete.
+rs_audit_ignores_pass() {
+    local dir=$1 json=$2 input=$3 db=${RS_DB} applied read rc=0 kind value
+    local -a args=(audit)
+    shift 3
+    # shellcheck disable=SC2016 # jq program, not shell
+    applied=$(jq -c '[.settings.ignore[]? | tostring] | sort' "${json}")
+    read=$(jq -c '[.[].id] | sort' <<< "${RS_IGNORES}")
+    if [[ "${applied}" != "${read}" ]]; then
+        echo "ERROR: cargo audit applied the ignores ${applied}, but unused_ignores read ${read} from" >&2
+        echo "  ${RS_AUDIT_CONFIG:-no config} and extra_args, so it can't tell which are unused." >&2
+        return 1
+    fi
+    if [[ "${db}" != /* ]]; then
+        db="$(pwd)/${db}"
+    fi
+    args+=(--db "${db}" --no-fetch --no-yanked)
+    for kind in ${RS_DENIED[@]+"${RS_DENIED[@]}"}; do
+        args+=(--deny "${kind}")
+    done
+    rs_list target_arch "${PARAM_TARGET_ARCH}"
+    for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        args+=(--target-arch "${value}")
+    done
+    rs_list target_os "${PARAM_TARGET_OS}"
+    for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        args+=(--target-os "${value}")
+    done
+    args+=(${RS_EXTRA_KEEP[@]+"${RS_EXTRA_KEEP[@]}"} --json "$@")
+    echo "Auditing ${input} again without its ignores, to find the unused ones..."
+    rs_show_command "${RS_TOOL##*/}" "${args[@]}"
+    (cd "${dir}" && "${RS_TOOL}" "${args[@]}") > "${dir}/pass.json" 2> "${dir}/pass.log" || rc=$?
+    if ! rs_json_is "${dir}/pass.json" 'type == "object" and (.vulnerabilities | type == "object")'; then
+        echo "ERROR: cargo audit did not complete without the ignores (exit code ${rc}), so their use can't be told. Its output:" >&2
+        sed 's/^/  /' "${dir}/pass.log" | tail -n 20 >&2
+        return 1
+    fi
+    # shellcheck disable=SC2016 # jq program, not shell
+    RS_IGNORE_MATCHES=$(jq -c --arg input "${input}" --slurpfile pass "${dir}/pass.json" '
+        [$pass[0] | (.vulnerabilities.list[]?.advisory), (.warnings[]?[]?.advisory) | select(. != null)
+            | {id, aliases: (.aliases // [])}] as $found
+        | . + [{input: $input, ids: [$found[].id] | unique,
+            aliases: [$found[] | .id as $id | .aliases[] | {alias: ., id: $id}] | unique}]' <<< "${RS_IGNORE_MATCHES}")
+}
+
+# rs_advisory_versions DB ID: prints, as JSON, what the advisory database DB
+# says of the advisory ID (or one with ID among its aliases): its package,
+# patched and unaffected versions, and when it was withdrawn; null when it
+# has none. That is usually why an ignore stopped matching.
+rs_advisory_versions() {
+    local file="" dir
+    local -a dirs=()
+    # Advisories for crates, and for the Rust toolchain's own (rust/).
+    for dir in "$1/crates" "$1/rust"; do
+        if [[ -d "${dir}" ]]; then
+            dirs+=("${dir}")
+        fi
+    done
+    if [[ ${#dirs[@]} -gt 0 ]]; then
+        file=$(find "${dirs[@]}" -name "$2.md" -type f | head -n 1) || file=""
+        if [[ -z "${file}" ]]; then
+            file=$(grep -rlF -- "\"$2\"" "${dirs[@]}" | head -n 1) || file=""
+        fi
+    fi
+    if [[ -z "${file}" ]]; then
+        echo null
+        return 0
+    fi
+    # The advisory's front matter, a TOML block: [advisory] id, package and
+    # withdrawn, and [versions] patched and unaffected, arrays that can span
+    # lines.
+    awk '
+        /^```toml/ { front = 1; next }
+        front && /^```/ { exit }
+        !front { next }
+        /^\[/ { table = $0; gsub(/[][[:space:]]/, "", table); key = ""; next }
+        index($0, "=") && !collecting {
+            key = $0; sub(/[[:space:]]*=.*/, "", key); sub(/^[[:space:]]*/, "", key)
+            rest = substr($0, index($0, "=") + 1)
+            if (table == "advisory" && (key == "id" || key == "package" || key == "withdrawn")) {
+                if (match(rest, /"[^"]*"/)) print table "." key "\t" substr(rest, RSTART + 1, RLENGTH - 2)
+                next
+            }
+            if (table == "versions" && (key == "patched" || key == "unaffected")) { collecting = 1; $0 = rest }
+            else next
+        }
+        collecting {
+            line = $0
+            sub(/#.*/, "", line)
+            while (match(line, /"[^"]*"/)) {
+                print table "." key "\t" substr(line, RSTART + 1, RLENGTH - 2)
+                line = substr(line, RSTART + RLENGTH)
+            }
+            if (index(line, "]")) collecting = 0
+        }' "${file}" | jq -Rsc 'split("\n") | map(select(. != "") | split("\t")) as $rows
+            | {id: ([$rows[] | select(.[0] == "advisory.id") | .[1]][0]),
+               package: ([$rows[] | select(.[0] == "advisory.package") | .[1]][0]),
+               patched: [$rows[] | select(.[0] == "versions.patched") | .[1]],
+               unaffected: [$rows[] | select(.[0] == "versions.unaffected") | .[1]],
+               withdrawn: ([$rows[] | select(.[0] == "advisory.withdrawn") | .[1]][0])}'
+}
+
+# rs_audit_ignores_report MODE FILE CLASS: writes FILE, the ignores report:
+# each ignore with its source, the inputs it matched a finding in, the
+# advisories it names only by an alias, and, for an unused one, what the
+# database now says of its advisory. An ignore is unused when it matched no
+# finding in any input: one config often covers several lockfiles, and an
+# ignore is legitimately unused in those without the crate. Sets
+# RS_UNUSED_IGNORES to the unused IDs, as a JSON array, prints them (as
+# warnings), and sets RS_IGNORE_CASES to JUnit test cases for them, of
+# classname CLASS, failed with MODE deny and skipped with warn.
+rs_audit_ignores_report() {
+    local report entry advisory line ids=()
+    # shellcheck disable=SC2016 # jq program, not shell
+    report=$(jq -c --argjson matches "${RS_IGNORE_MATCHES}" 'map(. as $ignore | . + {
+            matched_in: [$matches[] | select(.ids | index($ignore.id)) | .input],
+            alias_of: ([$matches[].aliases[] | select(.alias == $ignore.id) | .id] | unique)}
+        | . + {used: (.matched_in | length > 0)})' <<< "${RS_IGNORES}")
+    mapfile -t ids < <(jq -r '.[] | select(.used | not) | .id' <<< "${report}")
+    for entry in ${ids[@]+"${ids[@]}"}; do
+        advisory=$(rs_advisory_versions "${RS_DB}" "${entry}")
+        # shellcheck disable=SC2016 # jq program, not shell
+        report=$(jq -c --arg id "${entry}" --argjson advisory "${advisory}" \
+            'map(if .id == $id and (.used | not) then . + {advisory: $advisory} else . end)' <<< "${report}")
+    done
+    # shellcheck disable=SC2016 # jq program, not shell
+    jq --arg mode "$1" --argjson inputs "$(jq -c '[.[].input]' <<< "${RS_IGNORE_MATCHES}")" '{mode: $mode, inputs: $inputs,
+        ignores: map({id, source, used, matched_in, alias_of, advisory: (.advisory // null)})}' <<< "${report}" > "$2"
+    # shellcheck disable=SC2034 # read by the scripts
+    RS_UNUSED_IGNORES=$(jq -c '[.ignores[] | select(.used | not) | .id] | unique' "$2")
+    while IFS= read -r line; do
+        if [[ "$1" == deny ]]; then
+            echo "  unused ignore: ${line}"
+        else
+            echo "WARN: unused ignore: ${line}" >&2
+        fi
+    done < <(jq -r '.ignores[] | select(.used | not) | "\(.id) (from \(.source)) matches no finding"
+        + (if (.alias_of | length) > 0 then "; it names \(.alias_of | join(", ")) by an alias, and cargo audit matches ignores by advisory ID only" else "" end)
+        + (if .advisory then "; the database'"'"'s \(.advisory.id) is for \(.advisory.package // "a crate")"
+            + (if .advisory.withdrawn then ", withdrawn on \(.advisory.withdrawn)" else "" end)
+            + (if (.advisory.patched | length) > 0 then ", patched in \(.advisory.patched | join(" or "))" else ", with no patched version" end)
+            + (if (.advisory.unaffected | length) > 0 then ", and leaves out \(.advisory.unaffected | join(" or "))" else "" end)
+          else "" end)' "$2")
+    # shellcheck disable=SC2034,SC2016 # read by the scripts; jq program, not shell
+    RS_IGNORE_CASES=$(jq -c --arg mode "$1" --arg class "$3" '[.ignores[] | select(.used | not) | {
+            classname: $class, name: .id, status: (if $mode == "deny" then "failed" else "skipped" end),
+            message: ("ignored in \(.source), but no finding matches it"
+                + (if (.alias_of | length) > 0 then " (it is an alias of \(.alias_of | join(", ")))" else "" end)),
+            detail: (if .advisory then (.advisory | tojson) else "" end)}]' "$2")
 }
 
 # rs_audit_summary JSON PREFIX: prints a cargo audit JSON report's findings,

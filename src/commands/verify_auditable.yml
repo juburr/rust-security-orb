@@ -1,9 +1,11 @@
 description: >
-  Checks that each binary carries the dependency list cargo auditable embeds, and that it decodes,
-  by reading it back with rust-audit-info, and fails when one doesn't: stripping with llvm-strip
-  or --strip-section-headers, packers and other post-link steps can remove it without a word.
-  Writes each binary's decoded list as JSON and, with cyclonedx, an SBOM. Needs rust-audit-info
-  (in the install command's tools).
+  Checks that each binary carries the dependency list cargo auditable embeds, and that it decodes
+  to what cargo auditable writes, and fails when one doesn't: stripping with llvm-strip or
+  --strip-section-headers, packers and other post-link steps can remove it without a word. Writes
+  each binary's decoded list as JSON and, with cyclonedx, an SBOM. Reads the list with
+  rust-audit-info (in the install command's tools, built from source with cargo) or, with no Rust
+  toolchain, the orb's native decoder, which needs only python3 and reads ELF binaries of any
+  architecture.
 parameters:
   working_dir:
     type: string
@@ -15,6 +17,19 @@ parameters:
       The binaries to check, separated by spaces or commas; shell patterns are expanded. Name
       the final artifacts, after stripping and packaging, which can remove the data.
       Environment variables are expanded.
+  decoder:
+    type: enum
+    enum: ["auto", "native", "rust-audit-info"]
+    default: auto
+    description: >
+      What reads each binary's .dep-v0 section: rust-audit-info; native, the orb's own decoder,
+      which needs only python3 (no cargo, no build) and reads ELF binaries of any architecture,
+      printing exactly what rust-audit-info prints; or auto, the default, which takes a
+      rust-audit-info the install command verified, or else native, or else an unverified
+      rust-audit-info, with a warning. Either way, the list must have the shape cargo auditable
+      writes: packages, exactly one root, dependencies that are indices into packages. native
+      reads ELF only; another format (PE, Mach-O, WebAssembly) fails the step, so use
+      rust-audit-info for those.
   cyclonedx:
     type: boolean
     default: false
@@ -54,15 +69,17 @@ parameters:
       fails.
 steps:
   - run:
-      name: Verify cargo-auditable data
+      name: Verify cargo-auditable data (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_BINARIES: << parameters.binaries >>
         PARAM_CYCLONEDX: << parameters.cyclonedx >>
+        PARAM_DECODER: << parameters.decoder >>
         PARAM_JUNIT: << parameters.junit >>
         PARAM_OUTPUT_DIR: << parameters.output_dir >>
         PARAM_REPORT_NAME: << parameters.report_name >>
         PARAM_RUN_RECORD: << parameters.run_record >>
+        SCRIPT_DEP_V0_PY: << include(scripts/lib/dep_v0.py) >>
         SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
       command: << include(scripts/verify_auditable.sh) >>
   - when:

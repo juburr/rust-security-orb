@@ -11,7 +11,9 @@
 # audit, a scan that completes prints its whole JSON report and one that fails
 # prints nothing; a binary with no dependency information at all (not built
 # with cargo auditable, and no dependency paths cargo audit could recover)
-# can't be scanned, which fails the step even with report_only.
+# can't be scanned, which fails the step even with report_only. With
+# unused_ignores, each binary is audited once more without the ignores, and
+# those that match no finding in any of them are reported.
 
 set -euo pipefail
 
@@ -27,19 +29,18 @@ JUNIT=$(rs_bool junit "${PARAM_JUNIT}")
 REPORT_ONLY=$(rs_bool report_only "${PARAM_REPORT_ONLY}")
 RUN_RECORD=$(rs_bool run_record "${PARAM_RUN_RECORD}")
 REQUIRE_AUDITABLE=$(rs_bool require_auditable "${PARAM_REQUIRE_AUDITABLE}")
+UNUSED_IGNORES=${PARAM_UNUSED_IGNORES}
 rs_output "${PARAM_OUTPUT_DIR}" "${PARAM_REPORT_NAME}"
 rs_audit_extra_args
 rs_require_jq
 rs_tool cargo-audit
+# With require_auditable, each binary's .dep-v0 section is read with
+# rust-audit-info or the native decoder (rs_decoder), as verify_auditable
+# reads it, before cargo audit reads it its own way.
 if [[ "${REQUIRE_AUDITABLE}" == true ]]; then
-    if ! AUDIT_INFO=$(command -v rust-audit-info); then
-        echo "ERROR: require_auditable needs rust-audit-info, which is not on the PATH. Add rust-audit-info to the" >&2
-        echo "  install command's tools, or use install_rust_audit_info." >&2
-        exit 1
-    fi
-    rs_tool_verified rust-audit-info "${AUDIT_INFO}"
+    rs_decoder "${PARAM_DECODER}"
     # shellcheck disable=SC2034 # read by rs_run_record
-    RS_OTHER_TOOLS=("${AUDIT_INFO}")
+    RS_OTHER_TOOLS=("${RS_DECODER_TOOL}")
 fi
 
 # Every binary named, with shell patterns expanded. A pattern that matches
@@ -75,6 +76,14 @@ done
 shopt -u nullglob
 
 rs_audit_options
+IGNORE_DIR=""
+case "${UNUSED_IGNORES}" in
+    warn | deny)
+        IGNORE_DIR=$(mktemp -d)
+        trap 'rm -rf "${IGNORE_DIR}"' EXIT
+        ;;
+esac
+rs_audit_ignores_prepare "${UNUSED_IGNORES}" "${IGNORE_DIR}"
 RS_TOOL_VERSION=$("${RS_TOOL}" --version 2> /dev/null || true)
 # The options every scan shares, for the run record.
 # shellcheck disable=SC2034 # read by rs_run_record
@@ -106,20 +115,32 @@ for binary in "${BINARIES[@]}"; do
     name=${candidate}
     USED_NAMES[${name}]=1
     base="${RS_BASE}-${name}"
-    if [[ "${REQUIRE_AUDITABLE}" == true ]] && ! "${AUDIT_INFO}" "${binary}" > /dev/null 2> "${base}.audit-info.log"; then
-        echo "  ${binary}: no cargo-auditable data ($(head -n 1 "${base}.audit-info.log"))"
-        MISSING+=("${binary}")
+    if [[ "${REQUIRE_AUDITABLE}" == true ]]; then
+        rc=0
+        rs_decode "${binary}" "${base}.audit-info.json" "${base}.audit-info.log" || rc=$?
+        if [[ "${rc}" -eq 2 ]]; then
+            echo "ERROR: The ${RS_DECODER} decoder can't tell whether ${binary} carries cargo-auditable data: $(head -n 1 "${base}.audit-info.log")" >&2
+            rm -f "${base}.audit-info.json" "${base}.audit-info.log"
+            if [[ "${RUN_RECORD}" == true ]]; then
+                rs_run_record "${RS_BASE}.run-record.json" audit_bin error 2 "${STARTED}"
+            fi
+            exit 1
+        elif [[ "${rc}" -ne 0 ]]; then
+            echo "  ${binary}: no cargo-auditable data ($(head -n 1 "${base}.audit-info.log"))"
+            MISSING+=("${binary}")
+        fi
+        rm -f "${base}.audit-info.json" "${base}.audit-info.log"
     fi
-    rm -f "${base}.audit-info.log"
     # Only the first scan may fetch the database; the others read that copy.
     OPTS=()
     if [[ "${RS_NO_FETCH}" != true && "${CODES}" -gt 0 ]]; then
         OPTS+=(--no-fetch)
     fi
     CODES=$((CODES + 1))
+    ARGS=(audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${OPTS[@]+"${OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} --json bin "${binary}")
+    rs_show_command "${RS_TOOL##*/}" "${ARGS[@]}"
     rc=0
-    "${RS_TOOL}" audit ${RS_AUDIT_OPTS[@]+"${RS_AUDIT_OPTS[@]}"} ${OPTS[@]+"${OPTS[@]}"} ${RS_EXTRA[@]+"${RS_EXTRA[@]}"} \
-        --json bin "${binary}" > "${base}.json" 2> "${base}.log" || rc=$?
+    "${RS_TOOL}" "${ARGS[@]}" > "${base}.json" 2> "${base}.log" || rc=$?
     if ! rs_json_is "${base}.json" 'type == "object" and (.vulnerabilities | type == "object")'; then
         echo "ERROR: cargo audit bin could not audit ${binary} (exit code ${rc}). Its output:" >&2
         sed 's/^/  /' "${base}.log" | tail -n 20 >&2
@@ -138,6 +159,13 @@ for binary in "${BINARIES[@]}"; do
         if [[ "${RUN_RECORD}" == true ]]; then
             RS_REPORTS+=("${base}.log")
             rs_run_record "${RS_BASE}.run-record.json" audit_bin error "${rc}" "${STARTED}"
+        fi
+        exit 1
+    fi
+    if [[ -n "${IGNORE_DIR}" ]] \
+        && ! rs_audit_ignores_pass "${IGNORE_DIR}" "${base}.json" "${binary}" bin "$(realpath -m -s -- "${binary}")"; then
+        if [[ "${RUN_RECORD}" == true ]]; then
+            rs_run_record "${RS_BASE}.run-record.json" audit_bin error 1 "${STARTED}"
         fi
         exit 1
     fi
@@ -187,6 +215,18 @@ RS_COUNTS=$(jq -c '{binaries: (.binaries | length), vulnerabilities: ([.binaries
     denied_warnings: ([.binaries[].denied_warnings] | add), denied_by_config: ([.binaries[].denied_by_config] | any),
     without_auditable_data: (.without_auditable_data | length)}' "${RS_BASE}.json")
 
+# Ignores that matched no finding in any binary.
+UNUSED="[]"
+SUITES="[]"
+if [[ -n "${IGNORE_DIR}" ]]; then
+    rs_audit_ignores_report "${UNUSED_IGNORES}" "${RS_BASE}.ignores.json" cargo-audit-bin.unused-ignore
+    RS_REPORTS+=("${RS_BASE}.ignores.json")
+    UNUSED=${RS_UNUSED_IGNORES}
+    # shellcheck disable=SC2016 # jq program, not shell
+    RS_COUNTS=$(jq -c --argjson unused "${UNUSED}" '. + {unused_ignores: ($unused | length)}' <<< "${RS_COUNTS}")
+    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}-ignores" --argjson cases "${RS_IGNORE_CASES}" '[{name: $name, cases: $cases}]' <<< "${SUITES}")
+fi
+
 if [[ "${JUNIT}" == true ]]; then
     if [[ "${REQUIRE_AUDITABLE}" == true ]]; then
         for binary in ${MISSING[@]+"${MISSING[@]}"}; do
@@ -194,7 +234,8 @@ if [[ "${JUNIT}" == true ]]; then
                 message: "no cargo-auditable data: build it with cargo auditable"}]' <<< "${CASES}")
         done
     fi
-    rs_junit "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${PARAM_REPORT_NAME}" "${CASES}"
+    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}" --argjson cases "${CASES}" '[{name: $name, cases: $cases}] + .' <<< "${SUITES}")
+    rs_junit_suites "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${SUITES}"
     RS_REPORTS+=("${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml")
 fi
 
@@ -209,6 +250,12 @@ fi
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     FINDINGS=true
     MESSAGE="${MESSAGE} ${#MISSING[@]} carry no cargo-auditable data (require_auditable): ${MISSING[*]}."
+fi
+if [[ "${UNUSED}" != "[]" ]]; then
+    if [[ "${UNUSED_IGNORES}" == deny ]]; then
+        FINDINGS=true
+    fi
+    MESSAGE="${MESSAGE} $(jq -r 'length' <<< "${UNUSED}") ignores match no finding: $(jq -r 'join(", ")' <<< "${UNUSED}")."
 fi
 OUTCOME=passed
 if [[ "${FINDINGS}" == true ]]; then

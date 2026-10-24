@@ -98,7 +98,7 @@ parameters:
       fails.
 steps:
   - run:
-      name: cargo vet
+      name: cargo vet (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_EXTRA_ARGS: << parameters.extra_args >>

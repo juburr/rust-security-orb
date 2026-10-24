@@ -1,0 +1,7 @@
+# A lockfile without smallvec, for audit's unused_ignores over several
+# lockfiles that share .cargo/audit.toml.
+version = 4
+
+[[package]]
+name = "rso-audit-ignores"
+version = "0.1.0"

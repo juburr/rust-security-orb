@@ -14,14 +14,14 @@
     },
     "command": {
       "description": "The orb command that wrote the record.",
-      "enum": ["audit", "audit_bin", "deny", "licenses", "verify_auditable", "sbom", "vet"]
+      "enum": ["audit", "audit_bin", "deny", "licenses", "verify_auditable", "sbom", "vet", "tree_forbid", "tree_expect"]
     },
     "outcome": {
-      "description": "passed: no findings. findings: findings failed the step. findings-reported: findings, passed because report_only is true. error: the tool did not complete, so there is no verdict, and the step failed.",
-      "enum": ["passed", "findings", "findings-reported", "error"]
+      "description": "passed: no findings. findings: findings failed the step. findings-reported: findings, passed because report_only is true. skipped: the check's precondition (tree_forbid's only_if_reachable) didn't hold, so nothing was checked, and the step passed. error: the tool did not complete, so there is no verdict, and the step failed.",
+      "enum": ["passed", "findings", "findings-reported", "skipped", "error"]
     },
     "exit_code": {
-      "description": "The tool's own exit code (for audit_bin, the last binary's; for verify_auditable, 1 when a binary has no data; when a SARIF pass or auditable2cdx fails, its own).",
+      "description": "The tool's own exit code (for audit_bin, and audit and deny with several lockfiles or manifests, the last non-zero one; for verify_auditable, 1 when a binary has no data; when a SARIF pass or auditable2cdx fails, its own; for tree_forbid and tree_expect, cargo tree's last).",
       "type": "integer"
     },
     "started_at": { "$ref": "#/$defs/timestamp" },
@@ -45,14 +45,14 @@
       "description": "The absolute directory the command ran in. Relative paths in arguments are relative to it.",
       "type": "string"
     },
-    "tool": { "description": "The tool binary the command ran.", "$ref": "#/$defs/tool" },
+    "tool": { "description": "The tool binary the command ran: for verify_auditable, its .dep-v0 decoder, rust-audit-info or python3 (with program); for tree_forbid and tree_expect, cargo.", "$ref": "#/$defs/tool" },
     "other_tools": {
-      "description": "Other binaries the command ran, each described as tool is: auditable2cdx for verify_auditable with cyclonedx, rust-audit-info for audit_bin with require_auditable, and none otherwise.",
+      "description": "Other binaries the command ran, each described as tool is: auditable2cdx for verify_auditable with cyclonedx, the .dep-v0 decoder for audit_bin with require_auditable (rust-audit-info, or python3 running the orb's native decoder), and none otherwise.",
       "type": "array",
       "items": { "$ref": "#/$defs/tool" }
     },
     "arguments": {
-      "description": "The arguments the tool ran with, after the binary's name, except the options the command adds to read the tool's results (cargo audit's --json, cargo deny's --format json and --log-level info, cargo vet's --output-format json and --output-file) and the binaries audit_bin and verify_auditable read, which are in inputs.",
+      "description": "The arguments the tool ran with, after the binary's name, except the options the command adds to read the tool's results (cargo audit's --json, cargo deny's --format json and --log-level info, cargo vet's --output-format json and --output-file) and the binaries audit_bin and verify_auditable read, which are in inputs. With several lockfiles or manifests (audit's lockfiles, deny's, tree_forbid's and tree_expect's manifest_paths), the arguments they share, without --file or --manifest-path. For tree_forbid and tree_expect, the cargo tree call whose output decided; their JSON report lists every call.",
       "type": "array",
       "items": { "type": "string" }
     },
@@ -98,6 +98,11 @@
         }
       }
     },
+    "exceptions": {
+      "description": "The exceptions or boundaries the check is a premise of, as tree_forbid's and tree_expect's exception parameter names them, such as RUSTSEC-2023-0071 or licence:MPL-2.0; only those commands write it.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
     "counts": {
       "description": "The command's own summary of what it found, such as vulnerabilities and denied warnings for audit, or errors and warnings per check for deny. null when the tool did not complete.",
       "type": ["object", "null"]
@@ -127,6 +132,15 @@
         "path": { "description": "The binary that ran.", "type": "string" },
         "version": { "description": "What the binary reports as its version; empty when it reports none.", "type": "string" },
         "sha512": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha512" }] },
+        "program": {
+          "description": "For an interpreter that ran a program of the orb's, such as python3 running the native .dep-v0 decoder (verify_auditable and audit_bin with decoder native): the program's name and SHA-256, which identify the decoder as the binary's SHA-512 identifies a tool.",
+          "type": "object",
+          "required": ["name", "sha256"],
+          "properties": {
+            "name": { "type": "string" },
+            "sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
         "install": {
           "description": "How the orb installed the binary that ran, from the record its install command left beside it. null when there is none, or when it describes another binary than the one that ran.",
           "oneOf": [

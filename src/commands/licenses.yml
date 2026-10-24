@@ -97,7 +97,7 @@ parameters:
       fails.
 steps:
   - run:
-      name: cargo deny list
+      name: cargo deny list (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_ALL_FEATURES: << parameters.all_features >>

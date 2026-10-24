@@ -1,0 +1,20 @@
+description: >
+  Stores output_dir as job artifacts under rust-security-reports/, including when an earlier step
+  failed. Each reporting command stores output_dir after itself by default, so a job that runs
+  several of them uploads the shared directory once per command, each time with more in it. Set
+  store_artifacts to false on each of them and end the job with this command instead: every
+  report is uploaded once. JUnit results need nothing of the kind, since each command stores its
+  own file.
+parameters:
+  output_dir:
+    type: string
+    default: /tmp/rust-security-reports
+    description: >
+      Absolute path of the directory the reporting commands wrote into: the output_dir they were
+      given. Environment variables are not expanded, since CircleCI reads the path when it
+      compiles the config.
+steps:
+  - store_artifacts:
+      path: << parameters.output_dir >>
+      destination: rust-security-reports
+      when: always

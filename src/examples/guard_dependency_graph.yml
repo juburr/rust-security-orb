@@ -1,0 +1,66 @@
+description: >
+  Assert what each build's dependency graph may and may not hold, with no
+  policy file of the orb's own: tree_forbid keeps crates and features out of
+  the shipped binary's graph (for cargo build -p server, and for a
+  workspace-wide build, where cargo unifies features across members), and
+  tree_expect fails when the graph around an ignored advisory or a licence
+  exception changes shape, so the exception is reviewed again. A graph that
+  doesn't resolve, such as with a stale lockfile, fails closed.
+
+usage:
+  version: 2.1
+  orbs:
+    rust-security: juburr/rust-security-orb@0.2.0
+  jobs:
+    graph:
+      docker:
+        - image: cimg/rust:1.99
+      steps:
+        - checkout
+        - rust-security/tree_forbid:
+            report_name: boundary-server
+            exception: boundary:server
+            package: server
+            edges: no-dev
+            all_features: true
+            forbidden_packages: >-
+              reqwest reqwest-* native-tls native-tls-* curl curl-*
+              ingest replication
+            forbidden_features: index:writer
+            junit: true
+            store_artifacts: false
+        - rust-security/tree_forbid:
+            report_name: boundary-workspace-index
+            exception: boundary:server
+            workspace: true
+            edges: no-dev
+            all_features: true
+            forbidden_features: index:writer
+            only_if_reachable: index
+            only_if_reachable_from: server
+            junit: true
+            store_artifacts: false
+        - rust-security/tree_expect:
+            report_name: premise-paste
+            exception: RUSTSEC-2024-0436
+            workspace: true
+            all_features: true
+            invert: paste
+            depth: 1
+            expected: paste@1.0.15 utoipa-axum@0.2.0
+            junit: true
+            store_artifacts: false
+        - rust-security/tree_expect:
+            report_name: premise-libfuzzer-licence
+            exception: licence:NCSA
+            manifest_paths: fuzz/*/Cargo.toml
+            invert: libfuzzer-sys
+            depth: 1
+            expected: "libfuzzer-sys@0.4.13 {root}"
+            junit: true
+            store_artifacts: false
+        - rust-security/store_reports
+  workflows:
+    security:
+      jobs:
+        - graph

@@ -23,6 +23,20 @@ parameters:
     description: >
       The Cargo.toml to check (cargo deny --manifest-path), relative to working_dir. Defaults
       to the one in working_dir. Environment variables are expanded.
+  manifest_paths:
+    type: string
+    default: ""
+    description: >
+      Several Cargo.toml files to check instead of manifest_path, each with the same config_path,
+      checks, allow, warn, deny and feature and target parameters, such as standalone workspaces
+      (fuzz targets, test harnesses) under one deny.toml. Separated by commas, spaces or newlines;
+      shell patterns such as crates/*/fuzz/Cargo.toml are expanded, and one that matches nothing
+      fails the step. Each is checked on its own, with reports named <report_name>-<slug>, where
+      the slug is its path relative to working_dir without Cargo.toml, with / as - (root for
+      working_dir's own), listed in an index, <report_name>.json, and every one is checked before
+      the step fails. cargo-deny 0.20 fetches the advisory database for each check unless offline
+      is true, so fetch it once with fetch_advisory_db and set offline. Can't go with
+      metadata_path. Environment variables are expanded.
   config_path:
     type: string
     default: ""
@@ -141,7 +155,7 @@ parameters:
     default: cargo-deny
     description: >
       The reports' file name, without extension, so several runs in a job (or a matrix) don't
-      overwrite each other's reports.
+      overwrite each other's reports. It is also in the step's name.
   sarif:
     type: boolean
     default: true
@@ -150,8 +164,9 @@ parameters:
     type: boolean
     default: false
     description: >
-      Also write JUnit XML, one test case per error or warning, to output_dir/junit, and show
-      it in CircleCI's Tests tab: errors fail, warnings are skipped.
+      Also write JUnit XML, one test case per error or warning (with manifest_paths, one test
+      suite per manifest), to output_dir/junit, and show it in CircleCI's Tests tab: errors fail,
+      warnings are skipped.
   report_only:
     type: boolean
     default: false
@@ -173,7 +188,7 @@ parameters:
       fails.
 steps:
   - run:
-      name: cargo deny check << parameters.checks >>
+      name: cargo deny check << parameters.checks >> (<< parameters.report_name >>)
       working_directory: << parameters.working_dir >>
       environment:
         PARAM_ALL_FEATURES: << parameters.all_features >>
@@ -190,6 +205,7 @@ steps:
         PARAM_JUNIT: << parameters.junit >>
         PARAM_LOCKED: << parameters.locked >>
         PARAM_MANIFEST_PATH: << parameters.manifest_path >>
+        PARAM_MANIFEST_PATHS: << parameters.manifest_paths >>
         PARAM_METADATA_PATH: << parameters.metadata_path >>
         PARAM_NO_DEFAULT_FEATURES: << parameters.no_default_features >>
         PARAM_OFFLINE: << parameters.offline >>
