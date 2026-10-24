@@ -318,6 +318,17 @@ The orb adds no exception file. Each tool already has one:
   With `require_ignore_reasons: true`, `deny` fails when an ignore that applied has no reason, or one of only spaces, and lists it. It reads cargo-deny's own report of the ignores it applied, so only entries that matched an advisory count.
 - **`.cargo/audit.toml`** takes bare advisory IDs under `[advisories] ignore`, with no field for a reason. Teams that need justified exceptions should keep them in `deny.toml` and run `deny`'s advisories check, or keep a comment above each entry by convention.
 
+An ignore that no longer matches anything is a latent hole: if its advisory ever matches again, say for another version, it is accepted without a review. cargo-deny reports those itself (`advisory-not-detected`, under `unused-ignored-advisory`, which `deny` lists by advisory ID). cargo-audit doesn't, so `audit` and `audit_bin` take `unused_ignores: warn` (report them) or `deny` (fail on them):
+
+```yaml
+- rust-security/audit:
+    lockfiles: Cargo.lock fuzz/*/Cargo.lock
+    no_fetch: true
+    unused_ignores: deny
+```
+
+cargo audit's report doesn't say which ignores it applied, so the step audits each lockfile once more, offline, with a copy of the config that has no ignores (and `extra_args` without `--ignore`): an ignore is used when its advisory's ID matches a finding there. Its own report is left as it is. One `.cargo/audit.toml` often covers several lockfiles, and an ignore is legitimately unused in those without its crate, so it counts as unused only when no lockfile the step audits has a finding for it: name every lockfile the config covers in `lockfiles`, since with one lockfile, every ignore that belongs to another is reported. cargo-audit matches ignores by advisory ID only, never by alias, so an ignore written as a CVE or GHSA ID ignores nothing; it is reported as unused, with the RUSTSEC ID to ignore instead. `<report_name>.ignores.json` lists every ignore with where it comes from and which lockfiles it matched in, and for an unused one, what the advisory database now says of its advisory (its package, patched and unaffected versions, and whether it was withdrawn), which is usually why it stopped matching. A config the step can't rewrite exactly (an inline `advisories = { ... }` table, a multiline or escaped string, anything but strings in the array) fails it, rather than skip the check.
+
 Neither tool has expiry dates for exceptions, so the orb doesn't invent one: a field only this orb understood would tie every adopter to it.
 
 ### Guard Boundaries and Exception Premises in the Graph
@@ -436,6 +447,7 @@ Checks a `Cargo.lock` with `cargo audit`. Fails on vulnerabilities, and on the w
 | `deny` | *(empty)* | Warning kinds that fail like vulnerabilities: `unmaintained`, `unsound`, `yanked`, or `warnings` for all three. |
 | `target_arch`, `target_os` | *(empty)* | Report only vulnerabilities that affect these architectures or operating systems, such as `x86_64` and `linux`. |
 | `no_yanked` | `false` | Skip the yanked-crate check, which queries the crates.io index (cargo-audit 0.22.2 and later). |
+| `unused_ignores` | `allow` | What to do about an ignore that matches no finding, with the levels of cargo-deny's `unused-ignored-advisory`: `allow` doesn't check, `warn` reports it, `deny` fails the step. See [Keep Exceptions Reviewed](#keep-exceptions-reviewed). |
 | `extra_args` | *(empty)* | More `cargo audit` arguments, split like shell words; nothing in them is run as shell code. `--json` and `--format` are refused, and so are `--no-fetch`, `--db` and `--stale` (`-n`, `-d`): use `no_fetch`, `db_path` and `allow_stale`, which the staleness check and run record follow. `--deny` (`-D`) is refused too: use `deny`, which the counts and JUnit report follow. Only options and their values are taken: cargo audit would read any other word as a subcommand, such as `bin`, or its argument, and audit something else. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit`. |
 
@@ -447,7 +459,7 @@ Checks built binaries with `cargo audit bin`, which reads the dependency list ca
 | --- | --- | --- |
 | `binaries` | *required* | The binaries to audit, separated by spaces or commas. Shell patterns such as `dist/*` are expanded, and everything they match must be a binary (`target/release/*` also matches directories and `.d` files); a pattern that matches nothing fails the step. Name the files you ship, after stripping and packaging. |
 | `require_auditable` | `false` | Count a binary without cargo-auditable data as a finding: without it, cargo audit can only guess a binary's dependencies from its panic messages. Needs rust-audit-info. |
-| `working_dir`, `db_path`, `no_fetch`, `allow_stale`, `deny`, `target_arch`, `target_os`, `no_yanked`, `extra_args` | | As for `audit`. |
+| `working_dir`, `db_path`, `no_fetch`, `allow_stale`, `deny`, `target_arch`, `target_os`, `no_yanked`, `unused_ignores`, `extra_args` | | As for `audit`. An ignore is unused when no binary has a finding for it. |
 | `output_dir`, `report_name`, `sarif`, `junit`, `report_only`, `run_record`, `store_artifacts` | | See [Reports and Evidence](#-reports-and-evidence). `report_name` defaults to `cargo-audit-bin`. |
 
 ### `rust-security/deny`
@@ -607,6 +619,7 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 | Report | Written by |
 | --- | --- |
 | Native JSON | `audit`, `audit_bin` (cargo audit's `--json`), `deny` (cargo-deny's JSON diagnostics, one per line, `.jsonl`), `licenses`, `verify_auditable`, `vet` |
+| Unused ignores | `audit` and `audit_bin` with `unused_ignores`: `<report_name>.ignores.json` |
 | Index | `audit` with `lockfiles`, `deny` with `manifest_paths`, `audit_bin` and `verify_auditable`: `<report_name>.json`, listing each input with its SHA-256, its report and its result |
 | SARIF 2.1.0 | `audit`, `audit_bin`, `deny`. cargo-deny's SARIF output exits 0 whatever it finds, so `deny` writes it in a second, offline pass after the JSON pass has decided. |
 | JUnit XML | `audit`, `audit_bin`, `deny`, `vet`: one test case per finding, so the Tests tab lists each advisory with its crate (for `deny`, an ignore in `deny.toml` that matched nothing by its advisory ID, or its crate for a yanked crate). Errors fail; warnings that don't fail the step are skipped, and a clean run has one passing case. `verify_auditable`: one test case per binary. |

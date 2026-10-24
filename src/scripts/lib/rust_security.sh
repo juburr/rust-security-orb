@@ -1496,6 +1496,272 @@ rs_audit_config() {
         }' "${RS_AUDIT_CONFIG}")
 }
 
+# rs_audit_ignores_prepare MODE DIR: for unused_ignores MODE (allow, warn or
+# deny, as for cargo-deny's unused-ignored-advisory), sets RS_IGNORES to the
+# ignores cargo audit applies, as a JSON array of {id, source}: those in the
+# audit.toml it reads (RS_AUDIT_CONFIG, advisories.ignore by its full dotted
+# name, an array that can span lines and hold comments) and those --ignore in
+# extra_args adds. With MODE allow it does nothing. Writes DIR/.cargo/audit.toml, a copy of that config without
+# advisories.ignore, which shadows $CARGO_HOME/audit.toml for a cargo audit
+# run in DIR, and sets RS_EXTRA_KEEP to extra_args without --ignore. A config
+# it can't rewrite with certainty (an inline advisories table, a multiline or
+# escaped string, anything but strings in the array) stops the step: an
+# unused ignore must never go unreported because the check couldn't run.
+rs_audit_ignores_prepare() {
+    local line value=false word
+    local -a ids=()
+    case "$1" in
+        allow) return 0 ;;
+        warn | deny) ;;
+        *)
+            echo "ERROR: unused_ignores must be allow, warn or deny, not '$1'." >&2
+            exit 1
+            ;;
+    esac
+    mkdir -p "$2/.cargo"
+    : > "$2/.cargo/audit.toml"
+    RS_IGNORES="[]"
+    if [[ -n "${RS_AUDIT_CONFIG}" ]]; then
+        while IFS= read -r line; do
+            case "${line}" in
+                "id "*) ids+=("${line#id }") ;;
+                "error "*)
+                    echo "ERROR: unused_ignores can't read ${RS_AUDIT_CONFIG}'s advisories.ignore exactly: ${line#error }." >&2
+                    echo "  Write it as a list of plain \"...\" or '...' strings under [advisories] (or as advisories.ignore), so the" >&2
+                    echo "  ignores can be checked." >&2
+                    exit 1
+                    ;;
+            esac
+        done < <(awk -v q="'" -v out="$2/.cargo/audit.toml" "${RS_TOML_AWK}"'
+            # scan(text): reads the ignore array from text, printing
+            # "id <string>" for each string, and leaves it when a ] closes it.
+            function scan(text,    c, rest, quote) {
+                while (text != "") {
+                    c = substr(text, 1, 1)
+                    if (c ~ /[[:space:],]/) { text = substr(text, 2); continue }
+                    if (c == "#") { return }
+                    if (c == "]") {
+                        in_ignore = 0
+                        rest = substr(text, 2)
+                        sub(/^[[:space:]]*(#.*)?$/, "", rest)
+                        if (rest != "") { print "error text after the array closes" }
+                        return
+                    }
+                    if (c == "\"" || c == q) {
+                        if (substr(text, 1, 3) == c c c) { print "error a multiline string"; return }
+                        quote = c
+                        text = substr(text, 2)
+                        if (!index(text, quote)) { print "error a string that does not end on its line"; return }
+                        rest = substr(text, 1, index(text, quote) - 1)
+                        if (quote == "\"" && index(rest, "\\")) { print "error a string with escapes"; return }
+                        print "id " rest
+                        text = substr(text, index(text, quote) + 1)
+                        continue
+                    }
+                    print "error something other than a string in the array"
+                    return
+                }
+            }
+            in_ignore { scan($0); next }
+            /^[[:space:]]*\[/ { table = toml_table($0); print > out; next }
+            index($0, "=") {
+                key = toml_key($0)
+                if (key != "" && key != "\\" && table != "\\") {
+                    key = table == "" ? key : table "." key
+                    if (key == "advisories.ignore") {
+                        rest = toml_rest($0)
+                        if (substr(rest, 1, 1) != "[") { print "error a value that is not an array"; next }
+                        in_ignore = 1
+                        scan(substr(rest, 2))
+                        next
+                    }
+                    if (key == "advisories") { print "error an inline advisories table"; next }
+                }
+            }
+            { print > out }
+            END { if (in_ignore) { print "error an array that never closes" } }' "${RS_AUDIT_CONFIG}")
+        for value in ${ids[@]+"${ids[@]}"}; do
+            RS_IGNORES=$(jq -c --arg id "${value}" --arg source "${RS_AUDIT_CONFIG}" '. + [{id: $id, source: $source}]' <<< "${RS_IGNORES}")
+        done
+    fi
+    # --ignore ID and --ignore=ID in extra_args.
+    RS_EXTRA_KEEP=()
+    value=false
+    for word in ${RS_EXTRA[@]+"${RS_EXTRA[@]}"}; do
+        if [[ "${value}" == true ]]; then
+            value=false
+            RS_IGNORES=$(jq -c --arg id "${word}" '. + [{id: $id, source: "extra_args"}]' <<< "${RS_IGNORES}")
+        elif [[ "${word}" == --ignore ]]; then
+            value=true
+        elif [[ "${word}" == --ignore=* ]]; then
+            RS_IGNORES=$(jq -c --arg id "${word#--ignore=}" '. + [{id: $id, source: "extra_args"}]' <<< "${RS_IGNORES}")
+        else
+            RS_EXTRA_KEEP+=("${word}")
+        fi
+    done
+    RS_IGNORE_MATCHES="[]"
+}
+
+# rs_audit_ignores_pass DIR JSON INPUT TARGET...: runs cargo audit once more
+# for one input, from DIR (see rs_audit_ignores_prepare), with no ignores, no
+# fetch and no yanked check (yanked findings carry no advisory ID), against
+# the database the audit read, and records in RS_IGNORE_MATCHES which ignores
+# matched a finding there: its advisory's ID, or only one of its aliases,
+# which cargo-audit 0.22 doesn't match ignores against. TARGET is the
+# lockfile (--file ABS) or binary (bin ABS) part of the arguments; JSON is
+# the audit's own report, whose settings.ignore must be the ignores
+# rs_audit_ignores_prepare read, or the step stops. Returns 1, saying why,
+# when the pass doesn't complete.
+rs_audit_ignores_pass() {
+    local dir=$1 json=$2 input=$3 db=${RS_DB} applied read rc=0 kind value
+    local -a args=(audit)
+    shift 3
+    # shellcheck disable=SC2016 # jq program, not shell
+    applied=$(jq -c '[.settings.ignore[]? | tostring] | sort' "${json}")
+    read=$(jq -c '[.[].id] | sort' <<< "${RS_IGNORES}")
+    if [[ "${applied}" != "${read}" ]]; then
+        echo "ERROR: cargo audit applied the ignores ${applied}, but unused_ignores read ${read} from" >&2
+        echo "  ${RS_AUDIT_CONFIG:-no config} and extra_args, so it can't tell which are unused." >&2
+        return 1
+    fi
+    if [[ "${db}" != /* ]]; then
+        db="$(pwd)/${db}"
+    fi
+    args+=(--db "${db}" --no-fetch --no-yanked)
+    for kind in ${RS_DENIED[@]+"${RS_DENIED[@]}"}; do
+        args+=(--deny "${kind}")
+    done
+    rs_list target_arch "${PARAM_TARGET_ARCH}"
+    for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        args+=(--target-arch "${value}")
+    done
+    rs_list target_os "${PARAM_TARGET_OS}"
+    for value in ${RS_LIST[@]+"${RS_LIST[@]}"}; do
+        args+=(--target-os "${value}")
+    done
+    args+=(${RS_EXTRA_KEEP[@]+"${RS_EXTRA_KEEP[@]}"} --json "$@")
+    echo "Auditing ${input} again without its ignores, to find the unused ones..."
+    rs_show_command "${RS_TOOL##*/}" "${args[@]}"
+    (cd "${dir}" && "${RS_TOOL}" "${args[@]}") > "${dir}/pass.json" 2> "${dir}/pass.log" || rc=$?
+    if ! rs_json_is "${dir}/pass.json" 'type == "object" and (.vulnerabilities | type == "object")'; then
+        echo "ERROR: cargo audit did not complete without the ignores (exit code ${rc}), so their use can't be told. Its output:" >&2
+        sed 's/^/  /' "${dir}/pass.log" | tail -n 20 >&2
+        return 1
+    fi
+    # shellcheck disable=SC2016 # jq program, not shell
+    RS_IGNORE_MATCHES=$(jq -c --arg input "${input}" --slurpfile pass "${dir}/pass.json" '
+        [$pass[0] | (.vulnerabilities.list[]?.advisory), (.warnings[]?[]?.advisory) | select(. != null)
+            | {id, aliases: (.aliases // [])}] as $found
+        | . + [{input: $input, ids: [$found[].id] | unique,
+            aliases: [$found[] | .id as $id | .aliases[] | {alias: ., id: $id}] | unique}]' <<< "${RS_IGNORE_MATCHES}")
+}
+
+# rs_advisory_versions DB ID: prints, as JSON, what the advisory database DB
+# says of the advisory ID (or one with ID among its aliases): its package,
+# patched and unaffected versions, and when it was withdrawn; null when it
+# has none. That is usually why an ignore stopped matching.
+rs_advisory_versions() {
+    local file="" dir
+    local -a dirs=()
+    # Advisories for crates, and for the Rust toolchain's own (rust/).
+    for dir in "$1/crates" "$1/rust"; do
+        if [[ -d "${dir}" ]]; then
+            dirs+=("${dir}")
+        fi
+    done
+    if [[ ${#dirs[@]} -gt 0 ]]; then
+        file=$(find "${dirs[@]}" -name "$2.md" -type f | head -n 1) || file=""
+        if [[ -z "${file}" ]]; then
+            file=$(grep -rlF -- "\"$2\"" "${dirs[@]}" | head -n 1) || file=""
+        fi
+    fi
+    if [[ -z "${file}" ]]; then
+        echo null
+        return 0
+    fi
+    # The advisory's front matter, a TOML block: [advisory] id, package and
+    # withdrawn, and [versions] patched and unaffected, arrays that can span
+    # lines.
+    awk '
+        /^```toml/ { front = 1; next }
+        front && /^```/ { exit }
+        !front { next }
+        /^\[/ { table = $0; gsub(/[][[:space:]]/, "", table); key = ""; next }
+        index($0, "=") && !collecting {
+            key = $0; sub(/[[:space:]]*=.*/, "", key); sub(/^[[:space:]]*/, "", key)
+            rest = substr($0, index($0, "=") + 1)
+            if (table == "advisory" && (key == "id" || key == "package" || key == "withdrawn")) {
+                if (match(rest, /"[^"]*"/)) print table "." key "\t" substr(rest, RSTART + 1, RLENGTH - 2)
+                next
+            }
+            if (table == "versions" && (key == "patched" || key == "unaffected")) { collecting = 1; $0 = rest }
+            else next
+        }
+        collecting {
+            line = $0
+            sub(/#.*/, "", line)
+            while (match(line, /"[^"]*"/)) {
+                print table "." key "\t" substr(line, RSTART + 1, RLENGTH - 2)
+                line = substr(line, RSTART + RLENGTH)
+            }
+            if (index(line, "]")) collecting = 0
+        }' "${file}" | jq -Rsc 'split("\n") | map(select(. != "") | split("\t")) as $rows
+            | {id: ([$rows[] | select(.[0] == "advisory.id") | .[1]][0]),
+               package: ([$rows[] | select(.[0] == "advisory.package") | .[1]][0]),
+               patched: [$rows[] | select(.[0] == "versions.patched") | .[1]],
+               unaffected: [$rows[] | select(.[0] == "versions.unaffected") | .[1]],
+               withdrawn: ([$rows[] | select(.[0] == "advisory.withdrawn") | .[1]][0])}'
+}
+
+# rs_audit_ignores_report MODE FILE CLASS: writes FILE, the ignores report:
+# each ignore with its source, the inputs it matched a finding in, the
+# advisories it names only by an alias, and, for an unused one, what the
+# database now says of its advisory. An ignore is unused when it matched no
+# finding in any input: one config often covers several lockfiles, and an
+# ignore is legitimately unused in those without the crate. Sets
+# RS_UNUSED_IGNORES to the unused IDs, as a JSON array, prints them (as
+# warnings), and sets RS_IGNORE_CASES to JUnit test cases for them, of
+# classname CLASS, failed with MODE deny and skipped with warn.
+rs_audit_ignores_report() {
+    local report entry advisory line ids=()
+    # shellcheck disable=SC2016 # jq program, not shell
+    report=$(jq -c --argjson matches "${RS_IGNORE_MATCHES}" 'map(. as $ignore | . + {
+            matched_in: [$matches[] | select(.ids | index($ignore.id)) | .input],
+            alias_of: ([$matches[].aliases[] | select(.alias == $ignore.id) | .id] | unique)}
+        | . + {used: (.matched_in | length > 0)})' <<< "${RS_IGNORES}")
+    mapfile -t ids < <(jq -r '.[] | select(.used | not) | .id' <<< "${report}")
+    for entry in ${ids[@]+"${ids[@]}"}; do
+        advisory=$(rs_advisory_versions "${RS_DB}" "${entry}")
+        # shellcheck disable=SC2016 # jq program, not shell
+        report=$(jq -c --arg id "${entry}" --argjson advisory "${advisory}" \
+            'map(if .id == $id and (.used | not) then . + {advisory: $advisory} else . end)' <<< "${report}")
+    done
+    # shellcheck disable=SC2016 # jq program, not shell
+    jq --arg mode "$1" --argjson inputs "$(jq -c '[.[].input]' <<< "${RS_IGNORE_MATCHES}")" '{mode: $mode, inputs: $inputs,
+        ignores: map({id, source, used, matched_in, alias_of, advisory: (.advisory // null)})}' <<< "${report}" > "$2"
+    # shellcheck disable=SC2034 # read by the scripts
+    RS_UNUSED_IGNORES=$(jq -c '[.ignores[] | select(.used | not) | .id] | unique' "$2")
+    while IFS= read -r line; do
+        if [[ "$1" == deny ]]; then
+            echo "  unused ignore: ${line}"
+        else
+            echo "WARN: unused ignore: ${line}" >&2
+        fi
+    done < <(jq -r '.ignores[] | select(.used | not) | "\(.id) (from \(.source)) matches no finding"
+        + (if (.alias_of | length) > 0 then "; it names \(.alias_of | join(", ")) by an alias, and cargo audit matches ignores by advisory ID only" else "" end)
+        + (if .advisory then "; the database'"'"'s \(.advisory.id) is for \(.advisory.package // "a crate")"
+            + (if .advisory.withdrawn then ", withdrawn on \(.advisory.withdrawn)" else "" end)
+            + (if (.advisory.patched | length) > 0 then ", patched in \(.advisory.patched | join(" or "))" else ", with no patched version" end)
+            + (if (.advisory.unaffected | length) > 0 then ", and leaves out \(.advisory.unaffected | join(" or "))" else "" end)
+          else "" end)' "$2")
+    # shellcheck disable=SC2034,SC2016 # read by the scripts; jq program, not shell
+    RS_IGNORE_CASES=$(jq -c --arg mode "$1" --arg class "$3" '[.ignores[] | select(.used | not) | {
+            classname: $class, name: .id, status: (if $mode == "deny" then "failed" else "skipped" end),
+            message: ("ignored in \(.source), but no finding matches it"
+                + (if (.alias_of | length) > 0 then " (it is an alias of \(.alias_of | join(", ")))" else "" end)),
+            detail: (if .advisory then (.advisory | tojson) else "" end)}]' "$2")
+}
+
 # rs_audit_summary JSON PREFIX: prints a cargo audit JSON report's findings,
 # one per line, each line starting with PREFIX.
 rs_audit_summary() {

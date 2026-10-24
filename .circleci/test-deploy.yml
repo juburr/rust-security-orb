@@ -309,6 +309,41 @@ jobs:
             expect_failure "ignored advisories have no reason in deny.toml (require_ignore_reasons)" deny \
               working_dir=tests/fixtures/app config_path=deny-ignore-bare.toml require_ignore_reasons=true
             bash tests/run_command.sh deny working_dir=tests/fixtures/app config_path=deny-ignore-reason.toml require_ignore_reasons=true
+      - run:
+          name: Verify Unused Ignores Are Found
+          command: |
+            # tests/fixtures/audit-ignores/.cargo/audit.toml ignores RUSTSEC-2021-0003, which the fixture's smallvec
+            # 1.6.0 has, and RUSTSEC-2023-0071, which nothing there has. Its own Cargo.lock has neither.
+            run() { bash tests/run_command.sh audit working_dir=tests/fixtures/audit-ignores no_fetch=true "$@" > /tmp/run.log 2>&1; }
+            if run lockfile=../app/Cargo.lock unused_ignores=deny output_dir=/tmp/ignores-deny; then
+              cat /tmp/run.log
+              echo "FAIL: an unused ignore passed with unused_ignores: deny."
+              exit 1
+            fi
+            cat /tmp/run.log
+            grep -q "1 ignores match no finding: RUSTSEC-2023-0071." /tmp/run.log
+            run lockfile=../app/Cargo.lock unused_ignores=warn junit=true run_record=true report_name=audit-ignores \
+              output_dir=/tmp/workspace/reports/detection
+            cat /tmp/run.log
+            grep -q "WARN: unused ignore: RUSTSEC-2023-0071 (from .cargo/audit.toml) matches no finding" /tmp/run.log
+            R=/tmp/workspace/reports/detection
+            jq -e '[.ignores[] | "\(.id) \(.used)"] == ["RUSTSEC-2021-0003 true", "RUSTSEC-2023-0071 false"]
+              and .ignores[1].advisory.package == "rsa"' "${R}/audit-ignores.ignores.json"
+            jq -e '.counts.unused_ignores == 1 and .outcome == "passed"' "${R}/audit-ignores.run-record.json"
+            run lockfile=../app/Cargo.lock output_dir=/tmp/ignores-allow
+            [[ ! -e /tmp/ignores-allow/cargo-audit.ignores.json ]]
+            # Used in one of two lockfiles that share the config is used.
+            if run lockfiles="Cargo.lock ../app/Cargo.lock" unused_ignores=deny output_dir=/tmp/ignores-two; then
+              cat /tmp/run.log
+              echo "FAIL: an ignore unused in both lockfiles passed with unused_ignores: deny."
+              exit 1
+            fi
+            jq -e '.ignores[0].matched_in == ["../app/Cargo.lock"] and ([.ignores[] | select(.used | not) | .id] == ["RUSTSEC-2023-0071"])' \
+              /tmp/ignores-two/cargo-audit.ignores.json
+            # cargo audit matches ignores by advisory ID only: one written as an alias ignores nothing.
+            bash tests/run_command.sh audit working_dir=tests/fixtures/app no_fetch=true unused_ignores=warn report_only=true \
+              extra_args="--ignore GHSA-43w2-9j62-hq99" output_dir=/tmp/ignores-alias > /tmp/run.log 2>&1
+            jq -e '.ignores[0] | .used == false and .alias_of == ["RUSTSEC-2021-0003"]' /tmp/ignores-alias/cargo-audit.ignores.json
       - rust-security-orb/licenses:
           working_dir: *fixture
           all_features: true

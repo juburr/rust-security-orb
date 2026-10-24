@@ -70,6 +70,15 @@ parameters:
     description: >
       Skip the check for yanked crates (cargo audit --no-yanked, cargo-audit 0.22.2 and
       later), which otherwise queries the crates.io index.
+  unused_ignores:
+    type: enum
+    enum: ["allow", "warn", "deny"]
+    default: allow
+    description: >
+      What to do about an ignore (in the audit.toml cargo audit reads, or --ignore in extra_args)
+      that matches no finding in any of the binaries: allow, the default, doesn't check; warn
+      reports each one; deny also fails the step. Each binary is audited again, offline, without
+      the ignores, as audit's unused_ignores does. Writes <report_name>.ignores.json.
   extra_args:
     type: string
     default: ""
@@ -144,6 +153,7 @@ steps:
         PARAM_SARIF: << parameters.sarif >>
         PARAM_TARGET_ARCH: << parameters.target_arch >>
         PARAM_TARGET_OS: << parameters.target_os >>
+        PARAM_UNUSED_IGNORES: << parameters.unused_ignores >>
         SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
       command: << include(scripts/audit_bin.sh) >>
   - when:

@@ -5,6 +5,8 @@
 # record. With lockfiles, it audits each lockfile on its own, with its own
 # reports (<report_name>-<slug>.json, .sarif, .log), lists them in an index,
 # <report_name>.json, and fails the step only once every one is audited.
+# With unused_ignores, it audits each lockfile once more without the ignores,
+# and reports those that match no finding in any of them.
 #
 # cargo-audit exits 1 both when it finds vulnerabilities (or warnings that
 # deny makes errors) and when it fails, so the exit code alone can't tell
@@ -26,6 +28,7 @@ SARIF=$(rs_bool sarif "${PARAM_SARIF}")
 JUNIT=$(rs_bool junit "${PARAM_JUNIT}")
 REPORT_ONLY=$(rs_bool report_only "${PARAM_REPORT_ONLY}")
 RUN_RECORD=$(rs_bool run_record "${PARAM_RUN_RECORD}")
+UNUSED_IGNORES=${PARAM_UNUSED_IGNORES}
 rs_output "${PARAM_OUTPUT_DIR}" "${PARAM_REPORT_NAME}"
 rs_audit_extra_args
 rs_require_jq
@@ -72,6 +75,14 @@ for lockfile in "${LOCKFILES[@]}"; do
 done
 
 rs_audit_options
+IGNORE_DIR=""
+case "${UNUSED_IGNORES}" in
+    warn | deny)
+        IGNORE_DIR=$(mktemp -d)
+        trap 'rm -rf "${IGNORE_DIR}"' EXIT
+        ;;
+esac
+rs_audit_ignores_prepare "${UNUSED_IGNORES}" "${IGNORE_DIR}"
 # The arguments every lockfile's audit shares, for the run record; with one
 # lockfile, its --file too.
 # shellcheck disable=SC2034 # read by rs_run_record
@@ -136,6 +147,10 @@ for ((i = 0; i < ${#LOCKFILES[@]}; i++)); do
     if ! rs_audit_check "${base}.log" "${base}.json" "${rc}"; then
         audit_error "${rc}"
     fi
+    if [[ -n "${IGNORE_DIR}" ]] \
+        && ! rs_audit_ignores_pass "${IGNORE_DIR}" "${base}.json" "${lockfile}" --file "$(realpath -m -s -- "${lockfile}")"; then
+        audit_error 1
+    fi
 
     if [[ "${SARIF}" == true ]]; then
         # The JSON pass fetched the database if it was going to, so this pass
@@ -193,15 +208,29 @@ else
     WHERE=${LOCKFILE}
 fi
 
+# Ignores that matched no finding in any lockfile.
+UNUSED="[]"
+if [[ -n "${IGNORE_DIR}" ]]; then
+    rs_audit_ignores_report "${UNUSED_IGNORES}" "${RS_BASE}.ignores.json" cargo-audit.unused-ignore
+    RS_REPORTS+=("${RS_BASE}.ignores.json")
+    UNUSED=${RS_UNUSED_IGNORES}
+    # shellcheck disable=SC2016 # jq program, not shell
+    RS_COUNTS=$(jq -c --argjson unused "${UNUSED}" '. + {unused_ignores: ($unused | length)}' <<< "${RS_COUNTS}")
+    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}-ignores" --argjson cases "${RS_IGNORE_CASES}" \
+        '. + [{name: $name, cases: $cases}]' <<< "${SUITES}")
+fi
+
 if [[ "${JUNIT}" == true ]]; then
     rs_junit_suites "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${SUITES}"
     RS_REPORTS+=("${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml")
 fi
 
 FINDINGS=false
-OUTCOME=passed
-if [[ "${FAILED_CODE}" -ne 0 ]]; then
+if [[ "${FAILED_CODE}" -ne 0 || ( "${UNUSED_IGNORES}" == deny && "${UNUSED}" != "[]" ) ]]; then
     FINDINGS=true
+fi
+OUTCOME=passed
+if [[ "${FINDINGS}" == true ]]; then
     OUTCOME=findings
     if [[ "${REPORT_ONLY}" == true ]]; then
         OUTCOME=findings-reported
@@ -214,7 +243,10 @@ MESSAGE="cargo audit found $(jq '.vulnerabilities' <<< "${RS_COUNTS}") vulnerabi
 if [[ "$(jq '.denied_by_config' <<< "${RS_COUNTS}")" == true ]]; then
     MESSAGE="${MESSAGE} cargo audit's own config (the deny list in .cargo/audit.toml) denied them."
 fi
-if [[ "${MULTI}" == true && "${FINDINGS}" == true ]]; then
+if [[ "${MULTI}" == true && "${FAILED_CODE}" -ne 0 ]]; then
     MESSAGE="${MESSAGE} Findings in: $(jq -r '[.[] | select(.outcome != "passed") | .lockfile] | join(", ")' <<< "${INDEX}")."
+fi
+if [[ "${UNUSED}" != "[]" ]]; then
+    MESSAGE="${MESSAGE} $(jq -r 'length' <<< "${UNUSED}") ignores match no finding: $(jq -r 'join(", ")' <<< "${UNUSED}")."
 fi
 rs_gate "${FINDINGS}" "${REPORT_ONLY}" "${MESSAGE}"

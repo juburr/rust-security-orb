@@ -84,6 +84,23 @@ parameters:
     description: >
       Skip the check for yanked crates (cargo audit --no-yanked, cargo-audit
       0.22.2 and later), which otherwise queries the crates.io index.
+  unused_ignores:
+    type: enum
+    enum: ["allow", "warn", "deny"]
+    default: allow
+    description: >
+      What to do about an ignore (in the audit.toml cargo audit reads, or --ignore in
+      extra_args) that matches no finding, with the levels of cargo-deny's
+      unused-ignored-advisory: allow, the default, doesn't check; warn reports each one; deny
+      also fails the step. cargo audit's report doesn't say which ignores applied, so this
+      audits each lockfile again, offline, with a copy of the config without its ignores: an
+      ignore is used when its advisory's ID matches a finding there. cargo audit doesn't
+      match ignores against aliases, so one written as a CVE or GHSA ID is unused, and the
+      report names the advisory to ignore instead. An ignore is unused only if no lockfile
+      the step audits has a finding for it, so with one config shared by several lockfiles,
+      name them all in lockfiles: audited one at a time, each would report the others'
+      ignores. Writes <report_name>.ignores.json, with what the database now says of each
+      unused ignore's advisory. A config this can't rewrite exactly fails the step.
   extra_args:
     type: string
     default: ""
@@ -160,6 +177,7 @@ steps:
         PARAM_SARIF: << parameters.sarif >>
         PARAM_TARGET_ARCH: << parameters.target_arch >>
         PARAM_TARGET_OS: << parameters.target_os >>
+        PARAM_UNUSED_IGNORES: << parameters.unused_ignores >>
         SCRIPT_RUST_SECURITY_LIB: << include(scripts/lib/rust_security.sh) >>
       command: << include(scripts/audit.sh) >>
   - when:

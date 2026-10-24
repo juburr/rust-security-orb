@@ -124,7 +124,11 @@ EOF
 # packages), exit1 (exits 1, reporting nothing), yanked-unchecked (the
 # crates.io index was unreachable) or vuln-warn (a vulnerability and an
 # unmaintained crate). A lockfile that holds "STUB_VULN" is vuln whatever
-# STUB_AUDIT says.
+# STUB_AUDIT says. Like cargo audit, it drops the findings whose advisory ID
+# the config's advisories.ignore (read with Python's tomllib, from
+# .cargo/audit.toml in the directory it runs in, or else CARGO_HOME's) or an
+# --ignore names, and reports both in settings.ignore. STUB_EXTRA_IGNORE
+# adds one it reports, and STUB_PASS=crash fails a run with --no-yanked.
 {
     echo '#!/usr/bin/env bash'
     record
@@ -138,6 +142,23 @@ for a in "$@"; do
     prev=${a}
 done
 if [[ "${mode}" == crash ]]; then echo "error: couldn't load the advisory database" >&2; exit 1; fi
+if [[ "${STUB_PASS:-}" == crash && "${args}" == *" --no-yanked "* ]]; then echo "error: the second pass failed" >&2; exit 1; fi
+config=.cargo/audit.toml
+[[ -f "${config}" ]] || config="${CARGO_HOME:-${HOME}/.cargo}/audit.toml"
+ignores="[]"
+if [[ -f "${config}" ]] && grep -q ignore "${config}"; then
+    if ! ignores=$(python3 -I -c 'import json, sys, tomllib; print(json.dumps(tomllib.load(open(sys.argv[1], "rb")).get("advisories", {}).get("ignore", [])))' "${config}" 2>&1); then
+        echo "error: invalid config ${config}: ${ignores}" >&2; exit 1
+    fi
+fi
+prev=""
+for a in "$@"; do
+    if [[ "${prev}" == --ignore ]]; then ignores=$(jq -c --arg id "${a}" '. + [$id]' <<< "${ignores}"); fi
+    if [[ "${a}" == --ignore=* ]]; then ignores=$(jq -c --arg id "${a#--ignore=}" '. + [$id]' <<< "${ignores}"); fi
+    prev=${a}
+done
+reported=${ignores}
+if [[ -n "${STUB_EXTRA_IGNORE:-}" ]]; then reported=$(jq -c --arg id "${STUB_EXTRA_IGNORE}" '. + [$id]' <<< "${ignores}"); fi
 if [[ "${mode}" == nodata && "${args}" == *" bin "* ]]; then
     echo "error: parse error: No dependency information found! Is this a Rust executable built with cargo?" >&2; exit 2
 fi
@@ -149,7 +170,7 @@ if [[ "${mode}" == vuln-warn ]]; then
     mode=vuln
 fi
 if [[ "${mode}" == vuln ]]; then
-    vulns='{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2021-0003","package":"smallvec","title":"Buffer overflow <in> SmallVec & co","url":"https://example.test/252"},"versions":{"patched":[">=1.6.1"]},"package":{"name":"smallvec","version":"1.6.0"}}]}'
+    vulns='{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2021-0003","aliases":["CVE-2021-25900","GHSA-43w2-9j62-hq99"],"package":"smallvec","title":"Buffer overflow <in> SmallVec & co","url":"https://example.test/252"},"versions":{"patched":[">=1.6.1"]},"package":{"name":"smallvec","version":"1.6.0"}}]}'
     rc=1
 elif [[ "${mode}" == warn || "${mode}" == warn-config ]]; then
     warnings='{"unmaintained":[{"kind":"unmaintained","package":{"name":"ansi_term","version":"0.12.1"},"advisory":{"id":"RUSTSEC-2021-0139","title":"ansi_term is unmaintained"}}]}'
@@ -167,7 +188,14 @@ fi
 count=4
 [[ "${mode}" == empty ]] && count=0
 printf '{"database":{"advisory-count":3,"last-commit":null,"last-updated":null},"lockfile":{"dependency-count":%s},"vulnerabilities":%s,"warnings":%s}\n' \
-    "${count}" "${vulns}" "${warnings}"
+    "${count}" "${vulns}" "${warnings}" | jq -c --argjson ignore "${ignores}" --argjson reported "${reported}" '.settings = {ignore: $reported}
+        | .vulnerabilities.list |= map(select(.advisory.id as $id | $ignore | index($id) | not))
+        | .vulnerabilities.count = (.vulnerabilities.list | length) | .vulnerabilities.found = (.vulnerabilities.count > 0)
+        | .warnings |= (map_values(map(select((.advisory.id // "") as $id | $ignore | index($id) | not))) | with_entries(select(.value | length > 0)))' \
+    > "${TMPDIR:-/tmp}/stub-audit.$$"
+if [[ "${mode}" == vuln && "$(jq '.vulnerabilities.count' "${TMPDIR:-/tmp}/stub-audit.$$")" -eq 0 ]]; then rc=0; fi
+cat "${TMPDIR:-/tmp}/stub-audit.$$"
+rm -f "${TMPDIR:-/tmp}/stub-audit.$$"
 exit "${rc}"
 EOF
 } > "${STUBS}/cargo-audit"
@@ -917,7 +945,7 @@ check "saying so" said "Could not unpack"
 # --- audit
 DEFAULTS=(PARAM_LOCKFILE= PARAM_LOCKFILES= PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false PARAM_NO_YANKED=false
     PARAM_DENY= PARAM_TARGET_ARCH= PARAM_TARGET_OS= PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set
-    PARAM_REPORT_NAME=cargo-audit PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0)
+    PARAM_REPORT_NAME=cargo-audit PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0 PARAM_UNUSED_IGNORES=allow)
 audit_case() {
     new_case
     echo "# lockfile" > "${CASE}/work/Cargo.lock"
@@ -1171,6 +1199,128 @@ crates/b/Cargo.lock
 crates/a/Cargo.lock"
 check "lockfiles takes newlines, and audits a lockfile named twice once" call_count cargo-audit 5
 
+begin "audit: unused ignores"
+# ignores_case: a lockfile whose smallvec RUSTSEC-2021-0003 affects, and a
+# .cargo/audit.toml that ignores it and an advisory that matches nothing,
+# in an array that spans lines and holds comments.
+ignores_case() {
+    audit_case
+    echo "# STUB_VULN" >> "${CASE}/work/Cargo.lock"
+    mkdir -p "${CASE}/work/.cargo"
+    cat > "${CASE}/work/.cargo/audit.toml" << 'TOML'
+[advisories]
+ignore = [
+    # smallvec: insert_many is never called [reviewed]
+    "RUSTSEC-2021-0003",
+    'RUSTSEC-2023-0071', # rsa, which this project doesn't use
+]
+informational_warnings = ["unmaintained"]
+
+[output]
+quiet = false
+TOML
+}
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=deny PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "an unused ignore fails the step with deny" failed
+check "naming it, and where it is" said "unused ignore: RUSTSEC-2023-0071 (from .cargo/audit.toml) matches no finding"
+check "and why the step failed" said "ERROR: cargo audit found 0 vulnerabilities and 0 denied warnings in Cargo.lock. 1 ignores match no finding: RUSTSEC-2023-0071."
+check "after auditing again, offline, without the ignores" \
+    called_with cargo-audit audit --no-fetch --no-yanked --json --file "${CASE}/work/Cargo.lock"
+check "from a directory whose .cargo/audit.toml, a copy without the ignores, cargo audit read: it found the ignored advisory" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0] | "\(.id) \(.used) \(.matched_in | join(","))"' "RUSTSEC-2021-0003 true Cargo.lock"
+check "the report says which is unused" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[1] | "\(.id) \(.used) \(.source)"' \
+    "RUSTSEC-2023-0071 false .cargo/audit.toml"
+check "leaving cargo audit's own report alone" json_is "${CASE}/out/cargo-audit.json" '.vulnerabilities.count' 0
+check "JUnit fails it, in a suite of its own" \
+    file_has "${CASE}/out/junit/cargo-audit.xml" '<testsuite name="cargo-audit-ignores" tests="1" failures="1"'
+check "the run record counts it" json_is "${CASE}/out/cargo-audit.run-record.json" '"\(.outcome) \(.counts.unused_ignores)"' "findings 1"
+check "and lists the ignores report" json_is "${CASE}/out/cargo-audit.run-record.json" '[.reports[].path | split("/")[-1]] | index("cargo-audit.ignores.json") != null' true
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn PARAM_JUNIT=true
+check "warn passes" succeeded
+check "with a warning" said "WARN: unused ignore: RUSTSEC-2023-0071 (from .cargo/audit.toml) matches no finding"
+check "and a skipped JUnit case" file_has "${CASE}/out/junit/cargo-audit.xml" '<testsuite name="cargo-audit-ignores" tests="1" failures="0" skipped="1"'
+ignores_case
+run audit.sh
+check "allow, the default, doesn't check" succeeded
+check "auditing once" call_count cargo-audit 3
+check "and writing no ignores report" absent "${CASE}/out/cargo-audit.ignores.json"
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn "PARAM_EXTRA_ARGS=--ignore GHSA-43w2-9j62-hq99 --ignore=RUSTSEC-2021-0139"
+check "takes --ignore and --ignore= from extra_args" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '[.ignores[] | "\(.id)=\(.source)"] | join(" ")' \
+    "RUSTSEC-2021-0003=.cargo/audit.toml RUSTSEC-2023-0071=.cargo/audit.toml GHSA-43w2-9j62-hq99=extra_args RUSTSEC-2021-0139=extra_args"
+check "leaving them out of the second pass" not_called_with cargo-audit --no-yanked --ignore
+check "an ignore that names an advisory by an alias is unused, since cargo audit matches IDs only" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[2] | "\(.used) \(.alias_of | join(","))"' "false RUSTSEC-2021-0003"
+check "saying which advisory to ignore instead" said "it names RUSTSEC-2021-0003 by an alias, and cargo audit matches ignores by advisory ID only"
+ignores_case
+printf 'advisories.ignore = ["RUSTSEC-2021-0003", "RUSTSEC-2023-0071"]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit.sh PARAM_UNUSED_IGNORES=warn
+check "reads advisories.ignore written as a dotted key" said "WARN: unused ignore: RUSTSEC-2023-0071"
+check "and still finds the used one" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0].used' true
+for config in 'advisories = { ignore = ["RUSTSEC-2021-0003"] }' $'[advisories]\nignore = ["RUSTSEC\\u002d2021-0003"]' \
+    $'[advisories]\nignore = ["""RUSTSEC-2021-0003"""]' $'[advisories]\nignore = [ { id = "x" } ]' $'[advisories]\nignore = [\n  "RUSTSEC-2021-0003",' \
+    $'[advisories]\nignore = "RUSTSEC-2021-0003"'; do
+    ignores_case
+    printf '%s\n' "${config}" > "${CASE}/work/.cargo/audit.toml"
+    run audit.sh PARAM_UNUSED_IGNORES=warn
+    check "a config it can't rewrite exactly fails the step ($(head -c 40 <<< "${config//$'\n'/ }"))" failed
+    check "saying so" said "ERROR: unused_ignores can't read .cargo/audit.toml's advisories.ignore exactly"
+    check "before running cargo audit" call_count cargo-audit 0
+done
+ignores_case
+mkdir -p "${CASE}/cargo"
+mv "${CASE}/work/.cargo/audit.toml" "${CASE}/cargo/audit.toml"
+run audit.sh PARAM_UNUSED_IGNORES=warn "CARGO_HOME=${CASE}/cargo"
+check "reads the ignores of a config only in CARGO_HOME" said "WARN: unused ignore: RUSTSEC-2023-0071 (from ${CASE}/cargo/audit.toml)"
+check "and shadows it in the second pass" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0].used' true
+ignores_case
+mkdir -p "${CASE}/work/crates/a"
+echo "# lockfile" > "${CASE}/work/crates/a/Cargo.lock"
+run audit.sh PARAM_UNUSED_IGNORES=deny "PARAM_LOCKFILES=Cargo.lock crates/a/Cargo.lock"
+check "an ignore used in one of several lockfiles isn't unused" \
+    json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[0] | "\(.used) \(.matched_in | join(","))"' "true Cargo.lock"
+check "while one used in none is" said "unused ignore: RUSTSEC-2023-0071"
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn STUB_EXTRA_IGNORE=RUSTSEC-2099-0001 PARAM_RUN_RECORD=true
+check "ignores cargo audit applied that the config reader missed fail the step" failed
+check "saying so" said "ERROR: cargo audit applied the ignores"
+check "with an error run record" json_is "${CASE}/out/cargo-audit.run-record.json" .outcome error
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=warn STUB_PASS=crash
+check "a second pass that doesn't complete fails the step" failed
+check "saying so" said "ERROR: cargo audit did not complete without the ignores"
+ignores_case
+make_db "${CASE}/db" 3
+mkdir -p "${CASE}/db/crates/rsa"
+cat > "${CASE}/db/crates/rsa/RUSTSEC-2023-0071.md" << 'ADVISORY'
+```toml
+[advisory]
+id = "RUSTSEC-2023-0071"
+package = "rsa"
+aliases = ["CVE-2023-49092"]
+
+[versions]
+patched = []
+unaffected = [
+    "< 0.1.0", # before the timing side channel
+]
+```
+
+# Marvin Attack
+ADVISORY
+"${REAL_GIT}" -C "${CASE}/db" add -A && "${REAL_GIT}" -C "${CASE}/db" -c user.name=t -c user.email=t@example.test commit -q -m rsa
+run audit.sh PARAM_UNUSED_IGNORES=warn "PARAM_DB_PATH=${CASE}/db" PARAM_NO_FETCH=true
+check "names what the database says of an unused ignore's advisory" said "the database's RUSTSEC-2023-0071 is for rsa, with no patched version, and leaves out < 0.1.0"
+check "in the report too" json_is "${CASE}/out/cargo-audit.ignores.json" '.ignores[1].advisory | "\(.package) \(.unaffected | join(","))"' "rsa < 0.1.0"
+check "passing the second pass that database" called_with cargo-audit --db "${CASE}/db" --no-fetch --no-yanked
+ignores_case
+run audit.sh PARAM_UNUSED_IGNORES=never
+check "unused_ignores refuses another value" failed
+check "saying which it takes" said "unused_ignores must be allow, warn or deny"
+
 begin "audit: the advisory database"
 audit_case
 run audit.sh "RUSTSEC_ADVISORY_DB=${CASE}/db"
@@ -1354,7 +1504,7 @@ check "and the run record has no SHA-512 for the tool" json_is "${CASE}/out/carg
 # --- audit_bin
 DEFAULTS=(PARAM_BINARIES="app" PARAM_REQUIRE_AUDITABLE=0 PARAM_DB_PATH= PARAM_NO_FETCH=false PARAM_ALLOW_STALE=false
     PARAM_NO_YANKED=false PARAM_DENY= PARAM_TARGET_ARCH= PARAM_TARGET_OS= PARAM_EXTRA_ARGS= PARAM_OUTPUT_DIR=/will/be/set
-    PARAM_REPORT_NAME=cargo-audit-bin PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0)
+    PARAM_REPORT_NAME=cargo-audit-bin PARAM_SARIF=1 PARAM_JUNIT=0 PARAM_REPORT_ONLY=0 PARAM_RUN_RECORD=0 PARAM_UNUSED_IGNORES=allow)
 bin_case() {
     new_case
     mkdir -p "${CASE}/work/target/release" "${CASE}/work/dist"
@@ -1447,6 +1597,15 @@ check "saying so" said "matches no file"
 bin_case
 run audit_bin.sh PARAM_BINARIES=
 check "no binaries fails" failed
+bin_case
+mkdir -p "${CASE}/work/.cargo"
+printf '[advisories]\nignore = ["RUSTSEC-2021-0003", "RUSTSEC-2023-0071"]\n' > "${CASE}/work/.cargo/audit.toml"
+run audit_bin.sh STUB_AUDIT=vuln "PARAM_BINARIES=app target/release/tool" PARAM_UNUSED_IGNORES=deny PARAM_JUNIT=true
+check "unused_ignores audits each binary again without the ignores" called_with cargo-audit --no-yanked --json bin "${CASE}/work/target/release/tool"
+check "and fails on an ignore no binary needs" failed
+check "naming it" said "unused ignore: RUSTSEC-2023-0071"
+check "while the used one isn't" json_is "${CASE}/out/cargo-audit-bin.ignores.json" '.ignores[0] | "\(.used) \(.matched_in | join(","))"' "true app,target/release/tool"
+check "in a JUnit suite of its own" file_has "${CASE}/out/junit/cargo-audit-bin.xml" '<testsuite name="cargo-audit-bin-ignores" tests="1" failures="1"'
 bin_case
 run audit_bin.sh STUB_SARIF=crash PARAM_RUN_RECORD=1
 check "a SARIF pass that fails fails the step" failed

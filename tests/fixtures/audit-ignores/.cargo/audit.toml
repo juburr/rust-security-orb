@@ -1,0 +1,13 @@
+# For audit's unused_ignores: run cargo audit here, on ../app/Cargo.lock.
+# RUSTSEC-2021-0003 matches the fixture's smallvec 1.6.0, and
+# RUSTSEC-2023-0071 (rsa) matches nothing in it.
+
+[advisories]
+ignore = [
+    # smallvec 1.6.0: insert_many is never called [reviewed]
+    "RUSTSEC-2021-0003",
+    "RUSTSEC-2023-0071", # rsa is not a dependency
+]
+
+[output]
+quiet = false
