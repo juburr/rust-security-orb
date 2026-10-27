@@ -13,8 +13,17 @@ parameters:
       Absolute path of the directory the reporting commands wrote into: the output_dir they were
       given. Environment variables are not expanded, since CircleCI reads the path when it
       compiles the config.
+  store_artifacts:
+    type: boolean
+    default: true
+    description: >
+      Store output_dir. A job that takes a store_artifacts setting of its own can pass it here,
+      after setting store_artifacts to false on each reporting command.
 steps:
-  - store_artifacts:
-      path: << parameters.output_dir >>
-      destination: rust-security-reports
-      when: always
+  - when:
+      condition: << parameters.store_artifacts >>
+      steps:
+        - store_artifacts:
+            path: << parameters.output_dir >>
+            destination: rust-security-reports
+            when: always

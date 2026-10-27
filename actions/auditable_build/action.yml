@@ -1,0 +1,37 @@
+name: Build with cargo auditable
+description: >
+  Builds with cargo auditable, which embeds the resolved dependency list of every binary it links
+  (in the .dep-v0 section), for audit_bin and verify_auditable to read back from the shipped file.
+  It decides no build options: extra_args passes them all to cargo. Needs cargo and cargo-auditable
+  (the install command installs it by default). The GitHub Actions twin of the orb's auditable_build
+  command.
+author: juburr
+
+inputs:
+  extra_args:
+    description: >
+      The cargo arguments, split like shell words, such as "--release --locked -p app --features
+      tls-rustls --target x86_64-unknown-linux-musl"; nothing in them is expanded or run. Every
+      argument reaches cargo unchanged, including -Z sbom on nightly Cargo, which is unstable.
+    default: ""
+  subcommand:
+    description: >
+      The cargo subcommand to run auditably.
+    default: build
+  working_dir:
+    description: >
+      Directory to build in.
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: cargo auditable
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_EXTRA_ARGS: ${{ inputs.extra_args }}
+        PARAM_SUBCOMMAND: ${{ inputs.subcommand }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/auditable_build.sh"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"

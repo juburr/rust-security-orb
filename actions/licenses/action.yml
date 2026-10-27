@@ -1,0 +1,131 @@
+name: List licences with cargo deny
+description: >
+  Writes a licence inventory of every crate in the dependency graph with cargo deny list, as JSON
+  and TSV: an artifact for legal review, apart from the pass/fail licences check deny runs. It
+  reports and never gates. Check the feature set and target you ship, since they decide the graph.
+  The GitHub Actions twin of the orb's licenses command.
+author: juburr
+
+inputs:
+  all_features:
+    description: >
+      Enable every feature (--all-features).
+    default: "false"
+  config_path:
+    description: >
+      The cargo-deny config to use (--config). Defaults to the first deny.toml, .deny.toml or
+      .cargo/deny.toml cargo deny finds in the manifest's directory or above. A path that doesn't
+      exist fails the step, rather than fall back to cargo-deny's default config.
+    default: ""
+  features:
+    description: >
+      Features to enable (--features), separated by commas or spaces. Check the feature set you
+      ship: it decides the dependency graph.
+    default: ""
+  formats:
+    description: >
+      The inventory's formats, separated by commas or spaces: json, tsv, or both.
+    default: "json,tsv"
+  layout:
+    description: >
+      List licences per crate, or crates per licence.
+    default: crate
+  locked:
+    description: >
+      Fail when Cargo.lock is out of date, instead of updating it (--locked).
+    default: "false"
+  manifest_path:
+    description: >
+      The Cargo.toml to check (cargo deny --manifest-path), relative to working_dir. Defaults to the
+      one in working_dir.
+    default: ""
+  metadata_path:
+    description: >
+      Check against this pre-generated cargo metadata output (--metadata-path) instead of running
+      cargo metadata, for a reproducible graph with no network.
+    default: ""
+  no_default_features:
+    description: >
+      Disable the default features (--no-default-features).
+    default: "false"
+  offline:
+    description: >
+      Run without network access (--offline): cargo deny doesn't fetch the advisory database
+      (fetch_advisory_db provides it) and cargo metadata uses only cargo's cache, so warm it or use
+      metadata_path. The database's age is checked against deny.toml's maximum-db-staleness (90 days
+      by default).
+    default: "false"
+  output_dir:
+    description: >
+      Absolute path of the directory to write the reports into.
+    default: /tmp/rust-security-reports
+  report_name:
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+    default: licenses
+  run_record:
+    description: >
+      Also write <report_name>.run-record.json: cargo-deny's version and SHA-512 and how it was
+      installed, the inputs' SHA-256, the arguments and every report's SHA-256.
+    default: "false"
+  store_artifacts:
+    description: >
+      Upload output_dir as a workflow artifact, named rust-security-reports-<report_name> and a
+      random suffix, including when the step fails.
+    default: "true"
+  target:
+    description: >
+      Check only the dependencies of this target triple (--target), such as
+      x86_64-unknown-linux-gnu. deny.toml's [graph] targets lists several.
+    default: ""
+  working_dir:
+    description: >
+      Directory to run cargo deny list in. Relative paths are relative to it.
+    default: .
+
+runs:
+  using: composite
+  steps:
+    # Artifact names must be unique in a workflow run, and the same command
+    # can run in several jobs or matrix legs, so the name ends in a random
+    # suffix.
+    - name: Name the reports artifact
+      id: artifact
+      if: (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.report_name }}
+      run: |
+        if [[ ! "${REPORT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            REPORT_NAME=reports
+        fi
+        printf 'name=rust-security-reports-%s-%s\n' "${REPORT_NAME}" "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" >> "${GITHUB_OUTPUT}"
+    - name: cargo deny list
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_ALL_FEATURES: ${{ inputs.all_features }}
+        PARAM_CONFIG_PATH: ${{ inputs.config_path }}
+        PARAM_FEATURES: ${{ inputs.features }}
+        PARAM_FORMATS: ${{ inputs.formats }}
+        PARAM_LAYOUT: ${{ inputs.layout }}
+        PARAM_LOCKED: ${{ inputs.locked }}
+        PARAM_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        PARAM_METADATA_PATH: ${{ inputs.metadata_path }}
+        PARAM_NO_DEFAULT_FEATURES: ${{ inputs.no_default_features }}
+        PARAM_OFFLINE: ${{ inputs.offline }}
+        PARAM_OUTPUT_DIR: ${{ inputs.output_dir }}
+        PARAM_REPORT_NAME: ${{ inputs.report_name }}
+        PARAM_RUN_RECORD: ${{ inputs.run_record }}
+        PARAM_TARGET: ${{ inputs.target }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/licenses.sh"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"
+    - name: Upload the reports
+      if: always() && (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ inputs.output_dir }}
+        if-no-files-found: ignore

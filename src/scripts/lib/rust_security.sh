@@ -615,12 +615,11 @@ rs_run_record() {
         --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg cwd "$(pwd)" \
         --argjson tool "${tool_json}" --argjson others "${others}" --argjson toolchain "${toolchain}" --argjson db "${db_json}" \
         --argjson inputs "${inputs}" --argjson reports "${reports}" --argjson counts "${RS_COUNTS:-null}" \
-        --arg build_url "${CIRCLE_BUILD_URL:-}" --arg sha1 "${CIRCLE_SHA1:-}" --arg job "${CIRCLE_JOB:-}" \
-        --argjson args "${args}" --argjson exceptions "${RS_EXCEPTIONS:-null}" '{
+        --argjson ci "$(rs_ci_json)" --argjson args "${args}" --argjson exceptions "${RS_EXCEPTIONS:-null}" '{
             schema: "https://github.com/juburr/rust-security-orb/blob/main/schemas/run-record.v1.json",
             command: $command, outcome: $outcome, exit_code: $code,
             started_at: $started, finished_at: $finished,
-            ci: (if $build_url == "" then null else {build_url: $build_url, sha1: $sha1, job: $job} end),
+            ci: $ci,
             working_directory: $cwd,
             tool: $tool, other_tools: $others, arguments: $args, toolchain: $toolchain,
             advisory_db: $db, inputs: $inputs, counts: $counts, reports: $reports
@@ -629,6 +628,21 @@ rs_run_record() {
         return 0
     fi
     echo "Run record: ${file}"
+}
+
+# rs_ci_json: the CI job a run record names: a CircleCI job, a GitHub Actions
+# run, or null.
+rs_ci_json() {
+    if [[ -n "${CIRCLE_BUILD_URL:-}" ]]; then
+        jq -cn --arg url "${CIRCLE_BUILD_URL}" --arg sha "${CIRCLE_SHA1:-}" --arg job "${CIRCLE_JOB:-}" \
+            '{provider: "circleci", build_url: $url, sha1: $sha, job: $job}'
+    elif [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+        jq -cn --arg url "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}/attempts/${GITHUB_RUN_ATTEMPT:-1}" \
+            --arg sha "${GITHUB_SHA:-}" --arg job "${GITHUB_JOB:-}" \
+            '{provider: "github-actions", build_url: $url, sha1: $sha, job: $job}'
+    else
+        echo null
+    fi
 }
 
 # rs_public_args ARG...: prints the arguments as a JSON array, with every URL

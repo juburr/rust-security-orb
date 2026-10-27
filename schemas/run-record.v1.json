@@ -27,13 +27,14 @@
     "started_at": { "$ref": "#/$defs/timestamp" },
     "finished_at": { "$ref": "#/$defs/timestamp" },
     "ci": {
-      "description": "The CircleCI job, from CIRCLE_BUILD_URL, CIRCLE_SHA1 and CIRCLE_JOB; null outside CircleCI.",
+      "description": "The CI job the command ran in: a CircleCI job (from CIRCLE_BUILD_URL, CIRCLE_SHA1 and CIRCLE_JOB), or a GitHub Actions run (from GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_SHA and GITHUB_JOB); null elsewhere. Records written before GitHub Actions support have no provider.",
       "oneOf": [
         { "type": "null" },
         {
           "type": "object",
           "required": ["build_url", "sha1", "job"],
           "properties": {
+            "provider": { "enum": ["circleci", "github-actions"] },
             "build_url": { "type": "string" },
             "sha1": { "type": "string" },
             "job": { "type": "string" }

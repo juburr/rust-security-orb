@@ -1,0 +1,195 @@
+name: Expect a dependency graph shape
+description: >
+  Fails unless a depth-bounded part of the dependency graph cargo tree resolves is exactly the set
+  of packages that was reviewed: the premise of an exception, such as "only this crate depends on
+  the one with the advisory", or "this licence exception covers one crate at one version, which only
+  the fuzz target uses". A new dependent, a changed version, or the subject leaving the graph fails
+  it, so the exception is reviewed again. Whether the subject is in the graph comes from the full
+  graph of the same selection, not from cargo tree's error. Writes the trees cargo tree printed and
+  a JSON report with the missing and unexpected packages. Needs cargo. The GitHub Actions twin of
+  the orb's tree_expect command.
+author: juburr
+
+inputs:
+  all_features:
+    description: >
+      Enable every feature (--all-features).
+    default: "false"
+  depth:
+    description: >
+      How many levels of the tree to compare (cargo tree --depth, with --no-dedupe, so a package
+      within depth by any path counts); 1 is the subject and its direct dependents or dependencies.
+    required: true
+  edges:
+    description: >
+      The dependency kinds to follow (--edges), separated by commas or spaces: all, normal, build,
+      dev, no-normal, no-build, no-dev, no-proc-macro. Defaults to cargo tree's (normal, build and
+      dev). no-dev checks what ships, build scripts included.
+    default: ""
+  exception:
+    description: >
+      The exceptions or boundaries this check guards, such as RUSTSEC-2023-0071, licence:MPL-2.0 or
+      boundary:server, separated by commas, spaces or newlines. Free-form: they are carried into the
+      JSON report and the run record, so a reader can tell what the check is a premise of.
+    default: ""
+  expected:
+    description: >
+      Every package the tree must hold and nothing else, the subject included, separated by commas,
+      spaces or newlines: name@version for a registry package (crates.io or another),
+      path:name@version for a path package, git:name@version for a git one, and {root} for the
+      selection's root package (the manifest's package, or package), which lets one expectation fit
+      every manifest of manifest_paths. Quote a value that starts with {root} in YAML. Order doesn't
+      matter.
+    required: true
+  features:
+    description: >
+      Features to enable (--features), separated by commas or spaces.
+    default: ""
+  frozen:
+    description: >
+      Both locked and offline (--frozen).
+    default: "false"
+  if_absent:
+    description: >
+      What happens when the subject (invert, or package) is not in the graph: fail, the default,
+      since the reviewed shape no longer holds and the exception should be reviewed (or removed); or
+      pass, for a check whose healthy state includes the subject being gone.
+    default: fail
+  invert:
+    description: >
+      The package to invert the tree on (cargo tree -i), as name or name@version: the tree then
+      lists what depends on it. Empty, the tree runs forward from package (or the manifest's
+      package).
+    default: ""
+  junit:
+    description: >
+      Also write JUnit XML, one test case per manifest, to output_dir/junit, for a JUnit reader such
+      as a test report action, failing with the missing and unexpected packages.
+    default: "false"
+  locked:
+    description: >
+      Fail when Cargo.lock is out of date, instead of updating it (--locked). A graph that doesn't
+      resolve is an error, never a pass.
+    default: "true"
+  manifest_path:
+    description: >
+      The Cargo.toml whose graph to check (cargo tree --manifest-path), relative to working_dir.
+      Defaults to the one in working_dir.
+    default: ""
+  manifest_paths:
+    description: >
+      Several Cargo.toml files to check instead of manifest_path, each with the same parameters,
+      such as standalone fuzz workspaces that share an exception. Separated by commas, spaces or
+      newlines; shell patterns are expanded, and one that matches nothing fails the step. Each gets
+      its own reports, <report_name>-<slug>, with the slug made from its path as for deny's
+      manifest_paths, listed in an index, <report_name>.json.
+    default: ""
+  no_default_features:
+    description: >
+      Disable the default features (--no-default-features).
+    default: "false"
+  offline:
+    description: >
+      Resolve without network access (--offline), from cargo's cache.
+    default: "false"
+  output_dir:
+    description: >
+      Absolute path of the directory to write the reports into.
+    default: /tmp/rust-security-reports
+  package:
+    description: >
+      The package whose graph to check (cargo tree -p), as name or name@version, such as the binary
+      that ships: cargo build -p resolves features for that package alone. Defaults to the
+      manifest's package.
+    default: ""
+  report_name:
+    description: >
+      The reports' file name, without extension, so several checks in a job don't overwrite each
+      other's reports. It is also in the step's name.
+    default: tree-expect
+  report_only:
+    description: >
+      Report findings without failing the step. A graph cargo tree can't resolve, or output this
+      command can't read, still fails it.
+    default: "false"
+  run_record:
+    description: >
+      Also write <report_name>.run-record.json: cargo's version and SHA-512, the inputs' SHA-256
+      (the lockfile and manifests), the arguments, the exceptions, the counts and every report's
+      SHA-256.
+    default: "false"
+  store_artifacts:
+    description: >
+      Upload output_dir as a workflow artifact, named rust-security-reports-<report_name> and a
+      random suffix, including when the step fails.
+    default: "true"
+  target:
+    description: >
+      The target whose dependencies count (--target): all, the default, covers every target, so a
+      crate a boundary forbids can't hide behind a cfg the CI host doesn't match. Set a triple to
+      check one, or leave it empty for the host's.
+    default: all
+  working_dir:
+    description: >
+      Directory to run cargo tree in. Relative paths are relative to it.
+    default: .
+  workspace:
+    description: >
+      Check the graph of every workspace member together (cargo tree --workspace), where cargo
+      unifies each shared crate's features across all of them, as cargo build --workspace does.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Artifact names must be unique in a workflow run, and the same command
+    # can run in several jobs or matrix legs, so the name ends in a random
+    # suffix.
+    - name: Name the reports artifact
+      id: artifact
+      if: (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.report_name }}
+      run: |
+        if [[ ! "${REPORT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            REPORT_NAME=reports
+        fi
+        printf 'name=rust-security-reports-%s-%s\n' "${REPORT_NAME}" "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" >> "${GITHUB_OUTPUT}"
+    - name: cargo tree expect
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_ALL_FEATURES: ${{ inputs.all_features }}
+        PARAM_DEPTH: ${{ inputs.depth }}
+        PARAM_EDGES: ${{ inputs.edges }}
+        PARAM_EXCEPTION: ${{ inputs.exception }}
+        PARAM_EXPECTED: ${{ inputs.expected }}
+        PARAM_FEATURES: ${{ inputs.features }}
+        PARAM_FROZEN: ${{ inputs.frozen }}
+        PARAM_IF_ABSENT: ${{ inputs.if_absent }}
+        PARAM_INVERT: ${{ inputs.invert }}
+        PARAM_JUNIT: ${{ inputs.junit }}
+        PARAM_LOCKED: ${{ inputs.locked }}
+        PARAM_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        PARAM_MANIFEST_PATHS: ${{ inputs.manifest_paths }}
+        PARAM_NO_DEFAULT_FEATURES: ${{ inputs.no_default_features }}
+        PARAM_OFFLINE: ${{ inputs.offline }}
+        PARAM_OUTPUT_DIR: ${{ inputs.output_dir }}
+        PARAM_PACKAGE: ${{ inputs.package }}
+        PARAM_REPORT_NAME: ${{ inputs.report_name }}
+        PARAM_REPORT_ONLY: ${{ inputs.report_only }}
+        PARAM_RUN_RECORD: ${{ inputs.run_record }}
+        PARAM_TARGET: ${{ inputs.target }}
+        PARAM_WORKSPACE: ${{ inputs.workspace }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/tree_expect.sh"
+        "SCRIPT_CARGO_TREE_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/cargo_tree.sh"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"
+    - name: Upload the reports
+      if: always() && (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ inputs.output_dir }}
+        if-no-files-found: ignore

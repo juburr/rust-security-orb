@@ -1466,7 +1466,8 @@ mkdir -p "${CASE}/bin"
 cp "${STUBS}/cargo-audit" "${CASE}/bin/cargo-audit"
 printf '{"tool":"cargo-audit","version":"0.22.2","method":"prebuilt","binary_sha512":"%s"}\n' \
     "$(sha512sum "${CASE}/bin/cargo-audit" | awk '{ print $1 }')" > "${CASE}/bin/.cargo-audit.install.json"
-run audit.sh "PATH=${CASE}/bin:${STUBS}:${PATH}" PARAM_RUN_RECORD=1 CIRCLE_BUILD_URL=https://circleci.example/1 CIRCLE_SHA1=abc CIRCLE_JOB=audit
+run audit.sh "PATH=${CASE}/bin:${STUBS}:${PATH}" PARAM_RUN_RECORD=1 CIRCLE_BUILD_URL=https://circleci.example/1 CIRCLE_SHA1=abc CIRCLE_JOB=audit \
+    GITHUB_ACTIONS=
 RECORD="${CASE}/out/cargo-audit.run-record.json"
 check "names the binary that ran" json_is "${RECORD}" .tool.path "${CASE}/bin/cargo-audit"
 check "with its SHA-512" json_is "${RECORD}" .tool.sha512 "$(sha512sum "${CASE}/bin/cargo-audit" | awk '{ print $1 }')"
@@ -1475,8 +1476,16 @@ check "and no other tools" json_is "${RECORD}" '.other_tools | length' 0
 check "records the lockfile's SHA-256" json_is "${RECORD}" '.inputs[0].sha256' "$(sha256sum "${CASE}/work/Cargo.lock" | awk '{ print $1 }')"
 check "records the arguments" json_is "${RECORD}" '.arguments | join(" ")' "audit --file Cargo.lock"
 check "records the CircleCI job" json_is "${RECORD}" .ci.build_url https://circleci.example/1
+check "as a CircleCI job" json_is "${RECORD}" .ci.provider circleci
 check "records each report's SHA-256" json_is "${RECORD}" '.reports | length' 2
 check "records cargo's version" json_is "${RECORD}" .toolchain.cargo "cargo 1.99.0 (stand-in)"
+run audit.sh "PATH=${CASE}/bin:${STUBS}:${PATH}" PARAM_RUN_RECORD=1 CIRCLE_BUILD_URL= GITHUB_ACTIONS=true \
+    GITHUB_SERVER_URL=https://github.example GITHUB_REPOSITORY=owner/repo GITHUB_RUN_ID=7 GITHUB_RUN_ATTEMPT=2 \
+    GITHUB_SHA=def GITHUB_JOB=audit
+check "records the GitHub Actions run" json_is "${RECORD}" .ci.build_url https://github.example/owner/repo/actions/runs/7/attempts/2
+check "as a GitHub Actions run" json_is "${RECORD}" '"\(.ci.provider) \(.ci.sha1) \(.ci.job)"' "github-actions def audit"
+run audit.sh "PATH=${CASE}/bin:${STUBS}:${PATH}" PARAM_RUN_RECORD=1 CIRCLE_BUILD_URL= GITHUB_ACTIONS=
+check "records no CI job outside CI" json_is "${RECORD}" .ci null
 echo "changed" >> "${CASE}/bin/cargo-audit"
 run audit.sh "PATH=${CASE}/bin:${STUBS}:${PATH}" PARAM_RUN_RECORD=1
 check "leaves out an install record that doesn't match the binary" json_is "${RECORD}" .tool.install null

@@ -1,0 +1,102 @@
+name: Verify cargo auditable data in binaries
+description: >
+  Checks that each binary carries the dependency list cargo auditable embeds, and that it decodes to
+  what cargo auditable writes, and fails when one doesn't: stripping with llvm-strip or
+  --strip-section-headers, packers and other post-link steps can remove it without a word. Writes
+  each binary's decoded list as JSON and, with cyclonedx, an SBOM. Reads the list with
+  rust-audit-info (in the install command's tools, built from source with cargo) or, with no Rust
+  toolchain, the orb's native decoder, which needs only python3 and reads ELF binaries of any
+  architecture. The GitHub Actions twin of the orb's verify_auditable command.
+author: juburr
+
+inputs:
+  binaries:
+    description: >
+      The binaries to check, separated by spaces or commas; shell patterns are expanded. Name the
+      final artifacts, after stripping and packaging, which can remove the data.
+    required: true
+  cyclonedx:
+    description: >
+      Also write a CycloneDX SBOM of each binary, made from its embedded dependency list by
+      auditable2cdx (in the install command's tools), to <report_name>-<binary>.cdx.json.
+    default: "false"
+  decoder:
+    description: >
+      What reads each binary's .dep-v0 section: rust-audit-info; native, the orb's own decoder,
+      which needs only python3 (no cargo, no build) and reads ELF binaries of any architecture,
+      printing exactly what rust-audit-info prints; or auto, the default, which takes a
+      rust-audit-info the install command verified, or else native, or else an unverified
+      rust-audit-info, with a warning. Either way, the list must have the shape cargo auditable
+      writes: packages, exactly one root, dependencies that are indices into packages. native reads
+      ELF only; another format (PE, Mach-O, WebAssembly) fails the step, so use rust-audit-info for
+      those.
+    default: auto
+  junit:
+    description: >
+      Also write JUnit XML, one test case per binary, to output_dir/junit, for a JUnit reader such
+      as a test report action.
+    default: "false"
+  output_dir:
+    description: >
+      Absolute path of the directory to write the reports into.
+    default: /tmp/rust-security-reports
+  report_name:
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+    default: auditable
+  run_record:
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts and
+      every report's SHA-256.
+    default: "false"
+  store_artifacts:
+    description: >
+      Upload output_dir as a workflow artifact, named rust-security-reports-<report_name> and a
+      random suffix, including when the step fails.
+    default: "true"
+  working_dir:
+    description: >
+      Directory to run in; binaries are relative to it.
+    default: .
+
+runs:
+  using: composite
+  steps:
+    # Artifact names must be unique in a workflow run, and the same command
+    # can run in several jobs or matrix legs, so the name ends in a random
+    # suffix.
+    - name: Name the reports artifact
+      id: artifact
+      if: (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.report_name }}
+      run: |
+        if [[ ! "${REPORT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            REPORT_NAME=reports
+        fi
+        printf 'name=rust-security-reports-%s-%s\n' "${REPORT_NAME}" "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" >> "${GITHUB_OUTPUT}"
+    - name: Verify cargo-auditable data
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_BINARIES: ${{ inputs.binaries }}
+        PARAM_CYCLONEDX: ${{ inputs.cyclonedx }}
+        PARAM_DECODER: ${{ inputs.decoder }}
+        PARAM_JUNIT: ${{ inputs.junit }}
+        PARAM_OUTPUT_DIR: ${{ inputs.output_dir }}
+        PARAM_REPORT_NAME: ${{ inputs.report_name }}
+        PARAM_RUN_RECORD: ${{ inputs.run_record }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/verify_auditable.sh"
+        "SCRIPT_DEP_V0_PY=${GITHUB_ACTION_PATH}/../../src/scripts/lib/dep_v0.py"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"
+    - name: Upload the reports
+      if: always() && (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ inputs.output_dir }}
+        if-no-files-found: ignore
