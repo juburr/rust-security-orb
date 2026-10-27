@@ -1,0 +1,173 @@
+name: Audit binaries with cargo audit
+description: >
+  Checks built binaries against the RustSec advisory database with cargo audit bin, reading the
+  dependency list cargo auditable embedded in each, so it checks what actually ships rather than the
+  lockfile's superset of every feature set and target. Writes a JSON (and SARIF) report per binary
+  and an index, <report_name>.json. Fails on vulnerabilities and denied warnings unless report_only
+  is true, and always when a binary can't be audited at all. Install cargo-audit first, and build
+  the binaries with auditable_build. The GitHub Actions twin of the orb's audit_bin command.
+author: juburr
+
+inputs:
+  allow_stale:
+    description: >
+      Use an advisory database whose newest commit is 90 days old or more (cargo audit --stale),
+      instead of failing.
+    default: "false"
+  binaries:
+    description: >
+      The binaries to audit, separated by spaces or commas; shell patterns such as dist/* are
+      expanded, and everything they match must be a binary (target/release/* also matches
+      directories and .d files). Name the files you ship, after any stripping or packaging.
+    required: true
+  db_path:
+    description: >
+      The advisory database to use (cargo audit --db). Defaults to the one fetch_advisory_db fetched
+      or imported earlier in the job (RUSTSEC_ADVISORY_DB), or else $CARGO_HOME/advisory-db.
+    default: ""
+  decoder:
+    description: >
+      What reads each binary's .dep-v0 section for require_auditable, as for verify_auditable:
+      rust-audit-info, native (python3, no Rust toolchain, ELF of any architecture), or auto, a
+      verified rust-audit-info or else native.
+    default: auto
+  deny:
+    description: >
+      Warning kinds that fail the step like vulnerabilities (cargo audit --deny), separated by
+      commas or spaces: unmaintained, unsound, yanked, or warnings for all three.
+    default: ""
+  extra_args:
+    description: >
+      More cargo audit options, split like shell words; nothing in them is expanded or run. --json
+      and --format are refused, since this command writes the reports, and so are --no-fetch, --db
+      and --stale (-n, -d): use no_fetch, db_path and allow_stale, which the staleness check and run
+      record follow. --deny (-D) is refused too: use deny, which the counts and JUnit report follow.
+      Only options and their values are taken: cargo audit would read any other word as a
+      subcommand, such as bin, or its argument.
+    default: ""
+  junit:
+    description: >
+      Also write JUnit XML, one test case per finding per binary, to output_dir/junit, for a JUnit
+      reader such as a test report action: vulnerabilities, denied warnings and (with
+      require_auditable) binaries without cargo-auditable data fail; other warnings are skipped.
+    default: "false"
+  no_fetch:
+    description: >
+      Use the database as it is, without updating it (cargo audit --no-fetch). This command then
+      applies cargo audit's own staleness rule itself: a database whose newest commit is 90 days old
+      or more fails the step, unless allow_stale is true.
+    default: "false"
+  no_yanked:
+    description: >
+      Skip the check for yanked crates (cargo audit --no-yanked, cargo-audit 0.22.2 and later),
+      which otherwise queries the crates.io index.
+    default: "false"
+  output_dir:
+    description: >
+      Absolute path of the directory to write the reports into.
+    default: /tmp/rust-security-reports
+  report_name:
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+    default: cargo-audit-bin
+  report_only:
+    description: >
+      Report findings without failing the step, to adopt the check gradually. A tool that can't
+      complete still fails it.
+    default: "false"
+  require_auditable:
+    description: >
+      Count a binary without cargo-auditable data that decodes, with the shape cargo auditable
+      writes, as a finding, since cargo audit can only guess its dependencies from panic messages.
+      Reads it with decoder: rust-audit-info (in the install command's tools), or the native
+      decoder, which needs only python3.
+    default: "false"
+  run_record:
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts and
+      every report's SHA-256.
+    default: "false"
+  sarif:
+    description: >
+      Also write a SARIF 2.1.0 report, <report_name>.sarif.
+    default: "true"
+  store_artifacts:
+    description: >
+      Upload output_dir as a workflow artifact, named rust-security-reports-<report_name> and a
+      random suffix, including when the step fails.
+    default: "true"
+  target_arch:
+    description: >
+      Only report vulnerabilities that affect these CPU architectures (cargo audit --target-arch),
+      separated by commas or spaces.
+    default: ""
+  target_os:
+    description: >
+      Only report vulnerabilities that affect these operating systems (cargo audit --target-os),
+      separated by commas or spaces.
+    default: ""
+  unused_ignores:
+    description: >
+      What to do about an ignore (in the audit.toml cargo audit reads, or --ignore in extra_args)
+      that matches no finding in any of the binaries: allow, the default, doesn't check; warn
+      reports each one; deny also fails the step. Each binary is audited again, offline, without the
+      ignores, as audit's unused_ignores does. Writes <report_name>.ignores.json.
+    default: allow
+  working_dir:
+    description: >
+      Directory to run cargo audit in; binaries are relative to it. cargo audit reads
+      .cargo/audit.toml from here, or else from CARGO_HOME.
+    default: .
+
+runs:
+  using: composite
+  steps:
+    # Artifact names must be unique in a workflow run, and the same command
+    # can run in several jobs or matrix legs, so the name ends in a random
+    # suffix.
+    - name: Name the reports artifact
+      id: artifact
+      if: (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.report_name }}
+      run: |
+        if [[ ! "${REPORT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            REPORT_NAME=reports
+        fi
+        printf 'name=rust-security-reports-%s-%s\n' "${REPORT_NAME}" "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" >> "${GITHUB_OUTPUT}"
+    - name: cargo audit bin
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_ALLOW_STALE: ${{ inputs.allow_stale }}
+        PARAM_BINARIES: ${{ inputs.binaries }}
+        PARAM_DB_PATH: ${{ inputs.db_path }}
+        PARAM_DECODER: ${{ inputs.decoder }}
+        PARAM_DENY: ${{ inputs.deny }}
+        PARAM_EXTRA_ARGS: ${{ inputs.extra_args }}
+        PARAM_JUNIT: ${{ inputs.junit }}
+        PARAM_NO_FETCH: ${{ inputs.no_fetch }}
+        PARAM_NO_YANKED: ${{ inputs.no_yanked }}
+        PARAM_OUTPUT_DIR: ${{ inputs.output_dir }}
+        PARAM_REPORT_NAME: ${{ inputs.report_name }}
+        PARAM_REPORT_ONLY: ${{ inputs.report_only }}
+        PARAM_REQUIRE_AUDITABLE: ${{ inputs.require_auditable }}
+        PARAM_RUN_RECORD: ${{ inputs.run_record }}
+        PARAM_SARIF: ${{ inputs.sarif }}
+        PARAM_TARGET_ARCH: ${{ inputs.target_arch }}
+        PARAM_TARGET_OS: ${{ inputs.target_os }}
+        PARAM_UNUSED_IGNORES: ${{ inputs.unused_ignores }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/audit_bin.sh"
+        "SCRIPT_DEP_V0_PY=${GITHUB_ACTION_PATH}/../../src/scripts/lib/dep_v0.py"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"
+    - name: Upload the reports
+      if: always() && (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ inputs.output_dir }}
+        if-no-files-found: ignore

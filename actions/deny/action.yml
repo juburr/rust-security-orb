@@ -1,0 +1,224 @@
+name: Check dependencies with cargo deny
+description: >
+  Checks a project against its own deny.toml with cargo deny check: advisories (RustSec), licences,
+  banned crates and sources. Writes cargo-deny's JSON diagnostics (<report_name>.jsonl, which also
+  lists every advisory an ignore in deny.toml applied to) and a SARIF report. The step fails when a
+  check finds errors, as deny.toml configures them, unless report_only is true; it always fails when
+  cargo deny itself fails. Run it once per shipped feature set and target, such as in a matrix,
+  since each has its own dependency graph. Needs cargo-deny 0.20.0 or newer (the install command
+  installs it by default). The GitHub Actions twin of the orb's deny command.
+author: juburr
+
+inputs:
+  all_features:
+    description: >
+      Enable every feature (--all-features).
+    default: "false"
+  allow:
+    description: >
+      Diagnostic codes (such as unmaintained) or levels (warnings) to allow (-A), separated by
+      commas or spaces. Prefer deny.toml, where the reason can sit next to it.
+    default: ""
+  audit_compatible_output:
+    description: >
+      Also write the advisories in cargo audit's JSON format (--audit-compatible-output), to
+      <report_name>.audit.json.
+    default: "false"
+  checks:
+    description: >
+      The checks to run, separated by commas or spaces: advisories, bans, licenses, sources.
+      Defaults to all four.
+    default: ""
+  config_path:
+    description: >
+      The cargo-deny config to use (--config). Defaults to the first deny.toml, .deny.toml or
+      .cargo/deny.toml cargo deny finds in the manifest's directory or above. A path that doesn't
+      exist fails the step, rather than fall back to cargo-deny's default config.
+    default: ""
+  deny:
+    description: >
+      Diagnostic codes or levels to turn into errors (-D), separated by commas or spaces, such as
+      warnings.
+    default: ""
+  exclude:
+    description: >
+      Workspace members to leave out (--exclude), separated by commas or spaces.
+    default: ""
+  exclude_dev:
+    description: >
+      Leave out dev-dependencies (--exclude-dev), which never ship.
+    default: "false"
+  extra_args:
+    description: >
+      More cargo deny check options, split like shell words; nothing in them is expanded or run.
+      --format is refused, since this command writes the reports, and so is
+      --audit-compatible-output: use audit_compatible_output, which keeps that report. Only options
+      and their values are taken: cargo deny would read any other word as a check to run, which
+      checks names.
+    default: ""
+  features:
+    description: >
+      Features to enable (--features), separated by commas or spaces. Check the feature set you
+      ship: it decides the dependency graph.
+    default: ""
+  frozen:
+    description: >
+      Both offline and locked (--frozen).
+    default: "false"
+  junit:
+    description: >
+      Also write JUnit XML, one test case per error or warning (with manifest_paths, one test suite
+      per manifest), to output_dir/junit, for a JUnit reader such as a test report action: errors
+      fail, warnings are skipped.
+    default: "false"
+  locked:
+    description: >
+      Fail when Cargo.lock is out of date, instead of updating it (--locked).
+    default: "false"
+  manifest_path:
+    description: >
+      The Cargo.toml to check (cargo deny --manifest-path), relative to working_dir. Defaults to the
+      one in working_dir.
+    default: ""
+  manifest_paths:
+    description: >
+      Several Cargo.toml files to check instead of manifest_path, each with the same config_path,
+      checks, allow, warn, deny and feature and target parameters, such as standalone workspaces
+      (fuzz targets, test harnesses) under one deny.toml. Separated by commas, spaces or newlines;
+      shell patterns such as crates/*/fuzz/Cargo.toml are expanded, and one that matches nothing
+      fails the step. Each is checked on its own, with reports named <report_name>-<slug>, where the
+      slug is its path relative to working_dir without Cargo.toml, with / as - (root for
+      working_dir's own), listed in an index, <report_name>.json, and every one is checked before
+      the step fails. cargo-deny 0.20 fetches the advisory database for each check unless offline is
+      true, so fetch it once with fetch_advisory_db and set offline. Can't go with metadata_path.
+    default: ""
+  metadata_path:
+    description: >
+      Check against this pre-generated cargo metadata output (--metadata-path) instead of running
+      cargo metadata, for a reproducible graph with no network.
+    default: ""
+  no_default_features:
+    description: >
+      Disable the default features (--no-default-features).
+    default: "false"
+  offline:
+    description: >
+      Run without network access (--offline): cargo deny doesn't fetch the advisory database
+      (fetch_advisory_db provides it) and cargo metadata uses only cargo's cache, so warm it or use
+      metadata_path. The database's age is checked against deny.toml's maximum-db-staleness (90 days
+      by default). With [bans.std-replacements], run cargo deny fetch std-replacement earlier in the
+      job: without that data cargo deny skips the check, and the step fails rather than pass without
+      it.
+    default: "false"
+  output_dir:
+    description: >
+      Absolute path of the directory to write the reports into.
+    default: /tmp/rust-security-reports
+  report_name:
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports. It is also in the step's name.
+    default: cargo-deny
+  report_only:
+    description: >
+      Report findings without failing the step, to adopt the check gradually. A tool that can't
+      complete still fails it.
+    default: "false"
+  require_ignore_reasons:
+    description: >
+      Fail when an advisory or yanked crate ignored in deny.toml has no reason ({ id =
+      "RUSTSEC-...", reason = "..." }), or a blank one. It reads cargo deny's own report of each
+      ignore it applied, so only ignores that matched count.
+    default: "false"
+  run_record:
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts and
+      every report's SHA-256.
+    default: "false"
+  sarif:
+    description: >
+      Also write a SARIF 2.1.0 report, <report_name>.sarif.
+    default: "true"
+  store_artifacts:
+    description: >
+      Upload output_dir as a workflow artifact, named rust-security-reports-<report_name> and a
+      random suffix, including when the step fails.
+    default: "true"
+  target:
+    description: >
+      Check only the dependencies of this target triple (--target), such as
+      x86_64-unknown-linux-gnu. deny.toml's [graph] targets lists several.
+    default: ""
+  warn:
+    description: >
+      Diagnostic codes or levels to turn into warnings (-W), separated by commas or spaces.
+    default: ""
+  working_dir:
+    description: >
+      Directory to run cargo deny in. Relative paths are relative to it.
+    default: .
+  workspace:
+    description: >
+      Check every workspace member (--workspace), as a release build of the whole workspace resolves
+      them.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Artifact names must be unique in a workflow run, and the same command
+    # can run in several jobs or matrix legs, so the name ends in a random
+    # suffix.
+    - name: Name the reports artifact
+      id: artifact
+      if: (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.report_name }}
+      run: |
+        if [[ ! "${REPORT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            REPORT_NAME=reports
+        fi
+        printf 'name=rust-security-reports-%s-%s\n' "${REPORT_NAME}" "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" >> "${GITHUB_OUTPUT}"
+    - name: cargo deny check
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_ALLOW: ${{ inputs.allow }}
+        PARAM_ALL_FEATURES: ${{ inputs.all_features }}
+        PARAM_AUDIT_COMPATIBLE_OUTPUT: ${{ inputs.audit_compatible_output }}
+        PARAM_CHECKS: ${{ inputs.checks }}
+        PARAM_CONFIG_PATH: ${{ inputs.config_path }}
+        PARAM_DENY: ${{ inputs.deny }}
+        PARAM_EXCLUDE: ${{ inputs.exclude }}
+        PARAM_EXCLUDE_DEV: ${{ inputs.exclude_dev }}
+        PARAM_EXTRA_ARGS: ${{ inputs.extra_args }}
+        PARAM_FEATURES: ${{ inputs.features }}
+        PARAM_FROZEN: ${{ inputs.frozen }}
+        PARAM_JUNIT: ${{ inputs.junit }}
+        PARAM_LOCKED: ${{ inputs.locked }}
+        PARAM_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        PARAM_MANIFEST_PATHS: ${{ inputs.manifest_paths }}
+        PARAM_METADATA_PATH: ${{ inputs.metadata_path }}
+        PARAM_NO_DEFAULT_FEATURES: ${{ inputs.no_default_features }}
+        PARAM_OFFLINE: ${{ inputs.offline }}
+        PARAM_OUTPUT_DIR: ${{ inputs.output_dir }}
+        PARAM_REPORT_NAME: ${{ inputs.report_name }}
+        PARAM_REPORT_ONLY: ${{ inputs.report_only }}
+        PARAM_REQUIRE_IGNORE_REASONS: ${{ inputs.require_ignore_reasons }}
+        PARAM_RUN_RECORD: ${{ inputs.run_record }}
+        PARAM_SARIF: ${{ inputs.sarif }}
+        PARAM_TARGET: ${{ inputs.target }}
+        PARAM_WARN: ${{ inputs.warn }}
+        PARAM_WORKSPACE: ${{ inputs.workspace }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/deny.sh"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"
+    - name: Upload the reports
+      if: always() && (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ inputs.output_dir }}
+        if-no-files-found: ignore

@@ -1,0 +1,77 @@
+name: Install cargo-vet
+description: >
+  Builds and installs cargo-vet, which checks that every dependency is covered by a supply-chain
+  audit or exemption. Only 0.10.0 had prebuilt binaries, and only for x86_64, so this verifies the
+  crate's source archive against this orb's checksum table and builds it with cargo install
+  --locked, which needs cargo on the PATH and takes a few minutes. The GitHub Actions twin of the
+  orb's install_cargo_vet command.
+author: juburr
+
+inputs:
+  caching:
+    description: >
+      Cache the verified source archive between jobs, keyed by version, CPU architecture and home
+      directory. The binary is built in every job, since a build can't be verified against a
+      checksum. Only verified archives are cached, and a cached archive is verified again before it
+      is built.
+    default: "true"
+  install_path:
+    description: >
+      Absolute path of the directory to install cargo-vet into. It is created if needed and added to
+      the PATH of later steps when it isn't already on it, and must be writable without root.
+      Defaults to $HOME/bin.
+    default: ""
+  verify_checksums:
+    description: >
+      SHA-512 verification of the crate's source archive against this orb's checksum table. "strict"
+      (default) fails before downloading anything when the version has no checksum in the table.
+      "known_versions" verifies listed versions and builds unlisted versions from an unverified
+      archive, with a warning. "false" skips verification and is not recommended.
+    default: strict
+  version:
+    description: >
+      Version of cargo-vet to install, such as 0.10.2. A leading "v" is ignored.
+    default: "0.10.2"
+
+runs:
+  using: composite
+  steps:
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare cargo-vet cache key
+      id: cache-key
+      if: (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-cargo-vet-cache-key
+        PARAM_VERSION: ${{ inputs.version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-cargo-vet-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore cargo-vet cache
+      id: restore
+      if: (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-vet
+        key: ${{ steps.cache-key.outputs.key }}
+    - name: Install cargo-vet
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/cargo-vet/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save cargo-vet cache
+      if: (inputs.caching == 'true' || inputs.caching == '1') && steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-vet
+        key: ${{ steps.cache-key.outputs.key }}

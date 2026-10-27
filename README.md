@@ -2,27 +2,29 @@
 
 <img src="assets/logos/rust-security-orb-512px.png" width="256" alt="Rust Security Orb logo: a rust-orange gear wearing a shield with a green check mark, circled by an orbit ring, under a build, scan and deploy pipeline, above the words rust-security-orb, safer builds, brighter tomorrows, in a round dark badge">
 
-# Rust Security Orb for CircleCI
+# Rust Security for CircleCI and GitHub Actions
 
-### Check Rust dependencies and shipped binaries against RustSec, your policy and your supply chain, straight from CircleCI.
+### Check Rust dependencies and shipped binaries against RustSec, your policy and your supply chain, in CircleCI or GitHub Actions.
 
-Install checksum-verified [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit), [cargo-deny](https://github.com/EmbarkStudios/cargo-deny), [cargo-auditable](https://github.com/rust-secure-code/cargo-auditable) and friends, and gate builds on what they find:<br>
+Install checksum-verified [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit), [cargo-deny](https://github.com/EmbarkStudios/cargo-deny), [cargo-auditable](https://github.com/rust-secure-code/cargo-auditable) and friends, and gate builds on what they find, as orb commands or GitHub Actions:<br>
 advisories, licences, banned crates and sources, what may and may not be in each build's dependency graph, the dependency list embedded in each binary you ship, SBOMs and supply-chain audits.<br>
 Your tools' own configs are the policy · SARIF, JUnit and run records · Works offline · Strict SHA-512 verification by default · No `sudo`
 
 [![CircleCI Build Status](https://circleci.com/gh/juburr/rust-security-orb.svg?style=shield "CircleCI Build Status")](https://circleci.com/gh/juburr/rust-security-orb)
+[![GitHub Actions Status](https://github.com/juburr/rust-security-orb/actions/workflows/actions.yml/badge.svg?branch=main "GitHub Actions Status")](https://github.com/juburr/rust-security-orb/actions/workflows/actions.yml)
 [![CircleCI Orb Version](https://badges.circleci.com/orbs/juburr/rust-security-orb.svg)](https://circleci.com/developer/orbs/orb/juburr/rust-security-orb)
 [![GitHub License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
 [![CircleCI Community](https://img.shields.io/badge/community-CircleCI%20Discuss-343434.svg)](https://discuss.circleci.com/c/ecosystem/orbs)
 
+![CircleCI orb and GitHub Actions](https://img.shields.io/badge/CI-CircleCI%20%7C%20GitHub%20Actions-F97316?style=for-the-badge)
 ![RustSec advisories](https://img.shields.io/badge/RustSec-advisories-CE422B?style=for-the-badge&logo=rust&logoColor=white)
 ![amd64 and arm64](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-0EA5E9?style=for-the-badge&logo=linux&logoColor=white)
 ![SHA-512 verified by default](https://img.shields.io/badge/SHA--512-strict%20by%20default-16A34A?style=for-the-badge)
 ![No sudo required](https://img.shields.io/badge/sudo-not%20required-DB2777?style=for-the-badge)
 
-**[Quick Start](#-quick-start)** · **[Features](#-why-rust-security-orb)** · **[Recipes](#-recipes)** · **[Commands](#-commands)** · **[Reports](#-reports-and-evidence)** · **[Security](#-secure-by-design)** · **[Network Access](#-network-access)**
+**[Quick Start](#-quick-start)** · **[Features](#-why-rust-security-orb)** · **[Recipes](#-recipes)** · **[Commands](#-commands)** · **[GitHub Actions](#-github-actions)** · **[Reports](#-reports-and-evidence)** · **[Security](#-secure-by-design)** · **[Network Access](#-network-access)**
 
-<sub>An unofficial, community-maintained orb. [Contributions are welcome!](#-contributing)</sub>
+<sub>An unofficial, community-maintained CircleCI orb and set of GitHub Actions. [Contributions are welcome!](#-contributing)</sub>
 
 </div>
 
@@ -48,7 +50,7 @@ Your tools' own configs are the policy · SARIF, JUnit and run records · Works 
 <tr>
 <td width="33%" valign="top">
 🧾 <b>Reports and evidence</b><br><br>
-Each tool's native JSON and SARIF 2.1.0, JUnit for CircleCI's Tests tab, CycloneDX SBOMs, a licence inventory, and a run record per check: tool checksums, database commit, lockfile hash, arguments and counts.
+Each tool's native JSON and SARIF 2.1.0, JUnit for CircleCI's Tests tab or any JUnit reader, CycloneDX SBOMs, a licence inventory, and a run record per check: tool checksums, database commit, lockfile hash, arguments and counts.
 </td>
 <td width="33%" valign="top">
 ✈️ <b>Offline and air-gapped</b><br><br>
@@ -107,13 +109,15 @@ flowchart LR
 
 ## 🚀 Quick Start
 
+### CircleCI
+
 Add the orb, install the tools, check the project. Copy this into `.circleci/config.yml`:
 
 ```yaml
 version: 2.1
 
 orbs:
-  rust-security: juburr/rust-security-orb@0.2.0
+  rust-security: juburr/rust-security-orb@0.3.0
 
 jobs:
   security:
@@ -137,6 +141,32 @@ workflows:
 ```
 
 `fetch_advisory_db` fetches the RustSec advisory database once, `audit` checks `Cargo.lock` against that copy, and `deny` runs cargo-deny's advisories, bans, licences and sources checks against your `deny.toml`. Each fails the job on what it finds, and stores its reports under `rust-security-reports/` in the job's artifacts, with JUnit in the Tests tab.
+
+### GitHub Actions
+
+```yaml
+name: Security
+
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # cargo-audit, cargo-deny and cargo-auditable, verified.
+      - uses: juburr/rust-security-orb/actions/install@v0.3.0
+      - uses: juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.0
+      - uses: juburr/rust-security-orb/actions/audit@v0.3.0
+        with:
+          no_fetch: "true"
+      - uses: juburr/rust-security-orb/actions/deny@v0.3.0
+```
+
+Each check fails the job on what it finds and uploads its reports from `/tmp/rust-security-reports` as a workflow artifact, even when it fails. GitHub's runners come with Rust, which `deny` and the tools built from crates use. See [GitHub Actions](#-github-actions) for how the actions map to the orb's commands.
 
 `deny` needs a `deny.toml` in the project, since cargo-deny's default config allows no licence at all. `cargo deny init` writes one with every option documented; start from that, list the licences you accept, and set `[graph] targets` to the targets you ship (see [Check Every Shipped Configuration](#check-every-shipped-configuration)).
 
@@ -409,7 +439,7 @@ Both commands run `cargo tree --locked` by default, check its exit code before r
 
 ### Keep Evidence for an Assessor
 
-`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well, or for the native decoder, `python3` and the decoder's SHA-256), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, and for `deny`, `licenses` and `sbom` those packages' licence files (`LICENSE*`, `COPYING*` and `license-file`), which the tools read, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
+`run_record: true` writes `<report_name>.run-record.json` next to the reports: what ran (the tool's path, version, SHA-512 and how the orb installed it, and the same for auditable2cdx and rust-audit-info when `verify_auditable` and `audit_bin` run them as well, or for the native decoder, `python3` and the decoder's SHA-256), on what (the SHA-256 of the lockfile, the configs, the workspace's `Cargo.toml` files and those of path packages outside it, such as a `path` dependency in a sibling directory or a `[patch]` path, and for `deny`, `licenses` and `sbom` those packages' licence files (`LICENSE*`, `COPYING*` and `license-file`), which the tools read, the advisory database's URL, commit and commit time, and whether its files are exactly that commit's (a `db_path` checkout with local changes isn't), the arguments, which carry the feature set, target and workspace selection; URLs in either lose any credentials, query and fragment), with what result (the outcome, the tool's exit code, counts by check and severity), in which CI job (the CircleCI job or GitHub Actions run) and what it wrote (each report's SHA-256). It follows [`schemas/run-record.v1.json`](schemas/run-record.v1.json). Store it with the release, or attest it to the image or binary it describes with [cosign-orb](https://github.com/juburr/cosign-orb)'s `attest`, so the answer to "what exactly was checked?" doesn't depend on rerunning the job.
 
 ### Inventory Licences for Legal Review
 
@@ -626,8 +656,58 @@ JUnit results need nothing of the kind: each command stores only its own `junit/
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `output_dir` | `/tmp/rust-security-reports` | The `output_dir` the reporting commands wrote into. |
+| `store_artifacts` | `true` | Store `output_dir`. A job that takes a `store_artifacts` setting of its own can pass it here, after setting `store_artifacts: false` on each reporting command. |
 
 String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except `output_dir`, `report_name` and `install`'s `tools`, which CircleCI reads when it compiles the config, before the job's environment exists. In `extra_args` and the lists, that happens before the value is split, so quote a variable that may hold spaces.
+
+## ⚡ GitHub Actions
+
+Each of the orb's commands has a GitHub Action of the same name. The actions run the same scripts as the orb, so they check the same things the same way, and take the same inputs with the same defaults.
+
+| Action | Orb command |
+| --- | --- |
+| `juburr/rust-security-orb/actions/install@v0.3.0` | [`rust-security/install`](#rust-securityinstall) |
+| `juburr/rust-security-orb/actions/install_cargo_audit@v0.3.0`, `install_cargo_deny`, `install_cargo_auditable`, `install_cargo_cyclonedx`, `install_cargo_vet`, `install_rust_audit_info`, `install_auditable2cdx` | [`rust-security/install_<tool>`](#rust-securityinstall_tool) |
+| `juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.0` | [`rust-security/fetch_advisory_db`](#rust-securityfetch_advisory_db) |
+| `juburr/rust-security-orb/actions/audit@v0.3.0` | [`rust-security/audit`](#rust-securityaudit) |
+| `juburr/rust-security-orb/actions/audit_bin@v0.3.0` | [`rust-security/audit_bin`](#rust-securityaudit_bin) |
+| `juburr/rust-security-orb/actions/deny@v0.3.0` | [`rust-security/deny`](#rust-securitydeny) |
+| `juburr/rust-security-orb/actions/licenses@v0.3.0` | [`rust-security/licenses`](#rust-securitylicenses) |
+| `juburr/rust-security-orb/actions/auditable_build@v0.3.0` | [`rust-security/auditable_build`](#rust-securityauditable_build) |
+| `juburr/rust-security-orb/actions/verify_auditable@v0.3.0` | [`rust-security/verify_auditable`](#rust-securityverify_auditable) |
+| `juburr/rust-security-orb/actions/sbom@v0.3.0` | [`rust-security/sbom`](#rust-securitysbom) |
+| `juburr/rust-security-orb/actions/vet@v0.3.0` | [`rust-security/vet`](#rust-securityvet) |
+| `juburr/rust-security-orb/actions/tree_forbid@v0.3.0` | [`rust-security/tree_forbid`](#rust-securitytree_forbid) |
+| `juburr/rust-security-orb/actions/tree_expect@v0.3.0` | [`rust-security/tree_expect`](#rust-securitytree_expect) |
+| `juburr/rust-security-orb/actions/store_reports@v0.3.0` | [`rust-security/store_reports`](#rust-securitystore_reports) |
+
+To upload the advisories to GitHub code scanning (the job needs `permissions: security-events: write`), point the upload at the SARIF report:
+
+```yaml
+      - uses: juburr/rust-security-orb/actions/deny@v0.3.0
+        with:
+          report_only: "true"
+      - uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: /tmp/rust-security-reports/cargo-deny.sarif
+          category: cargo-deny
+```
+
+To persist the advisory database for later jobs, as [Fetch the Advisory Database Once per Workflow](#fetch-the-advisory-database-once-per-workflow) does with CircleCI's workspace, upload `fetch_advisory_db`'s `archive` with `actions/upload-artifact`, download it in the later jobs, and pass it to their `fetch_advisory_db` as `import`.
+
+How they differ from the orb's commands:
+
+- **Versions.** An action is referenced by the repository's release tag, such as `v0.3.0`, the same tag the orb is published from. There is no moving major tag yet. For the strongest pinning, use the tag's commit SHA: `juburr/rust-security-orb/actions/deny@<sha> # v0.3.0`.
+- **Inputs are strings.** Write booleans and numbers quoted, such as `report_only: "true"` or `depth: "1"`. The scripts check every boolean and enum themselves.
+- **Environment variables.** The orb expands `$NAME` in its parameters with the CircleCI CLI, which GitHub's runners don't have, so the actions take values as they are. Use GitHub's expressions instead, such as `binaries: ${{ runner.temp }}/dist/*`.
+- **Artifacts.** A command that stores artifacts uploads `output_dir` with [`actions/upload-artifact`](https://github.com/actions/upload-artifact), even when the step fails, as an artifact named `rust-security-reports-<report_name>-` and a random suffix, since artifact names must be unique in a workflow run; `store_reports` names it after `output_dir`'s last directory instead. Give `store_reports` `if: always()`, so it uploads after a failed check. There is no Tests tab: JUnit files are in `output_dir/junit/`, for any JUnit report action.
+- **Run records** name the GitHub Actions run (its URL, commit and job) where the orb's name the CircleCI job.
+- **Caching.** `caching` stores each tool's verified download (or crate archive) with [`actions/cache`](https://github.com/actions/cache), with the same key ingredients as the orb. The cache is restored before the install and saved right after it, and what it restores is verified again. It counts toward the repository's GitHub Actions cache storage.
+- **Exports.** What a command exports to later steps (the install path on the `PATH`, `fetch_advisory_db`'s `RUSTSEC_ADVISORY_DB`) is passed on through `GITHUB_PATH` and `GITHUB_ENV`.
+- **`no_output_timeout`** is CircleCI's, and the install actions that build from crates have none; set `timeout-minutes` on the job or step instead.
+- **Runners.** CI installs every tool on GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners and builds and checks an auditable binary on both, installs the prebuilt tools from the cache with the download hosts blocked, runs every check on the fixture as on CircleCI, offline too, and validates every report the actions uploaded.
+
+The actions are composite actions in [`actions/`](actions), next to the orb's source. Each passes its inputs to the orb's script as environment variables, never pasting them into a script, and [`actions/run_script.sh`](actions/run_script.sh) gives the script what CircleCI would: a `BASH_ENV` file for the values it hands to later steps, which it then passes on through `GITHUB_PATH` and `GITHUB_ENV`.
 
 ## 📄 Reports and Evidence
 
@@ -636,10 +716,10 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 | `output_dir` | `/tmp/rust-security-reports` | Absolute path of the directory for the reports. |
 | `report_name` | *(per command)* | The reports' file name, without extension. |
 | `sarif` | `true` | Also write `<report_name>.sarif`, SARIF 2.1.0 (`audit`, `audit_bin`, `deny`). |
-| `junit` | `false` | Also write `junit/<report_name>.xml` and store it with `store_test_results`, for CircleCI's Tests tab. |
+| `junit` | `false` | Also write `junit/<report_name>.xml` and store it with `store_test_results`, for CircleCI's Tests tab. On GitHub it is uploaded with `output_dir`. |
 | `report_only` | `false` | Report findings without failing the step. A tool that can't complete still fails it. |
 | `run_record` | `false` | Also write `<report_name>.run-record.json`. |
-| `store_artifacts` | `true` | Store `output_dir` as artifacts under `rust-security-reports/`, even when the step fails. With several reporting commands in a job, set it to `false` on each and end the job with `store_reports`. |
+| `store_artifacts` | `true` | Store `output_dir` as artifacts under `rust-security-reports/` (on GitHub, a workflow artifact), even when the step fails. With several reporting commands in a job, set it to `false` on each and end the job with `store_reports`. |
 
 | Report | Written by |
 | --- | --- |
@@ -666,7 +746,7 @@ String parameters expand environment variables, such as `${CIRCLE_SHA1}`, except
 
 ## 💻 Supported Platforms
 
-Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including CircleCI [Arm resource classes](https://circleci.com/docs/using-arm/). macOS and Windows executors aren't supported yet: `install` fails on them rather than install a binary that can't run. The arm64 releases of cargo-audit and cargo-cyclonedx link glibc (2.18 and 2.34 or newer), so on arm64 they need a glibc-based image such as `cimg/rust`; on Alpine and other musl-based arm64 images, their install fails before downloading anything. The other release binaries are static, and the tools built from crates build wherever cargo runs. CI runs every command on `cimg/rust` (Docker, amd64), installs every tool and builds an auditable binary on an Arm Docker executor, and runs the offline checks, the native decoder's on both builds included, on a machine executor with no Rust toolchain.
+Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including CircleCI [Arm resource classes](https://circleci.com/docs/using-arm/). macOS and Windows executors aren't supported yet: `install` fails on them rather than install a binary that can't run. The arm64 releases of cargo-audit and cargo-cyclonedx link glibc (2.18 and 2.34 or newer), so on arm64 they need a glibc-based image such as `cimg/rust`; on Alpine and other musl-based arm64 images, their install fails before downloading anything. The other release binaries are static, and the tools built from crates build wherever cargo runs. CI runs every command on `cimg/rust` (Docker, amd64), installs every tool and builds an auditable binary on an Arm Docker executor, and runs the offline checks, the native decoder's on both builds included, on a machine executor with no Rust toolchain. The GitHub Actions run on GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners (see [GitHub Actions](#-github-actions)).
 
 The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `realpath`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet`, `tree_forbid`, `tree_expect` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. The native `.dep-v0` decoder of `verify_auditable` and `audit_bin` needs `python3` (3.8 or newer, standard library only) instead. `cimg/rust` has all of them.
 
@@ -708,6 +788,7 @@ Hosts to allow (HTTPS, port 443) when running on a locked-down, self-hosted runn
 | `static.crates.io` | `install` (the same three); `deny`, `licenses`, `sbom`, `vet`, `auditable_build`, `tree_forbid`, `tree_expect` | Crate archives, for builds and for `cargo metadata` and `cargo tree` | As for `index.crates.io`, or when cargo's cache already holds the crates |
 | The hosts in `supply-chain/config.toml`'s `[imports]` | `vet` with `locked: false` | Audits imported from other organizations | `locked` is `true` (the default) |
 | `circleci-tasks-prod.s3.us-east-1.amazonaws.com` | The install commands with `caching: true` (the default), on CircleCI cloud with self-hosted runners | CircleCI's cache storage, used by the built-in `restore_cache` and `save_cache` steps (see the [runner FAQ](https://circleci.com/docs/guides/execution-runner/runner-faqs/#what-connectivity-is-required)) | `caching` is `false` |
+| GitHub's cache and artifact storage | The install actions with `caching: true`, through `actions/cache`; the reporting actions with `store_artifacts: true`, through `actions/upload-artifact`, on self-hosted GitHub runners | The tools' verified downloads, and the reports (see GitHub's [self-hosted runner communication](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#requirements-for-communication-with-github)) | `caching` and `store_artifacts` are `false` |
 
 Hosts you configure, contacted only by the commands that take them:
 
@@ -757,5 +838,5 @@ Need the logo for a slide deck, blog post, or internal developer portal? PNGs wi
   <br>
   <sub>Safer builds, brighter tomorrows. If this orb helps your team, a ⭐ helps others find it.</sub>
   <br>
-  <sub><a href="#rust-security-orb-for-circleci">Back to top ↑</a></sub>
+  <sub><a href="#rust-security-for-circleci-and-github-actions">Back to top ↑</a></sub>
 </div>

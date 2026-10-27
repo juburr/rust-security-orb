@@ -1,0 +1,852 @@
+# Tests the GitHub Actions in actions/ on GitHub's own runners, as
+# .circleci/test-deploy.yml tests the orb's commands on CircleCI. Each job
+# runs the actions from this checkout (uses: ./actions/...), so a pull
+# request tests its own changes. The fixture is tests/fixtures/app, whose
+# default feature links smallvec 1.6.0 (RUSTSEC-2021-0003) and whose
+# backend-a and backend-b features must never be combined.
+name: GitHub Actions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the offline tests
+        run: |
+          # commands_test.sh validates run records with Python's jsonschema.
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet jsonschema==4.26.0
+          export PATH="${RUNNER_TEMP}/venv/bin:${PATH}"
+          for test in tests/actions_test.sh tests/install_test.sh tests/env_subst_test.sh tests/shell_conventions_test.sh tests/wiring_test.sh tests/commands_test.sh; do
+            echo "=== ${test}"
+            bash "${test}"
+          done
+
+  # Every tool on both architectures, then the auditable round trip there:
+  # binaries built with cargo auditable keep their dependency list through
+  # strip, verify_auditable reads it back with rust-audit-info and with the
+  # native decoder, which must write the same bytes, and audit_bin finds the
+  # advisory in the binary that links smallvec and none in the one built
+  # without it.
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # e_machine field of the ELF header: 3e00 is x86-64, b700 is aarch64.
+          # Quoted, since YAML reads an unquoted 3e00 as the number 3.
+          - runner: ubuntu-24.04
+            elf: "3e00"
+          - runner: ubuntu-24.04-arm
+            elf: "b700"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo-vet, rust-audit-info and auditable2cdx are built with the
+      # runner's cargo.
+      - name: Show the runner's Rust
+        run: |
+          cargo --version
+          rustc --version
+      - uses: ./actions/install
+        with:
+          tools: cargo-audit cargo-deny cargo-auditable cargo-cyclonedx cargo-vet rust-audit-info auditable2cdx
+      - name: Verify the install
+        env:
+          ELF: ${{ matrix.elf }}
+        run: |
+          default() { awk -v name="  ${1//-/_}_version:" '$0 == name { p = 1 } p && /^    default:/ { gsub(/"/, "", $2); print $2; exit }' src/commands/install.yml; }
+          [[ "$(cargo-audit --version)" == "cargo-audit $(default cargo-audit)" ]]
+          [[ "$(cargo-deny --version)" == "cargo-deny $(default cargo-deny)" ]]
+          [[ "$(cargo cyclonedx --version)" == *" $(default cargo-cyclonedx)" ]]
+          [[ "$(cargo-vet --version)" == "cargo-vet $(default cargo-vet)" ]]
+          for tool in cargo-audit cargo-deny cargo-auditable cargo-cyclonedx cargo-vet rust-audit-info auditable2cdx; do
+            binary=$(command -v "${tool}")
+            [[ "${binary}" == "${HOME}/bin/${tool}" ]]
+            od -An -tx1 -j18 -N2 "${binary}" | tr -d ' \n' | grep -Fx "${ELF}"
+            case "${tool}" in
+              cargo-vet | rust-audit-info | auditable2cdx) method=source-built ;;
+              *) method=prebuilt ;;
+            esac
+            jq -e --arg version "$(default "${tool}")" --arg method "${method}" --arg sha "$(sha512sum "${binary}" | awk '{ print $1 }')" \
+              '.version == $version and .method == $method and .verify_checksums == "strict"
+                and (.asset_sha512 | length) == 128 and .binary_sha512 == $sha' "${HOME}/bin/.${tool}.install.json" > /dev/null
+          done
+      # The first install saved each tool to the cache, so this one restores
+      # it. It goes to a directory of its own, which later steps find first
+      # on the PATH.
+      - uses: ./actions/install_cargo_deny
+        with:
+          install_path: ${{ runner.temp }}/second
+      - name: Verify the second install comes first on the PATH
+        env:
+          SECOND: ${{ runner.temp }}/second
+        run: |
+          [[ "$(command -v cargo-deny)" == "${SECOND}/cargo-deny" ]]
+          cargo-deny --version
+      - name: Install an unlisted version, which must fail
+        id: unlisted
+        continue-on-error: true
+        uses: ./actions/install_cargo_deny
+        with:
+          version: 0.19.4
+          caching: false
+          install_path: ${{ runner.temp }}/unlisted
+      - name: Verify it failed before installing anything
+        env:
+          OUTCOME: ${{ steps.unlisted.outcome }}
+          UNLISTED: ${{ runner.temp }}/unlisted
+        run: |
+          [[ "${OUTCOME}" == failure ]]
+          [[ ! -e "${UNLISTED}/cargo-deny" ]]
+      - uses: ./actions/fetch_advisory_db
+      # cargo would run this alias for "cargo auditable" in place of
+      # cargo-auditable, so auditable_build must not go through it.
+      - name: Set an auditable alias that prints help
+        run: |
+          mkdir -p "${CARGO_HOME:-${HOME}/.cargo}"
+          printf '[alias]\nauditable = "help"\n' >> "${CARGO_HOME:-${HOME}/.cargo}/config.toml"
+      - uses: ./actions/auditable_build
+        with:
+          working_dir: tests/fixtures/app
+          extra_args: --release --locked
+      - name: Strip and keep the default build
+        working-directory: tests/fixtures/app
+        env:
+          DIST: ${{ runner.temp }}/dist
+        run: |
+          mkdir -p "${DIST}"
+          cp target/release/rso-fixture "${DIST}/rso-fixture-vulnerable"
+          strip "${DIST}/rso-fixture-vulnerable"
+      - uses: ./actions/auditable_build
+        with:
+          working_dir: tests/fixtures/app
+          extra_args: --release --locked --no-default-features
+      - name: Strip and keep the build without smallvec, and build one without cargo auditable
+        working-directory: tests/fixtures/app
+        env:
+          DIST: ${{ runner.temp }}/dist
+          PLAIN: ${{ runner.temp }}/plain
+        run: |
+          cp target/release/rso-fixture "${DIST}/rso-fixture-clean"
+          strip "${DIST}/rso-fixture-clean"
+          cargo build --release --locked --target-dir target/plain
+          mkdir -p "${PLAIN}"
+          cp target/plain/release/rso-fixture "${PLAIN}/rso-fixture-plain"
+      # The decoder defaults to rust-audit-info, which the install verified.
+      - uses: ./actions/verify_auditable
+        with:
+          binaries: ${{ runner.temp }}/dist/rso-fixture-vulnerable ${{ runner.temp }}/dist/rso-fixture-clean
+          cyclonedx: true
+          junit: true
+          run_record: true
+          output_dir: ${{ runner.temp }}/reports/auditable
+      - uses: ./actions/verify_auditable
+        with:
+          binaries: ${{ runner.temp }}/dist/rso-fixture-vulnerable ${{ runner.temp }}/dist/rso-fixture-clean
+          decoder: native
+          run_record: true
+          report_name: native
+          output_dir: ${{ runner.temp }}/reports/native
+      - uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          no_fetch: true
+          report_only: true
+          output_dir: ${{ runner.temp }}/reports/auditable
+      - uses: ./actions/audit_bin
+        with:
+          binaries: ${{ runner.temp }}/dist/rso-fixture-vulnerable
+          require_auditable: true
+          no_fetch: true
+          report_only: true
+          junit: true
+          run_record: true
+          report_name: audit-bin-vulnerable
+          output_dir: ${{ runner.temp }}/reports/auditable
+      # Passes at the default gate: the binary built without the feature
+      # doesn't link smallvec.
+      - uses: ./actions/audit_bin
+        with:
+          binaries: ${{ runner.temp }}/dist/rso-fixture-clean
+          require_auditable: true
+          no_fetch: true
+          report_name: audit-bin-clean
+          output_dir: ${{ runner.temp }}/reports/auditable
+      - name: Verify the round trip
+        env:
+          R: ${{ runner.temp }}/reports
+        run: |
+          components() { jq -r '[.components[]?.name] | sort | join(" ")' "$1"; }
+          [[ "$(components "${R}/auditable/auditable-rso-fixture-vulnerable.cdx.json")" == *smallvec* ]]
+          [[ "$(components "${R}/auditable/auditable-rso-fixture-clean.cdx.json")" != *smallvec* ]]
+          ids() { jq -r '[.vulnerabilities.list[].advisory.id] | sort | join(" ")' "$1"; }
+          [[ "$(ids "${R}/auditable/cargo-audit.json")" == "RUSTSEC-2021-0003" ]]
+          [[ "$(ids "${R}/auditable/audit-bin-vulnerable-rso-fixture-vulnerable.json")" == "RUSTSEC-2021-0003" ]]
+          [[ "$(ids "${R}/auditable/audit-bin-clean-rso-fixture-clean.json")" == "" ]]
+          # The native decoder writes what rust-audit-info wrote, byte for byte.
+          jq -e '.decoder == "rust-audit-info"' "${R}/auditable/auditable.json"
+          jq -e '.decoder == "native" and ([.binaries[] | select(.auditable)] | length) == 2' "${R}/native/native.json"
+          for build in vulnerable clean; do
+            cmp "${R}/native/native-rso-fixture-${build}.audit.json" "${R}/auditable/auditable-rso-fixture-${build}.audit.json"
+          done
+          # Run records name the GitHub Actions run.
+          jq -e --arg sha "${GITHUB_SHA}" '.ci.provider == "github-actions" and .ci.sha1 == $sha and .ci.job == "install"' \
+            "${R}/auditable/auditable.run-record.json"
+      - name: Verify a binary built without cargo auditable, which must fail
+        id: plain
+        continue-on-error: true
+        uses: ./actions/verify_auditable
+        with:
+          binaries: ${{ runner.temp }}/plain/rso-fixture-plain
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/plain
+      - name: Verify it failed
+        env:
+          OUTCOME: ${{ steps.plain.outcome }}
+        run: '[[ "${OUTCOME}" == failure ]]'
+
+  # A fresh runner with the release download hosts blocked installs the
+  # prebuilt tools from the cache the install job saved, which only works if
+  # the cache is used. (The tools built from source need crates.io for their
+  # dependencies.)
+  install-from-cache:
+    needs: install
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Block the download hosts
+        run: |
+          echo "127.0.0.1 github.com objects.githubusercontent.com release-assets.githubusercontent.com" | sudo tee -a /etc/hosts
+          if curl -sSf --max-time 10 -o /dev/null https://github.com; then
+            echo "github.com is still reachable."
+            exit 1
+          fi
+      - uses: ./actions/install
+        with:
+          tools: cargo-audit cargo-deny cargo-auditable cargo-cyclonedx
+      - name: Verify the install
+        run: |
+          cargo-audit --version
+          cargo-deny --version
+          cargo cyclonedx --version
+          [[ "$(command -v cargo-auditable)" == "${HOME}/bin/cargo-auditable" ]]
+
+  # audit and deny report the fixture's advisory with report_only, fail on
+  # it by default, and fail even with report_only when the tool can't run.
+  # Also several lockfiles and manifests in one step, unused ignores, deny's
+  # require_ignore_reasons, the licence inventory, and store_reports.
+  detection:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/install
+      - uses: ./actions/fetch_advisory_db
+      # The reports are uploaded once, by store_reports at the end of the job.
+      - uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          no_fetch: true
+          report_only: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/reports/detection
+      - uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          report_only: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/reports/detection
+      # Several lockfiles and manifests in one step: the fixture and its
+      # standalone workspace.
+      - uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          lockfiles: Cargo.lock standalone/Cargo.lock
+          no_fetch: true
+          report_only: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: audit-lockfiles
+          output_dir: ${{ runner.temp }}/reports/detection
+      - uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          manifest_paths: Cargo.toml standalone/Cargo.toml
+          checks: bans licenses sources
+          locked: true
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: deny-manifests
+          output_dir: ${{ runner.temp }}/reports/detection
+      - name: Verify report_only reported the advisory, for each lockfile and manifest
+        working-directory: ${{ runner.temp }}/reports/detection
+        run: |
+          jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' cargo-audit.json
+          jq -e '[.runs[].results[].ruleId] | index("RUSTSEC-2021-0003")' cargo-audit.sarif
+          grep -q 'name="RUSTSEC-2021-0003 smallvec 1.6.0"><failure' junit/cargo-audit.xml
+          jq -e '.outcome == "findings-reported" and .counts.vulnerabilities == 1' cargo-audit.run-record.json
+          jq -s -e 'any(.[]; .type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
+          jq -e '[.runs[].results[].partialFingerprints["cargo-deny/advisory-id"]] | index("RUSTSEC-2021-0003")' cargo-deny.sarif
+          jq -e '.outcome == "findings-reported" and .counts.advisories.errors == 1 and .advisory_db.commit != null' cargo-deny.run-record.json
+          jq -e '[.lockfiles[] | "\(.slug) \(.vulnerabilities) \(.outcome)"] == ["root 1 findings-reported", "standalone 1 findings-reported"]' audit-lockfiles.json
+          [[ "$(grep -c '<testsuite ' junit/audit-lockfiles.xml)" -eq 2 ]]
+          jq -e '[.manifests[] | "\(.slug) \(.outcome)"] == ["root passed", "standalone passed"]' deny-manifests.json
+          jq -e '.ci.provider == "github-actions" and .ci.job == "detection"' cargo-deny.run-record.json
+      - name: Audit by default, which must fail
+        id: audit-default
+        continue-on-error: true
+        uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          no_fetch: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/audit-default
+      - name: Deny by default, which must fail
+        id: deny-default
+        continue-on-error: true
+        uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/deny-default
+      - name: Audit a file that isn't a lockfile with report_only, which must fail
+        id: audit-error
+        continue-on-error: true
+        uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          lockfile: Cargo.toml
+          no_fetch: true
+          report_only: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/audit-error
+      - name: Deny with an invalid config and report_only, which must fail
+        id: deny-error
+        continue-on-error: true
+        uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          config_path: deny-invalid.toml
+          report_only: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/deny-error
+      # An advisory ignored without a reason passes, unless
+      # require_ignore_reasons is true.
+      - uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          config_path: deny-ignore-bare.toml
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/scratch/deny-ignore-bare
+      - name: Deny an ignore without a reason under require_ignore_reasons, which must fail
+        id: deny-reasons
+        continue-on-error: true
+        uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          config_path: deny-ignore-bare.toml
+          require_ignore_reasons: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/deny-reasons
+      # tests/fixtures/audit-ignores/.cargo/audit.toml ignores
+      # RUSTSEC-2021-0003, which the fixture's smallvec 1.6.0 has, and
+      # RUSTSEC-2023-0071, which nothing there has.
+      - name: Audit with an unused ignore under unused_ignores deny, which must fail
+        id: ignores-deny
+        continue-on-error: true
+        uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/audit-ignores
+          lockfile: ../app/Cargo.lock
+          no_fetch: true
+          unused_ignores: deny
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/ignores-deny
+      - uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/audit-ignores
+          lockfile: ../app/Cargo.lock
+          no_fetch: true
+          unused_ignores: warn
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: audit-ignores
+          output_dir: ${{ runner.temp }}/reports/detection
+      - name: Verify what must fail failed, and the unused ignore was reported
+        env:
+          OUTCOMES: >-
+            ${{ steps.audit-default.outcome }} ${{ steps.deny-default.outcome }} ${{ steps.audit-error.outcome }}
+            ${{ steps.deny-error.outcome }} ${{ steps.deny-reasons.outcome }} ${{ steps.ignores-deny.outcome }}
+          R: ${{ runner.temp }}/reports/detection
+          FAILING: ${{ runner.temp }}/failing
+        run: |
+          [[ "${OUTCOMES}" == "failure failure failure failure failure failure" ]]
+          jq -e '[.vulnerabilities.list[].advisory.id] == ["RUSTSEC-2021-0003"]' "${FAILING}/audit-default/cargo-audit.json"
+          jq -e '[.ignores[] | select(.used | not) | .id] == ["RUSTSEC-2023-0071"]' "${FAILING}/ignores-deny/cargo-audit.ignores.json"
+          jq -e '[.ignores[] | "\(.id) \(.used)"] == ["RUSTSEC-2021-0003 true", "RUSTSEC-2023-0071 false"]
+            and .ignores[1].advisory.package == "rsa"' "${R}/audit-ignores.ignores.json"
+          jq -e '.counts.unused_ignores == 1 and .outcome == "passed"' "${R}/audit-ignores.run-record.json"
+      - uses: ./actions/licenses
+        with:
+          working_dir: tests/fixtures/app
+          all_features: true
+          run_record: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/reports/detection
+      - name: Verify the licence inventory lists every crate
+        working-directory: tests/fixtures/app
+        env:
+          R: ${{ runner.temp }}/reports/detection
+        run: |
+          cargo metadata --format-version 1 --locked --all-features | jq -r '.packages[] | "\(.name) \(.version)"' | sort > "${RUNNER_TEMP}/crates.txt"
+          cat "${RUNNER_TEMP}/crates.txt"
+          [[ "$(wc -l < "${RUNNER_TEMP}/crates.txt")" -eq 4 ]]
+          jq -r 'keys[] | split(" ")[:2] | join(" ")' "${R}/licenses.json" | sort | diff "${RUNNER_TEMP}/crates.txt" -
+          tail -n +2 "${R}/licenses.tsv" | cut -f 1 | tr '@' ' ' | sort | diff "${RUNNER_TEMP}/crates.txt" -
+      - if: always()
+        uses: ./actions/store_reports
+        with:
+          output_dir: ${{ runner.temp }}/reports/detection
+
+  # Bans per configuration: with the config for one backend, a build of that
+  # backend passes the bans check, and the other backend, or both, fail it.
+  bans:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: a
+            other: b
+          - backend: b
+            other: a
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/install
+        with:
+          tools: cargo-deny
+      - uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          checks: bans
+          config_path: deny-backend-${{ matrix.backend }}.toml
+          no_default_features: true
+          features: backend-${{ matrix.backend }}
+          junit: true
+          run_record: true
+          report_name: bans-${{ matrix.backend }}
+          output_dir: ${{ runner.temp }}/reports/bans
+      - name: Check the other backend, which must fail
+        id: other
+        continue-on-error: true
+        uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          checks: bans
+          config_path: deny-backend-${{ matrix.backend }}.toml
+          no_default_features: true
+          features: backend-${{ matrix.other }}
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/other
+      - name: Check both backends, which must fail
+        id: both
+        continue-on-error: true
+        uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          checks: bans
+          config_path: deny-backend-${{ matrix.backend }}.toml
+          no_default_features: true
+          features: backend-a,backend-b
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/both
+      - name: Verify both failed the bans check
+        env:
+          OUTCOMES: ${{ steps.other.outcome }} ${{ steps.both.outcome }}
+          FAILING: ${{ runner.temp }}/failing
+        run: |
+          [[ "${OUTCOMES}" == "failure failure" ]]
+          for check in other both; do
+            jq -s -e 'any(.[]; .type == "diagnostic" and .fields.severity == "error")' "${FAILING}/${check}/cargo-deny.jsonl"
+          done
+
+  # Dependency-graph assertions with the real cargo tree: backend b must
+  # never ship in the backend-a build, as a package and as a feature, and
+  # smallvec's only dependent is the fixture (in the standalone workspace
+  # too, through {root}), until the default feature that links it is off.
+  graph:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/tree_forbid
+        with:
+          working_dir: tests/fixtures/app
+          features: backend-a
+          forbidden_packages: rso-backend-b
+          forbidden_features: rso-fixture:backend-b
+          exception: boundary:backend-a
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: forbid-backend-b
+          output_dir: ${{ runner.temp }}/reports/graph
+      - uses: ./actions/tree_forbid
+        with:
+          working_dir: tests/fixtures/app
+          workspace: true
+          all_features: true
+          forbidden_features: rso-fixture:backend-b
+          only_if_reachable: rso-backend-b
+          only_if_reachable_from: rso-backend-a
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: forbid-skipped
+          output_dir: ${{ runner.temp }}/reports/graph
+      - uses: ./actions/tree_expect
+        with:
+          working_dir: tests/fixtures/app
+          invert: smallvec
+          depth: 1
+          expected: smallvec@1.6.0 path:rso-fixture@0.1.0
+          exception: RUSTSEC-2021-0003
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec
+          output_dir: ${{ runner.temp }}/reports/graph
+      - uses: ./actions/tree_expect
+        with:
+          working_dir: tests/fixtures/app
+          manifest_paths: Cargo.toml standalone/Cargo.toml
+          invert: smallvec
+          depth: 1
+          expected: "smallvec@1.6.0 {root}"
+          junit: true
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec-root
+          output_dir: ${{ runner.temp }}/reports/graph
+      - uses: ./actions/tree_expect
+        with:
+          working_dir: tests/fixtures/app
+          no_default_features: true
+          invert: smallvec
+          depth: 1
+          expected: smallvec@1.6.0 path:rso-fixture@0.1.0
+          if_absent: pass
+          run_record: true
+          store_artifacts: false
+          report_name: expect-smallvec-absent
+          output_dir: ${{ runner.temp }}/reports/graph
+      - name: Verify the graph reports
+        working-directory: ${{ runner.temp }}/reports/graph
+        run: |
+          jq -e '.verdict == "passed" and .exceptions == ["boundary:backend-a"] and ([.nodes[].name] | index("rso-backend-a"))' forbid-backend-b.json
+          jq -e '.verdict == "skipped"' forbid-skipped.json
+          jq -e '.outcome == "skipped"' forbid-skipped.run-record.json
+          grep -q '<skipped message="rso-backend-b is not in the graph of rso-backend-a' junit/forbid-skipped.xml
+          jq -e '.verdict == "passed" and ([.nodes[].key] | sort) == ["path:rso-fixture@0.1.0", "smallvec@1.6.0"]' expect-smallvec.json
+          jq -e '.exceptions == ["RUSTSEC-2021-0003"] and .outcome == "passed"' expect-smallvec.run-record.json
+          jq -e '[.selections[] | "\(.slug) \(.verdict)"] == ["root passed", "standalone passed"]' expect-smallvec-root.json
+          jq -e '.present == false and .verdict == "passed"' expect-smallvec-absent.json
+      - name: Forbid backend b with every feature on, which must fail
+        id: forbid-all
+        continue-on-error: true
+        uses: ./actions/tree_forbid
+        with:
+          working_dir: tests/fixtures/app
+          all_features: true
+          forbidden_packages: rso-backend-b
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/forbid-all
+      - name: Expect smallvec without the default feature, which must fail
+        id: expect-absent
+        continue-on-error: true
+        uses: ./actions/tree_expect
+        with:
+          working_dir: tests/fixtures/app
+          no_default_features: true
+          invert: smallvec
+          depth: 1
+          expected: smallvec@1.6.0 path:rso-fixture@0.1.0
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/expect-absent
+      # A lockfile cargo would have to update, under locked, is an error even
+      # with report_only.
+      - name: Copy the fixture with a version its lockfile doesn't match
+        env:
+          STALE: ${{ runner.temp }}/stale
+        run: |
+          mkdir -p "${STALE}"
+          cp -a tests/fixtures/app/. "${STALE}/"
+          sed -i '0,/^version = "0.1.0"/s//version = "0.1.1"/' "${STALE}/Cargo.toml"
+      - name: Forbid on a stale lockfile with report_only, which must fail
+        id: forbid-stale
+        continue-on-error: true
+        uses: ./actions/tree_forbid
+        with:
+          working_dir: ${{ runner.temp }}/stale
+          forbidden_packages: x
+          report_only: true
+          run_record: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/stale
+      - name: Verify what must fail failed
+        env:
+          OUTCOMES: ${{ steps.forbid-all.outcome }} ${{ steps.expect-absent.outcome }} ${{ steps.forbid-stale.outcome }}
+          FAILING: ${{ runner.temp }}/failing
+        run: |
+          [[ "${OUTCOMES}" == "failure failure failure" ]]
+          jq -e '.verdict == "failed"' "${FAILING}/forbid-all/tree-forbid.json"
+          jq -e '.outcome == "error" and .exit_code == 101' "${FAILING}/stale/tree-forbid.run-record.json"
+      - if: always()
+        uses: ./actions/store_reports
+        with:
+          output_dir: ${{ runner.temp }}/reports/graph
+
+  # Offline: with github.com and crates.io blocked and the runner's Rust
+  # toolchain off the PATH, audit, deny and licenses run against an imported
+  # copy of the advisory database and a saved cargo metadata. A database 120
+  # days old fails unless allow_stale is true.
+  offline:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/install
+        with:
+          tools: cargo-audit cargo-deny
+      - uses: ./actions/fetch_advisory_db
+        with:
+          archive: ${{ runner.temp }}/advisory-db.tar.gz
+      - name: Write the fixture's cargo metadata
+        working-directory: tests/fixtures/app
+        env:
+          METADATA: ${{ runner.temp }}/metadata.json
+        run: cargo metadata --format-version 1 --locked > "${METADATA}"
+      - name: Block github.com and crates.io, and take Rust off the PATH
+        run: |
+          for host in github.com api.github.com codeload.github.com objects.githubusercontent.com \
+              release-assets.githubusercontent.com raw.githubusercontent.com crates.io index.crates.io static.crates.io; do
+            echo "127.0.0.1 ${host}" | sudo tee -a /etc/hosts > /dev/null
+          done
+          for url in https://github.com https://index.crates.io/config.json https://static.crates.io; do
+            if curl --silent --max-time 10 --output /dev/null "${url}"; then
+              echo "${url} is still reachable."
+              exit 1
+            fi
+          done
+          cargo_bin="$(dirname "$(command -v cargo)")"
+          mv "${cargo_bin}" "${cargo_bin}.hidden"
+          if command -v cargo; then
+            echo "cargo is still on the PATH."
+            exit 1
+          fi
+      - uses: ./actions/fetch_advisory_db
+        with:
+          import: ${{ runner.temp }}/advisory-db.tar.gz
+      - uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          no_fetch: true
+          no_yanked: true
+          report_only: true
+          run_record: true
+          output_dir: ${{ runner.temp }}/reports/offline
+      - uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          offline: true
+          metadata_path: ${{ runner.temp }}/metadata.json
+          report_only: true
+          run_record: true
+          output_dir: ${{ runner.temp }}/reports/offline
+      - uses: ./actions/licenses
+        with:
+          working_dir: tests/fixtures/app
+          offline: true
+          metadata_path: ${{ runner.temp }}/metadata.json
+          output_dir: ${{ runner.temp }}/reports/offline
+      - name: Verify each command found the advisory offline
+        working-directory: ${{ runner.temp }}/reports/offline
+        run: |
+          jq -e '[.vulnerabilities.list[].advisory.id] | index("RUSTSEC-2021-0003")' cargo-audit.json
+          jq -s -e 'any(.[]; .type == "diagnostic" and .fields.advisory.id == "RUSTSEC-2021-0003")' cargo-deny.jsonl
+          jq -e 'keys | map(startswith("smallvec 1.6.0")) | any' licenses.json
+          jq -e '.toolchain.cargo == null' cargo-audit.run-record.json
+      # The same advisories, with their newest commit 120 days old.
+      - name: Make a stale copy of the database
+        env:
+          STALE: ${{ runner.temp }}/stale-db
+        run: |
+          mkdir -p "${STALE}"
+          cp -a "${RUSTSEC_ADVISORY_DB}/." "${STALE}/"
+          rm -rf "${STALE}/.git"
+          when=$(($(date +%s) - 120 * 86400))
+          cd "${STALE}"
+          git init -q
+          git add -A
+          GIT_AUTHOR_DATE="@${when}" GIT_COMMITTER_DATE="@${when}" git -c user.name=test -c user.email=test@example.test commit -q -m stale
+      - uses: ./actions/fetch_advisory_db
+        with:
+          import: ${{ runner.temp }}/stale-db
+      - name: Audit the stale database, which must fail
+        id: audit-stale
+        continue-on-error: true
+        uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          no_fetch: true
+          no_yanked: true
+          report_only: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/audit-stale
+      - uses: ./actions/audit
+        with:
+          working_dir: tests/fixtures/app
+          no_fetch: true
+          no_yanked: true
+          allow_stale: true
+          report_only: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/scratch/audit-stale-allowed
+      - name: Deny with the stale database, which must fail
+        id: deny-stale
+        continue-on-error: true
+        uses: ./actions/deny
+        with:
+          working_dir: tests/fixtures/app
+          offline: true
+          metadata_path: ${{ runner.temp }}/metadata.json
+          report_only: true
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/deny-stale
+      - name: Verify the stale database failed both
+        env:
+          OUTCOMES: ${{ steps.audit-stale.outcome }} ${{ steps.deny-stale.outcome }}
+        run: '[[ "${OUTCOMES}" == "failure failure" ]]'
+
+  # cargo vet passes with the fixture's supply-chain store and fails with
+  # one that has no exemption for smallvec. sbom writes one CycloneDX SBOM
+  # per workspace member without touching Cargo.lock.
+  supply-chain:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/install
+        with:
+          tools: cargo-vet cargo-cyclonedx
+      - uses: ./actions/vet
+        with:
+          working_dir: tests/fixtures/app
+          locked: true
+          junit: true
+          run_record: true
+          output_dir: ${{ runner.temp }}/reports/supply-chain
+      - name: Vet with a store that has no exemption for smallvec, which must fail
+        id: unvetted
+        continue-on-error: true
+        uses: ./actions/vet
+        with:
+          working_dir: tests/fixtures/app
+          locked: true
+          store_path: supply-chain-unvetted
+          store_artifacts: false
+          output_dir: ${{ runner.temp }}/failing/unvetted
+      - name: Verify it failed on smallvec
+        env:
+          OUTCOME: ${{ steps.unvetted.outcome }}
+          FAILING: ${{ runner.temp }}/failing
+        run: |
+          [[ "${OUTCOME}" == failure ]]
+          jq -e '.conclusion == "fail (vetting)" and ([.failures[].name] | index("smallvec"))' "${FAILING}/unvetted/cargo-vet.json"
+      - uses: ./actions/sbom
+        with:
+          working_dir: tests/fixtures/app
+          run_record: true
+          output_dir: ${{ runner.temp }}/reports/supply-chain
+      - name: Verify the SBOMs
+        env:
+          SBOMS: ${{ runner.temp }}/reports/supply-chain/sbom
+        run: |
+          git diff --exit-code -- tests/fixtures/app/Cargo.lock
+          if find tests -name '*.cdx.json' | grep .; then
+            echo "An SBOM was left in the workspace."
+            exit 1
+          fi
+          find "${SBOMS}" -type f | sort
+          [[ "$(find "${SBOMS}" -name '*.cdx.json' | wc -l)" -eq 3 ]]
+          jq -e '[.components[].name] | index("smallvec")' "${SBOMS}/rso-fixture.cdx.json"
+
+  # Every report the jobs above uploaded, from the artifacts the actions
+  # named: every SARIF file validates against the SARIF 2.1.0 schema, every
+  # JUnit file is well-formed, every run record validates against
+  # schemas/run-record.v1.json, and every CycloneDX SBOM says what it is.
+  reports:
+    needs: [install, detection, bans, graph, offline, supply-chain]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rust-security-reports-*
+          path: ${{ runner.temp }}/reports
+      - name: Validate the reports
+        env:
+          REPORTS: ${{ runner.temp }}/reports
+        run: |
+          ls "${REPORTS}"
+          # One artifact per store_reports, and per reporting action that
+          # kept store_artifacts on.
+          ls -d "${REPORTS}"/rust-security-reports-detection-* "${REPORTS}"/rust-security-reports-graph-* \
+            "${REPORTS}"/rust-security-reports-auditable-* "${REPORTS}"/rust-security-reports-bans-a-* \
+            "${REPORTS}"/rust-security-reports-cargo-vet-* "${REPORTS}"/rust-security-reports-sbom-*
+          python3 -m venv "${RUNNER_TEMP}/venv"
+          "${RUNNER_TEMP}/venv/bin/pip" install --quiet jsonschema==4.26.0
+          curl --fail --silent --show-error --location --proto '=https' --output "${RUNNER_TEMP}/sarif-schema-2.1.0.json" \
+            https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json
+          echo "c3b4bb2d6093897483348925aaa73af03b3e3f4bd4ca38cef26dcb4212a2682e  ${RUNNER_TEMP}/sarif-schema-2.1.0.json" | sha256sum -c -
+          "${RUNNER_TEMP}/venv/bin/python" tests/validate_reports.py --sarif-schema "${RUNNER_TEMP}/sarif-schema-2.1.0.json" "${REPORTS}"

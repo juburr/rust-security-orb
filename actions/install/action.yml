@@ -1,0 +1,374 @@
+name: Install rust-security-orb tools
+description: >
+  Installs the cargo security tools named in tools, each verified against this orb's checksum table,
+  through the install command for that tool (install_cargo_audit, install_cargo_deny, ...), which
+  can also be used on its own. Tools with prebuilt Linux binaries (cargo-audit, cargo-deny,
+  cargo-auditable, cargo-cyclonedx) are downloaded for amd64 or arm64, picked from the machine's CPU
+  architecture. The others (cargo-vet, rust-audit-info, auditable2cdx) publish no binaries for
+  current releases, so their verified source archives are built with cargo install --locked, which
+  needs cargo. Run this before the orb's other commands. The GitHub Actions twin of the orb's
+  install command.
+author: juburr
+
+inputs:
+  auditable2cdx_version:
+    description: >
+      The auditable2cdx version, when tools names it.
+    default: "0.1.0"
+  caching:
+    description: >
+      Cache each tool's verified release (or, for the tools built from source, its verified source
+      archive) between jobs. Only verified files are cached, and a cached file is verified again
+      before it is used.
+    default: "true"
+  cargo_audit_version:
+    description: >
+      The cargo-audit version, when tools names it.
+    default: "0.22.2"
+  cargo_auditable_version:
+    description: >
+      The cargo-auditable version, when tools names it.
+    default: "0.7.7"
+  cargo_cyclonedx_version:
+    description: >
+      The cargo-cyclonedx version, when tools names it.
+    default: "0.5.9"
+  cargo_deny_version:
+    description: >
+      The cargo-deny version, when tools names it.
+    default: "0.20.2"
+  cargo_vet_version:
+    description: >
+      The cargo-vet version, when tools names it.
+    default: "0.10.2"
+  download_base_url:
+    description: >
+      Base URL of an internal mirror of GitHub releases, such as an Artifactory or Nexus remote
+      repository, to download the prebuilt tools from instead of https://github.com. It replaces
+      https://github.com in each release URL, so the mirror must serve the same paths. It must be an
+      https:// URL, without credentials (user:password@) or a query or fragment, which would show in
+      the log. What is downloaded is still verified against this orb's checksum table. The tools
+      built from source download from crates.io and the registry cargo is configured for.
+    default: ""
+  install_path:
+    description: >
+      Absolute path of the directory to install the tools into. It is created if needed and added to
+      the PATH of later steps when it isn't already on it, and must be writable without root.
+      Defaults to $HOME/bin.
+    default: ""
+  rust_audit_info_version:
+    description: >
+      The rust-audit-info version, when tools names it.
+    default: "0.5.4"
+  tools:
+    description: >
+      The tools to install, separated by commas or spaces: any of cargo-audit, cargo-deny,
+      cargo-auditable, cargo-cyclonedx, cargo-vet, rust-audit-info and auditable2cdx. An unknown
+      name fails the step.
+    default: "cargo-audit,cargo-deny,cargo-auditable"
+  verify_checksums:
+    description: >
+      SHA-512 verification against this orb's checksum table, for every tool. "strict" (default)
+      fails before downloading anything when a version has no checksum in the table.
+      "known_versions" verifies listed versions and installs unlisted versions unverified, with a
+      warning. "false" skips verification and is not recommended.
+    default: strict
+
+runs:
+  using: composite
+  steps:
+    - name: Check the tools to install
+      id: tools
+      shell: bash
+      env:
+        PARAM_TOOLS: ${{ inputs.tools }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/install_tools.sh"
+        # The names, space-separated with a space on either side, for the
+        # if: conditions below.
+        read -r -a tools <<< "${PARAM_TOOLS//,/ }"
+        printf 'list= %s \n' "${tools[*]}" >> "${GITHUB_OUTPUT}"
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare cargo-audit cache key
+      id: cargo-audit-cache-key
+      if: contains(steps.tools.outputs.list, ' cargo-audit ') && (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-cargo-audit-cache-key
+        PARAM_VERSION: ${{ inputs.cargo_audit_version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-cargo-audit-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore cargo-audit cache
+      id: cargo-audit-restore
+      if: contains(steps.tools.outputs.list, ' cargo-audit ') && (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-audit
+        key: ${{ steps.cargo-audit-cache-key.outputs.key }}
+    - name: Install cargo-audit
+      if: contains(steps.tools.outputs.list, ' cargo-audit ')
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_DOWNLOAD_BASE_URL: ${{ inputs.download_base_url }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.cargo_audit_version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/cargo-audit/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save cargo-audit cache
+      if: contains(steps.tools.outputs.list, ' cargo-audit ') && (inputs.caching == 'true' || inputs.caching == '1') && steps.cargo-audit-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-audit
+        key: ${{ steps.cargo-audit-cache-key.outputs.key }}
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare cargo-deny cache key
+      id: cargo-deny-cache-key
+      if: contains(steps.tools.outputs.list, ' cargo-deny ') && (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-cargo-deny-cache-key
+        PARAM_VERSION: ${{ inputs.cargo_deny_version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-cargo-deny-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore cargo-deny cache
+      id: cargo-deny-restore
+      if: contains(steps.tools.outputs.list, ' cargo-deny ') && (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-deny
+        key: ${{ steps.cargo-deny-cache-key.outputs.key }}
+    - name: Install cargo-deny
+      if: contains(steps.tools.outputs.list, ' cargo-deny ')
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_DOWNLOAD_BASE_URL: ${{ inputs.download_base_url }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.cargo_deny_version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/cargo-deny/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save cargo-deny cache
+      if: contains(steps.tools.outputs.list, ' cargo-deny ') && (inputs.caching == 'true' || inputs.caching == '1') && steps.cargo-deny-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-deny
+        key: ${{ steps.cargo-deny-cache-key.outputs.key }}
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare cargo-auditable cache key
+      id: cargo-auditable-cache-key
+      if: contains(steps.tools.outputs.list, ' cargo-auditable ') && (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-cargo-auditable-cache-key
+        PARAM_VERSION: ${{ inputs.cargo_auditable_version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-cargo-auditable-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore cargo-auditable cache
+      id: cargo-auditable-restore
+      if: contains(steps.tools.outputs.list, ' cargo-auditable ') && (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-auditable
+        key: ${{ steps.cargo-auditable-cache-key.outputs.key }}
+    - name: Install cargo-auditable
+      if: contains(steps.tools.outputs.list, ' cargo-auditable ')
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_DOWNLOAD_BASE_URL: ${{ inputs.download_base_url }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.cargo_auditable_version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/cargo-auditable/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save cargo-auditable cache
+      if: contains(steps.tools.outputs.list, ' cargo-auditable ') && (inputs.caching == 'true' || inputs.caching == '1') && steps.cargo-auditable-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-auditable
+        key: ${{ steps.cargo-auditable-cache-key.outputs.key }}
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare cargo-cyclonedx cache key
+      id: cargo-cyclonedx-cache-key
+      if: contains(steps.tools.outputs.list, ' cargo-cyclonedx ') && (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-cargo-cyclonedx-cache-key
+        PARAM_VERSION: ${{ inputs.cargo_cyclonedx_version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-cargo-cyclonedx-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore cargo-cyclonedx cache
+      id: cargo-cyclonedx-restore
+      if: contains(steps.tools.outputs.list, ' cargo-cyclonedx ') && (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-cyclonedx
+        key: ${{ steps.cargo-cyclonedx-cache-key.outputs.key }}
+    - name: Install cargo-cyclonedx
+      if: contains(steps.tools.outputs.list, ' cargo-cyclonedx ')
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_DOWNLOAD_BASE_URL: ${{ inputs.download_base_url }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.cargo_cyclonedx_version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/cargo-cyclonedx/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save cargo-cyclonedx cache
+      if: contains(steps.tools.outputs.list, ' cargo-cyclonedx ') && (inputs.caching == 'true' || inputs.caching == '1') && steps.cargo-cyclonedx-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-cyclonedx
+        key: ${{ steps.cargo-cyclonedx-cache-key.outputs.key }}
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare cargo-vet cache key
+      id: cargo-vet-cache-key
+      if: contains(steps.tools.outputs.list, ' cargo-vet ') && (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-cargo-vet-cache-key
+        PARAM_VERSION: ${{ inputs.cargo_vet_version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-cargo-vet-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore cargo-vet cache
+      id: cargo-vet-restore
+      if: contains(steps.tools.outputs.list, ' cargo-vet ') && (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-vet
+        key: ${{ steps.cargo-vet-cache-key.outputs.key }}
+    - name: Install cargo-vet
+      if: contains(steps.tools.outputs.list, ' cargo-vet ')
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.cargo_vet_version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/cargo-vet/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save cargo-vet cache
+      if: contains(steps.tools.outputs.list, ' cargo-vet ') && (inputs.caching == 'true' || inputs.caching == '1') && steps.cargo-vet-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-cargo-vet
+        key: ${{ steps.cargo-vet-cache-key.outputs.key }}
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare rust-audit-info cache key
+      id: rust-audit-info-cache-key
+      if: contains(steps.tools.outputs.list, ' rust-audit-info ') && (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-rust-audit-info-cache-key
+        PARAM_VERSION: ${{ inputs.rust_audit_info_version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-rust-audit-info-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore rust-audit-info cache
+      id: rust-audit-info-restore
+      if: contains(steps.tools.outputs.list, ' rust-audit-info ') && (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-rust-audit-info
+        key: ${{ steps.rust-audit-info-cache-key.outputs.key }}
+    - name: Install rust-audit-info
+      if: contains(steps.tools.outputs.list, ' rust-audit-info ')
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.rust_audit_info_version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/rust-audit-info/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save rust-audit-info cache
+      if: contains(steps.tools.outputs.list, ' rust-audit-info ') && (inputs.caching == 'true' || inputs.caching == '1') && steps.rust-audit-info-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-rust-audit-info
+        key: ${{ steps.rust-audit-info-cache-key.outputs.key }}
+    # The key is computed from a file that names the CPU (uname -m), HOME (a
+    # cache is restored to the absolute path it was saved from) and the
+    # version, as the orb's command computes it.
+    - name: Prepare auditable2cdx cache key
+      id: auditable2cdx-cache-key
+      if: contains(steps.tools.outputs.list, ' auditable2cdx ') && (inputs.caching == 'true' || inputs.caching == '1')
+      shell: bash
+      env:
+        ORB_CACHE_KEY_FILE: ${{ runner.temp }}/rust-security-orb-auditable2cdx-cache-key
+        PARAM_VERSION: ${{ inputs.auditable2cdx_version }}
+      run: |
+        bash "${GITHUB_ACTION_PATH}/../../src/scripts/cache_key.sh"
+        # Bump the version in the key when an existing checksum table entry
+        # changes, so caches saved for the old bytes stop being restored.
+        printf 'key=rust-security-orb-auditable2cdx-v1-%s\n' "$(sha256sum < "${ORB_CACHE_KEY_FILE}" | cut -c1-64)" >> "${GITHUB_OUTPUT}"
+    - name: Restore auditable2cdx cache
+      id: auditable2cdx-restore
+      if: contains(steps.tools.outputs.list, ' auditable2cdx ') && (inputs.caching == 'true' || inputs.caching == '1')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-auditable2cdx
+        key: ${{ steps.auditable2cdx-cache-key.outputs.key }}
+    - name: Install auditable2cdx
+      if: contains(steps.tools.outputs.list, ' auditable2cdx ')
+      shell: bash
+      env:
+        PARAM_CACHING: ${{ inputs.caching }}
+        PARAM_INSTALL_PATH: ${{ inputs.install_path }}
+        PARAM_VERIFY_CHECKSUMS: ${{ inputs.verify_checksums }}
+        PARAM_VERSION: ${{ inputs.auditable2cdx_version }}
+      run: bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/install/auditable2cdx/install.sh"
+    # A saved cache can't be replaced, so it is only saved when none was
+    # restored. Like the orb's save_cache, it is saved right after the
+    # install, not at the end of the job.
+    - name: Save auditable2cdx cache
+      if: contains(steps.tools.outputs.list, ' auditable2cdx ') && (inputs.caching == 'true' || inputs.caching == '1') && steps.auditable2cdx-restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/rust-security-orb-auditable2cdx
+        key: ${{ steps.auditable2cdx-cache-key.outputs.key }}

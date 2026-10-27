@@ -1,0 +1,178 @@
+name: Audit a Cargo.lock with cargo audit
+description: >
+  Checks a Cargo.lock, or several with lockfiles, against the RustSec advisory database with cargo
+  audit, and writes cargo-audit's JSON report and a SARIF report to output_dir. The step fails when
+  cargo audit finds vulnerabilities, or warnings that deny makes errors, unless report_only is true;
+  it always fails when cargo audit itself fails. Ignores and other policy belong in
+  .cargo/audit.toml in working_dir, which cargo audit reads as usual. Install cargo-audit first (the
+  install command does by default). The GitHub Actions twin of the orb's audit command.
+author: juburr
+
+inputs:
+  allow_stale:
+    description: >
+      Use an advisory database whose newest commit is 90 days old or more (cargo audit --stale),
+      instead of failing. Refresh an offline database on a schedule rather than leaving this on.
+    default: "false"
+  db_path:
+    description: >
+      The advisory database to use (cargo audit --db). Defaults to the one fetch_advisory_db fetched
+      or imported earlier in the job (it exports RUSTSEC_ADVISORY_DB), or else cargo-audit's
+      default, $CARGO_HOME/advisory-db.
+    default: ""
+  deny:
+    description: >
+      Warning kinds that fail the step like vulnerabilities (cargo audit --deny), separated by
+      commas or spaces: unmaintained, unsound, yanked, or warnings for all three.
+    default: ""
+  extra_args:
+    description: >
+      More cargo audit arguments, split like shell words. Nothing in them is expanded or run. --json
+      and --format are refused, since this command writes the reports, and so are --no-fetch, --db
+      and --stale (-n, -d): use no_fetch, db_path and allow_stale, which the staleness check and run
+      record follow. --deny (-D) is refused too: use deny, which the counts and JUnit report follow.
+      Only options and their values are taken: cargo audit would read any other word as a
+      subcommand, such as bin, or its argument.
+    default: ""
+  junit:
+    description: >
+      Also write JUnit XML, one test case per finding (with lockfiles, one test suite per lockfile),
+      for a JUnit reader such as a test report action: vulnerabilities and denied warnings fail,
+      other warnings are skipped.
+    default: "false"
+  lockfile:
+    description: >
+      The Cargo.lock to audit (cargo audit --file). Defaults to Cargo.lock. It must exist: the step
+      fails rather than let cargo audit create one with cargo update.
+    default: ""
+  lockfiles:
+    description: >
+      Several Cargo.lock files to audit instead of lockfile, such as those of standalone workspaces
+      (fuzz targets, test harnesses) that share one .cargo/audit.toml, separated by commas, spaces
+      or newlines; shell patterns such as crates/*/fuzz/Cargo.lock are expanded, and one that
+      matches nothing fails the step. Each is audited on its own, with reports named
+      <report_name>-<slug>, where the slug is its path relative to working_dir without Cargo.lock,
+      with / as - (root for working_dir's own), and listed in an index, <report_name>.json. Only the
+      first audit may fetch the database. Every lockfile is audited before the step fails.
+    default: ""
+  no_fetch:
+    description: >
+      Use the database as it is, without updating it (cargo audit --no-fetch), as a job that runs
+      after fetch_advisory_db or without network access should. cargo audit checks a database's age
+      only when it fetches, so with no_fetch this command applies cargo audit's own rule itself: a
+      database whose newest commit is 90 days old or more fails the step, unless allow_stale is
+      true.
+    default: "false"
+  no_yanked:
+    description: >
+      Skip the check for yanked crates (cargo audit --no-yanked, cargo-audit 0.22.2 and later),
+      which otherwise queries the crates.io index.
+    default: "false"
+  output_dir:
+    description: >
+      Absolute path of the directory to write the reports into.
+    default: /tmp/rust-security-reports
+  report_name:
+    description: >
+      The reports' file name, without extension: <report_name>.json, .sarif, .log, .run-record.json
+      and junit/<report_name>.xml (with lockfiles, <report_name>-<slug>.json, .sarif and .log for
+      each lockfile). Give each audit in a job its own; it is also in the step's name.
+    default: cargo-audit
+  report_only:
+    description: >
+      Report findings without failing the step, to adopt the check gradually. A cargo audit that
+      can't complete still fails it.
+    default: "false"
+  run_record:
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the advisory database's commit and time, the
+      lockfile's and config's SHA-256, the arguments, the counts and every report's SHA-256.
+    default: "false"
+  sarif:
+    description: >
+      Also write a SARIF 2.1.0 report, <report_name>.sarif.
+    default: "true"
+  store_artifacts:
+    description: >
+      Upload output_dir as a workflow artifact, named rust-security-reports-<report_name> and a
+      random suffix, including when the step fails.
+    default: "true"
+  target_arch:
+    description: >
+      Only report vulnerabilities that affect these CPU architectures (cargo audit --target-arch),
+      such as x86_64, separated by commas or spaces.
+    default: ""
+  target_os:
+    description: >
+      Only report vulnerabilities that affect these operating systems (cargo audit --target-os),
+      such as linux, separated by commas or spaces.
+    default: ""
+  unused_ignores:
+    description: >
+      What to do about an ignore (in the audit.toml cargo audit reads, or --ignore in extra_args)
+      that matches no finding, with the levels of cargo-deny's unused-ignored-advisory: allow, the
+      default, doesn't check; warn reports each one; deny also fails the step. cargo audit's report
+      doesn't say which ignores applied, so this audits each lockfile again, offline, with a copy of
+      the config without its ignores: an ignore is used when its advisory's ID matches a finding
+      there. cargo audit doesn't match ignores against aliases, so one written as a CVE or GHSA ID
+      is unused, and the report names the advisory to ignore instead. An ignore is unused only if no
+      lockfile the step audits has a finding for it, so with one config shared by several lockfiles,
+      name them all in lockfiles: audited one at a time, each would report the others' ignores.
+      Writes <report_name>.ignores.json, with what the database now says of each unused ignore's
+      advisory. A config this can't rewrite exactly fails the step.
+    default: allow
+  working_dir:
+    description: >
+      Directory to run cargo audit in. cargo audit reads .cargo/audit.toml from here, or else from
+      CARGO_HOME, and lockfile is relative to it.
+    default: .
+
+runs:
+  using: composite
+  steps:
+    # Artifact names must be unique in a workflow run, and the same command
+    # can run in several jobs or matrix legs, so the name ends in a random
+    # suffix.
+    - name: Name the reports artifact
+      id: artifact
+      if: (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.report_name }}
+      run: |
+        if [[ ! "${REPORT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            REPORT_NAME=reports
+        fi
+        printf 'name=rust-security-reports-%s-%s\n' "${REPORT_NAME}" "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" >> "${GITHUB_OUTPUT}"
+    - name: cargo audit
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_ALLOW_STALE: ${{ inputs.allow_stale }}
+        PARAM_DB_PATH: ${{ inputs.db_path }}
+        PARAM_DENY: ${{ inputs.deny }}
+        PARAM_EXTRA_ARGS: ${{ inputs.extra_args }}
+        PARAM_JUNIT: ${{ inputs.junit }}
+        PARAM_LOCKFILE: ${{ inputs.lockfile }}
+        PARAM_LOCKFILES: ${{ inputs.lockfiles }}
+        PARAM_NO_FETCH: ${{ inputs.no_fetch }}
+        PARAM_NO_YANKED: ${{ inputs.no_yanked }}
+        PARAM_OUTPUT_DIR: ${{ inputs.output_dir }}
+        PARAM_REPORT_NAME: ${{ inputs.report_name }}
+        PARAM_REPORT_ONLY: ${{ inputs.report_only }}
+        PARAM_RUN_RECORD: ${{ inputs.run_record }}
+        PARAM_SARIF: ${{ inputs.sarif }}
+        PARAM_TARGET_ARCH: ${{ inputs.target_arch }}
+        PARAM_TARGET_OS: ${{ inputs.target_os }}
+        PARAM_UNUSED_IGNORES: ${{ inputs.unused_ignores }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/audit.sh"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"
+    - name: Upload the reports
+      if: always() && (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ inputs.output_dir }}
+        if-no-files-found: ignore

@@ -1,0 +1,135 @@
+name: Check supply-chain audits with cargo vet
+description: >
+  Checks with cargo vet that every third-party crate is covered by an audit, an imported audit or an
+  exemption in the project's supply-chain store, and writes cargo-vet's JSON report. Fails when
+  vetting fails, unless report_only is true, and always when cargo vet can't run (no store, a
+  malformed one). Needs cargo and cargo-vet (in the install command's tools). The GitHub Actions
+  twin of the orb's vet command.
+author: juburr
+
+inputs:
+  extra_args:
+    description: >
+      More cargo vet options, split like shell words; nothing in them is expanded or run.
+      --store-path and --manifest-path are refused, and so is --manifest-path passed to cargo with
+      --cargo-arg: use store_path and manifest_path, which the run record follows.
+    default: ""
+  features:
+    description: >
+      Features to enable, separated by commas or spaces. cargo vet checks every feature unless
+      no_all_features is true.
+    default: ""
+  filter_graph:
+    description: >
+      Filter the dependency graph (--filter-graph), such as "exclude(eq(is_dev_only(true)))".
+    default: ""
+  frozen:
+    description: >
+      Also keep cargo metadata off the network (--frozen), which needs cargo's cache warm.
+    default: "false"
+  junit:
+    description: >
+      Also write JUnit XML, one test case per unvetted crate or violation, to output_dir/junit, for
+      a JUnit reader such as a test report action.
+    default: "false"
+  locked:
+    description: >
+      Use the imports recorded in imports.lock rather than fetching them (--locked), so cargo vet
+      makes no network requests of its own and never rewrites the store. Turn it off to fetch the
+      imports config.toml names, whose hosts then need network access. A check that then fails used
+      imported audits cargo vet doesn't write to imports.lock, so the run record can't hash them,
+      and the step warns.
+    default: "true"
+  manifest_path:
+    description: >
+      The Cargo.toml to vet (--manifest-path).
+    default: ""
+  no_all_features:
+    description: >
+      Don't enable every feature (--no-all-features).
+    default: "false"
+  no_default_features:
+    description: >
+      Disable the default features (--no-default-features).
+    default: "false"
+  output_dir:
+    description: >
+      Absolute path of the directory to write the reports into.
+    default: /tmp/rust-security-reports
+  report_name:
+    description: >
+      The reports' file name, without extension, so several runs in a job (or a matrix) don't
+      overwrite each other's reports.
+    default: cargo-vet
+  report_only:
+    description: >
+      Report findings without failing the step, to adopt the check gradually. A tool that can't
+      complete still fails it.
+    default: "false"
+  run_record:
+    description: >
+      Also write <report_name>.run-record.json: the tool's version and SHA-512 and how it was
+      installed, the cargo and rustc versions, the inputs' SHA-256, the arguments, the counts and
+      every report's SHA-256.
+    default: "false"
+  store_artifacts:
+    description: >
+      Upload output_dir as a workflow artifact, named rust-security-reports-<report_name> and a
+      random suffix, including when the step fails.
+    default: "true"
+  store_path:
+    description: >
+      The supply-chain store (--store-path). Defaults, as cargo vet does, to the store path in
+      Cargo.toml's [package.metadata.vet] or [workspace.metadata.vet], or else supply-chain in the
+      workspace root.
+    default: ""
+  working_dir:
+    description: >
+      Directory to run cargo vet in.
+    default: .
+
+runs:
+  using: composite
+  steps:
+    # Artifact names must be unique in a workflow run, and the same command
+    # can run in several jobs or matrix legs, so the name ends in a random
+    # suffix.
+    - name: Name the reports artifact
+      id: artifact
+      if: (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.report_name }}
+      run: |
+        if [[ ! "${REPORT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            REPORT_NAME=reports
+        fi
+        printf 'name=rust-security-reports-%s-%s\n' "${REPORT_NAME}" "$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')" >> "${GITHUB_OUTPUT}"
+    - name: cargo vet
+      shell: bash
+      working-directory: ${{ inputs.working_dir }}
+      env:
+        PARAM_EXTRA_ARGS: ${{ inputs.extra_args }}
+        PARAM_FEATURES: ${{ inputs.features }}
+        PARAM_FILTER_GRAPH: ${{ inputs.filter_graph }}
+        PARAM_FROZEN: ${{ inputs.frozen }}
+        PARAM_JUNIT: ${{ inputs.junit }}
+        PARAM_LOCKED: ${{ inputs.locked }}
+        PARAM_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        PARAM_NO_ALL_FEATURES: ${{ inputs.no_all_features }}
+        PARAM_NO_DEFAULT_FEATURES: ${{ inputs.no_default_features }}
+        PARAM_OUTPUT_DIR: ${{ inputs.output_dir }}
+        PARAM_REPORT_NAME: ${{ inputs.report_name }}
+        PARAM_REPORT_ONLY: ${{ inputs.report_only }}
+        PARAM_RUN_RECORD: ${{ inputs.run_record }}
+        PARAM_STORE_PATH: ${{ inputs.store_path }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/vet.sh"
+        "SCRIPT_RUST_SECURITY_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/rust_security.sh"
+    - name: Upload the reports
+      if: always() && (inputs.store_artifacts == 'true' || inputs.store_artifacts == '1')
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.artifact.outputs.name }}
+        path: ${{ inputs.output_dir }}
+        if-no-files-found: ignore
