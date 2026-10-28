@@ -117,7 +117,7 @@ Add the orb, install the tools, check the project. Copy this into `.circleci/con
 version: 2.1
 
 orbs:
-  rust-security: juburr/rust-security-orb@0.3.0
+  rust-security: juburr/rust-security-orb@0.3.1
 
 jobs:
   security:
@@ -158,12 +158,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # cargo-audit, cargo-deny and cargo-auditable, verified.
-      - uses: juburr/rust-security-orb/actions/install@v0.3.0
-      - uses: juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.0
-      - uses: juburr/rust-security-orb/actions/audit@v0.3.0
+      - uses: juburr/rust-security-orb/actions/install@v0.3.1
+      - uses: juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.1
+      - uses: juburr/rust-security-orb/actions/audit@v0.3.1
         with:
           no_fetch: "true"
-      - uses: juburr/rust-security-orb/actions/deny@v0.3.0
+      - uses: juburr/rust-security-orb/actions/deny@v0.3.1
 ```
 
 Each check fails the job on what it finds and uploads its reports from `/tmp/rust-security-reports` as a workflow artifact, even when it fails. GitHub's runners come with Rust, which `deny` and the tools built from crates use. See [GitHub Actions](#-github-actions) for how the actions map to the orb's commands.
@@ -666,25 +666,25 @@ Each of the orb's commands has a GitHub Action of the same name. The actions run
 
 | Action | Orb command |
 | --- | --- |
-| `juburr/rust-security-orb/actions/install@v0.3.0` | [`rust-security/install`](#rust-securityinstall) |
-| `juburr/rust-security-orb/actions/install_cargo_audit@v0.3.0`, `install_cargo_deny`, `install_cargo_auditable`, `install_cargo_cyclonedx`, `install_cargo_vet`, `install_rust_audit_info`, `install_auditable2cdx` | [`rust-security/install_<tool>`](#rust-securityinstall_tool) |
-| `juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.0` | [`rust-security/fetch_advisory_db`](#rust-securityfetch_advisory_db) |
-| `juburr/rust-security-orb/actions/audit@v0.3.0` | [`rust-security/audit`](#rust-securityaudit) |
-| `juburr/rust-security-orb/actions/audit_bin@v0.3.0` | [`rust-security/audit_bin`](#rust-securityaudit_bin) |
-| `juburr/rust-security-orb/actions/deny@v0.3.0` | [`rust-security/deny`](#rust-securitydeny) |
-| `juburr/rust-security-orb/actions/licenses@v0.3.0` | [`rust-security/licenses`](#rust-securitylicenses) |
-| `juburr/rust-security-orb/actions/auditable_build@v0.3.0` | [`rust-security/auditable_build`](#rust-securityauditable_build) |
-| `juburr/rust-security-orb/actions/verify_auditable@v0.3.0` | [`rust-security/verify_auditable`](#rust-securityverify_auditable) |
-| `juburr/rust-security-orb/actions/sbom@v0.3.0` | [`rust-security/sbom`](#rust-securitysbom) |
-| `juburr/rust-security-orb/actions/vet@v0.3.0` | [`rust-security/vet`](#rust-securityvet) |
-| `juburr/rust-security-orb/actions/tree_forbid@v0.3.0` | [`rust-security/tree_forbid`](#rust-securitytree_forbid) |
-| `juburr/rust-security-orb/actions/tree_expect@v0.3.0` | [`rust-security/tree_expect`](#rust-securitytree_expect) |
-| `juburr/rust-security-orb/actions/store_reports@v0.3.0` | [`rust-security/store_reports`](#rust-securitystore_reports) |
+| `juburr/rust-security-orb/actions/install@v0.3.1` | [`rust-security/install`](#rust-securityinstall) |
+| `juburr/rust-security-orb/actions/install_cargo_audit@v0.3.1`, `install_cargo_deny`, `install_cargo_auditable`, `install_cargo_cyclonedx`, `install_cargo_vet`, `install_rust_audit_info`, `install_auditable2cdx` | [`rust-security/install_<tool>`](#rust-securityinstall_tool) |
+| `juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.1` | [`rust-security/fetch_advisory_db`](#rust-securityfetch_advisory_db) |
+| `juburr/rust-security-orb/actions/audit@v0.3.1` | [`rust-security/audit`](#rust-securityaudit) |
+| `juburr/rust-security-orb/actions/audit_bin@v0.3.1` | [`rust-security/audit_bin`](#rust-securityaudit_bin) |
+| `juburr/rust-security-orb/actions/deny@v0.3.1` | [`rust-security/deny`](#rust-securitydeny) |
+| `juburr/rust-security-orb/actions/licenses@v0.3.1` | [`rust-security/licenses`](#rust-securitylicenses) |
+| `juburr/rust-security-orb/actions/auditable_build@v0.3.1` | [`rust-security/auditable_build`](#rust-securityauditable_build) |
+| `juburr/rust-security-orb/actions/verify_auditable@v0.3.1` | [`rust-security/verify_auditable`](#rust-securityverify_auditable) |
+| `juburr/rust-security-orb/actions/sbom@v0.3.1` | [`rust-security/sbom`](#rust-securitysbom) |
+| `juburr/rust-security-orb/actions/vet@v0.3.1` | [`rust-security/vet`](#rust-securityvet) |
+| `juburr/rust-security-orb/actions/tree_forbid@v0.3.1` | [`rust-security/tree_forbid`](#rust-securitytree_forbid) |
+| `juburr/rust-security-orb/actions/tree_expect@v0.3.1` | [`rust-security/tree_expect`](#rust-securitytree_expect) |
+| `juburr/rust-security-orb/actions/store_reports@v0.3.1` | [`rust-security/store_reports`](#rust-securitystore_reports) |
 
 To upload the advisories to GitHub code scanning (the job needs `permissions: security-events: write`), point the upload at the SARIF report:
 
 ```yaml
-      - uses: juburr/rust-security-orb/actions/deny@v0.3.0
+      - uses: juburr/rust-security-orb/actions/deny@v0.3.1
         with:
           report_only: "true"
       - uses: github/codeql-action/upload-sarif@v4
@@ -697,7 +697,7 @@ To persist the advisory database for later jobs, as [Fetch the Advisory Database
 
 How they differ from the orb's commands:
 
-- **Versions.** An action is referenced by the repository's release tag, such as `v0.3.0`, the same tag the orb is published from. There is no moving major tag yet. For the strongest pinning, use the tag's commit SHA: `juburr/rust-security-orb/actions/deny@<sha> # v0.3.0`.
+- **Versions.** An action is referenced by the repository's release tag, such as `v0.3.1`, the same tag the orb is published from. There is no moving major tag yet. For the strongest pinning, use the tag's commit SHA: `juburr/rust-security-orb/actions/deny@<sha> # v0.3.1`.
 - **Inputs are strings.** Write booleans and numbers quoted, such as `report_only: "true"` or `depth: "1"`. The scripts check every boolean and enum themselves.
 - **Environment variables.** The orb expands `$NAME` in its parameters with the CircleCI CLI, which GitHub's runners don't have, so the actions take values as they are. Use GitHub's expressions instead, such as `binaries: ${{ runner.temp }}/dist/*`.
 - **Artifacts.** A command that stores artifacts uploads `output_dir` with [`actions/upload-artifact`](https://github.com/actions/upload-artifact), even when the step fails, as an artifact named `rust-security-reports-<report_name>-` and a random suffix, since artifact names must be unique in a workflow run; `store_reports` names it after `output_dir`'s last directory instead. Give `store_reports` `if: always()`, so it uploads after a failed check. There is no Tests tab: JUnit files are in `output_dir/junit/`, for any JUnit report action.

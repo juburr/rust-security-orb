@@ -652,6 +652,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The runner downloads an action a composite action uses when that
+      # composite first runs, which for upload-artifact is after
+      # codeload.github.com is blocked: only runner images whose own action
+      # cache holds this release could start audit. A step that names an
+      # action has it downloaded when the job starts, whether or not it runs.
+      - name: Download upload-artifact while codeload.github.com is reachable
+        if: false
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: unused
       - uses: ./actions/install
         with:
           tools: cargo-audit cargo-deny
