@@ -2930,6 +2930,121 @@ run tree_expect.sh PARAM_INVERT=x PARAM_EXPECTED=x@1.0.0 "PATH=$(path_without ca
 check "needs cargo" failed
 check "saying so" said "ERROR: cargo is not on the PATH"
 
+# Linux refuses to start a program with any one argument (or environment
+# string) over 128 KiB: exit 126, "Argument list too long". A graph of some
+# 700 packages passed that as one jq argument, so the step failed before it
+# decided anything.
+begin "tree_forbid and tree_expect: a graph over 128 KiB"
+ARG_LIMIT=131072
+# big_graph NAME ROOT COUNT PAD FEATURES: writes CASE/NAME, a tree from ROOT
+# (a line without its depth) to COUNT packages p<n><PAD> v1.0.0 at depth 1,
+# each with FEATURES features of 24 characters, and a hub v1.0.0 below the
+# first of them.
+big_graph() {
+    awk -v root="$2" -v count="$3" -v pad="$4" -v features="$5" 'BEGIN {
+        list = ""
+        for (f = 1; f <= features; f++) list = list (f > 1 ? "," : "") sprintf("feature-%016d", f)
+        print "0" root
+        for (i = 1; i <= count; i++) {
+            printf "1p%04d%s v1.0.0\t%s\n", i, pad, list
+            if (i == 1) print "2hub v1.0.0\t"
+        }
+    }' > "${CASE}/$1"
+}
+# big_inverted NAME COUNT PAD: writes CASE/NAME, the tree inverted from hub,
+# with the same COUNT packages as its dependents.
+big_inverted() {
+    awk -v count="$2" -v pad="$3" 'BEGIN {
+        print "0hub v1.0.0\t"
+        for (i = 1; i <= count; i++) printf "1p%04d%s v1.0.0\t\n", i, pad
+    }' > "${CASE}/$1"
+}
+# json_size FILE FILTER: the size, in bytes, of FILTER's compact output.
+json_size() { jq -c "$2" "$1" | wc -c; }
+# Names of 80 characters, so the node list, the violations and the list of
+# unexpected packages each pass the limit on their own.
+LONG=$(printf -- '-%079d' 0)
+DEFAULTS=("${TREE_DEFAULTS[@]}" PARAM_REPORT_NAME=tree-forbid PARAM_FORBIDDEN_PACKAGES= PARAM_FORBIDDEN_FEATURES=
+    PARAM_ONLY_IF_REACHABLE= PARAM_ONLY_IF_REACHABLE_FROM=)
+tree_case
+big_graph graph.txt "work v0.1.0 (${CASE}/work)"$'\tdefault' 2000 "${LONG}" 4
+tree_answer '*' graph.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=nothing-like-it PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "tree_forbid passes a graph whose node list is over 128 KiB (exit ${RC})" test "${RC}" -eq 0
+check "without running into the limit" not_said "Argument list too long"
+check "its report lists every package" json_is "${CASE}/out/tree-forbid.json" '.nodes | length' 2002
+check "a list over the limit" test "$(json_size "${CASE}/out/tree-forbid.json" .nodes)" -gt "${ARG_LIMIT}"
+check "and the run record says passed" json_is "${CASE}/out/tree-forbid.run-record.json" '"\(.outcome) \(.counts.nodes)"' "passed 2002"
+tree_case
+big_graph graph.txt "work v0.1.0 (${CASE}/work)"$'\tdefault' 2000 "${LONG}" 4
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_PACKAGES=p*" "PARAM_FORBIDDEN_FEATURES=p*:feature-*1" PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "and fails one with a forbidden package in it (exit ${RC})" test "${RC}" -eq 1
+check "saying how many" said "ERROR: cargo tree's graph holds 4000 forbidden packages or features."
+check "its report lists every violation" json_is "${CASE}/out/tree-forbid.json" '.violations | length' 4000
+check "a list over the limit" test "$(json_size "${CASE}/out/tree-forbid.json" .violations)" -gt "${ARG_LIMIT}"
+check "JUnit has the failing cases, whose paths are over the limit too" \
+    test "$(grep -c '<failure' "${CASE}/out/junit/tree-forbid.xml")" -eq 2 -a "$(wc -c < "${CASE}/out/junit/tree-forbid.xml")" -gt "${ARG_LIMIT}"
+check "and the run record says findings" json_is "${CASE}/out/tree-forbid.run-record.json" '"\(.outcome) \(.counts.violations)"' "findings 4000"
+tree_case
+big_graph graph.txt "work v0.1.0 (${CASE}/work)"$'\tdefault' 2000 "${LONG}" 4
+tree_answer '*' graph.txt
+run tree_forbid.sh "PARAM_FORBIDDEN_PACKAGES=p*" PARAM_REPORT_ONLY=true PARAM_ONLY_IF_REACHABLE=hub
+check "with report_only and only_if_reachable, it reports them and passes (exit ${RC})" test "${RC}" -eq 0
+check "saying so" said "WARN: report_only is true, so this step passes."
+
+DEFAULTS=("${TREE_DEFAULTS[@]}" PARAM_REPORT_NAME=tree-expect PARAM_INVERT= PARAM_DEPTH=1 PARAM_EXPECTED= PARAM_IF_ABSENT=fail)
+tree_case
+big_graph graph.txt "work v0.1.0 (${CASE}/work)"$'\tdefault' 2000 "${LONG}" 4
+big_inverted inverted.txt 2000 "${LONG}"
+tree_answer '* -i hub *' inverted.txt
+tree_answer '*' graph.txt
+run tree_expect.sh PARAM_INVERT=hub PARAM_EXPECTED=hub@1.0.0 PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "tree_expect fails an inverted tree of 2000 unexpected dependents (exit ${RC})" test "${RC}" -eq 1
+check "saying how many" said "ERROR: cargo tree's graph around hub is not the expected one: 2000 unexpected."
+check "its report lists them" json_is "${CASE}/out/tree-expect.json" '.unexpected | length' 2000
+check "a list over the limit" test "$(json_size "${CASE}/out/tree-expect.json" .unexpected)" -gt "${ARG_LIMIT}"
+check "JUnit's message names them all" test "$(wc -c < "${CASE}/out/junit/tree-expect.xml")" -gt "${ARG_LIMIT}"
+check "and the run record says findings" json_is "${CASE}/out/tree-expect.run-record.json" '"\(.outcome) \(.counts.unexpected)"' "findings 2000"
+# Short names, so expected can list every package within an environment
+# variable's own limit, and 40 features each, so the node list is still over
+# it.
+tree_case
+big_graph graph.txt "work v0.1.0 (${CASE}/work)"$'\tdefault' 1500 "" 40
+tree_answer '* -p work *' graph.txt
+tree_answer '* --workspace *' graph.txt
+EXPECTED=$(printf 'p%04d@1.0.0 ' $(seq 1 1500))
+run tree_expect.sh PARAM_PACKAGE=work PARAM_DEPTH=2 "PARAM_EXPECTED={root} hub@1.0.0 ${EXPECTED}" PARAM_JUNIT=true PARAM_RUN_RECORD=true
+check "and passes a forward tree that is exactly the expected one (exit ${RC})" test "${RC}" -eq 0
+check "saying so" said "Passed: cargo tree's graph around work is the expected one."
+check "its report lists every package" json_is "${CASE}/out/tree-expect.json" '"\(.nodes | length) \(.expected | length)"' "1502 1502"
+check "a list over the limit" test "$(json_size "${CASE}/out/tree-expect.json" .nodes)" -gt "${ARG_LIMIT}"
+check "and the run record says passed" json_is "${CASE}/out/tree-expect.run-record.json" .outcome passed
+
+# The run record's inputs and reports grow with the workspace: 600 members,
+# with long paths, make a list of inputs over the limit.
+DEFAULTS=("${TREE_DEFAULTS[@]}" PARAM_REPORT_NAME=tree-forbid PARAM_FORBIDDEN_PACKAGES= PARAM_FORBIDDEN_FEATURES=
+    PARAM_ONLY_IF_REACHABLE= PARAM_ONLY_IF_REACHABLE_FROM=)
+tree_case
+MEMBERS=""
+for ((i = 1; i <= 600; i++)); do
+    dir=$(printf 'members/member-%04d%s' "${i}" "${LONG}")
+    mkdir -p "${CASE}/work/${dir}"
+    echo "[package]" > "${CASE}/work/${dir}/Cargo.toml"
+    MEMBERS+=" ${dir}"
+done
+{
+    printf '0work v0.1.0 (%s)\t\n' "${CASE}/work"
+    printf '1hub v1.0.0\t\n'
+} > "${CASE}/graph.txt"
+tree_answer '*' graph.txt
+run tree_forbid.sh PARAM_FORBIDDEN_PACKAGES=nothing-like-it PARAM_RUN_RECORD=true "STUB_MEMBERS=.${MEMBERS}"
+check "a workspace of 600 members passes (exit ${RC})" test "${RC}" -eq 0
+check "with its run record written, which is only a warning when jq can't start" \
+    exists "${CASE}/out/tree-forbid.run-record.json"
+check "listing every manifest" json_is "${CASE}/out/tree-forbid.run-record.json" '[.inputs[] | select(.role == "manifest")] | length' 601
+check "a list over the limit" test "$(json_size "${CASE}/out/tree-forbid.run-record.json" .inputs)" -gt "${ARG_LIMIT}"
+
 # --- the helpers
 begin "helpers"
 LIB_TEST() {

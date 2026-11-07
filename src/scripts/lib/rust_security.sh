@@ -487,8 +487,9 @@ rs_db_fresh() {
 #    "message": ..., "detail": ...}
 # A run with no cases gets one passing case, so the tab shows it ran.
 rs_junit() {
+    local suite=$2
     # shellcheck disable=SC2016 # jq program, not shell
-    rs_junit_suites "$1" "$(jq -c --arg suite "$2" '[{name: $suite, cases: .}]' <<< "$3")"
+    rs_junit_suites "$1" "$(jq -c --arg suite "${suite}" '[{name: $suite, cases: .}]' <<< "$3")"
 }
 
 # rs_junit_suites FILE SUITES: writes JUnit XML as rs_junit does, with one
@@ -550,10 +551,11 @@ rs_gate() {
 # OUTCOME is passed, findings, findings-reported (findings with report_only),
 # skipped (a check whose precondition didn't hold) or error.
 rs_run_record() {
-    local file=$1 entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url match
+    local file=$1 command=$2 outcome=$3 code=$4 started=$5
+    local entry path role sha tool_json others="[]" db_json="null" toolchain args inputs="[]" reports="[]" url match
     local -A listed=()
     rs_path_manifest_inputs
-    case "$2" in
+    case "${command}" in
         deny | licenses | sbom) rs_license_inputs ;;
     esac
     for entry in ${RS_INPUTS[@]+"${RS_INPUTS[@]}"}; do
@@ -611,19 +613,24 @@ rs_run_record() {
     args=$(rs_public_args ${RS_ARGS[@]+"${RS_ARGS[@]}"})
     toolchain=$(jq -cn --arg cargo "$(cargo --version 2> /dev/null || true)" --arg rustc "$(rustc --version 2> /dev/null || true)" \
         '{cargo: (if $cargo == "" then null else $cargo end), rustc: (if $rustc == "" then null else $rustc end)}')
-    if ! jq -n --arg command "$2" --arg outcome "$3" --argjson code "$4" --arg started "$5" \
+    # The lists, which grow with the workspace and the reports, reach jq
+    # through files: Linux refuses to run a program with any one argument
+    # over 128 KiB.
+    # shellcheck disable=SC2016 # jq program, not shell
+    if ! jq -n --arg command "${command}" --arg outcome "${outcome}" --argjson code "${code}" --arg started "${started}" \
         --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg cwd "$(pwd)" \
-        --argjson tool "${tool_json}" --argjson others "${others}" --argjson toolchain "${toolchain}" --argjson db "${db_json}" \
-        --argjson inputs "${inputs}" --argjson reports "${reports}" --argjson counts "${RS_COUNTS:-null}" \
-        --argjson ci "$(rs_ci_json)" --argjson args "${args}" --argjson exceptions "${RS_EXCEPTIONS:-null}" '{
+        --argjson tool "${tool_json}" --argjson toolchain "${toolchain}" --argjson db "${db_json}" --argjson ci "$(rs_ci_json)" \
+        --slurpfile others <(printf '%s' "${others}") --slurpfile inputs <(printf '%s' "${inputs}") \
+        --slurpfile reports <(printf '%s' "${reports}") --slurpfile counts <(printf '%s' "${RS_COUNTS:-null}") \
+        --slurpfile args <(printf '%s' "${args}") --slurpfile exceptions <(printf '%s' "${RS_EXCEPTIONS:-null}") '{
             schema: "https://github.com/juburr/rust-security-orb/blob/main/schemas/run-record.v1.json",
             command: $command, outcome: $outcome, exit_code: $code,
             started_at: $started, finished_at: $finished,
             ci: $ci,
             working_directory: $cwd,
-            tool: $tool, other_tools: $others, arguments: $args, toolchain: $toolchain,
-            advisory_db: $db, inputs: $inputs, counts: $counts, reports: $reports
-        } + (if $exceptions == null then {} else {exceptions: $exceptions} end)' > "${file}"; then
+            tool: $tool, other_tools: $others[0], arguments: $args[0], toolchain: $toolchain,
+            advisory_db: $db, inputs: $inputs[0], counts: $counts[0], reports: $reports[0]
+        } + (if $exceptions[0] == null then {} else {exceptions: $exceptions[0]} end)' > "${file}"; then
         echo "WARN: Could not write the run record ${file}." >&2
         return 0
     fi
@@ -674,7 +681,7 @@ rs_show_command() {
 # its SHA-512, and how the orb installed it, from the install record beside
 # it when that record describes this very binary.
 rs_tool_json() {
-    local sha="" install="null" entry program="null"
+    local path=$1 version=$2 sha="" install="null" entry program="null"
     if [[ -n "$1" && -f "$1" ]]; then
         # Without sha512sum the record says so with a null SHA-512, as rs_tool
         # only warns.
@@ -690,7 +697,7 @@ rs_tool_json() {
     if [[ -n "$1" && "$1" == "${RS_PROGRAM_PATH:-}" ]]; then
         program=$(jq -cn --arg name "${RS_PROGRAM_NAME}" --arg sha "${RS_PROGRAM_SHA256}" '{name: $name, sha256: $sha}')
     fi
-    jq -cn --arg name "${1##*/}" --arg path "$1" --arg version "$2" --arg sha "${sha}" --argjson install "${install}" \
+    jq -cn --arg name "${path##*/}" --arg path "${path}" --arg version "${version}" --arg sha "${sha}" --argjson install "${install}" \
         --argjson program "${program}" '{name: $name, path: $path, version: $version, sha512: (if $sha == "" then null else $sha end),
             install: $install} + (if $program == null then {} else {program: $program} end)'
 }
@@ -1477,8 +1484,9 @@ rs_audit_extra_args() {
 # from a run that exited with CODE, with the warnings that fail the step
 # counted as denied_warnings (see RS_AUDIT_DENIED_JQ).
 rs_audit_counts() {
+    local code=$2
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -c --argjson denied "$(rs_denied_json)" --argjson config "$(rs_config_denied_json)" --argjson code "$2" "${RS_AUDIT_DENIED_JQ}"'
+    jq -c --argjson denied "$(rs_denied_json)" --argjson config "$(rs_config_denied_json)" --argjson code "${code}" "${RS_AUDIT_DENIED_JQ}"'
         rs_denied_kinds as $kinds | {
             vulnerabilities: .vulnerabilities.count,
             warnings: (.warnings | map_values(length)),
@@ -1859,26 +1867,28 @@ rs_advisory_versions() {
 # warnings), and sets RS_IGNORE_CASES to JUnit test cases for them, of
 # classname CLASS, failed with MODE deny and skipped with warn.
 rs_audit_ignores_report() {
-    local report entry advisory line ids=()
+    local mode=$1 class=$3 report id advisory line ids=()
+    # One entry per input, each with every advisory ID found in it: through a
+    # file, since it can pass the 128 KiB Linux allows any one argument.
     # shellcheck disable=SC2016 # jq program, not shell
-    report=$(jq -c --argjson matches "${RS_IGNORE_MATCHES}" 'map(. as $ignore | . + {
+    report=$(jq -c --slurpfile matches <(printf '%s' "${RS_IGNORE_MATCHES}") '$matches[0] as $matches | map(. as $ignore | . + {
             matched_in: [$matches[] | select(.ids | index($ignore.id)) | .input],
             alias_of: ([$matches[].aliases[] | select(.alias == $ignore.id) | .id] | unique)}
         | . + {used: (.matched_in | length > 0)})' <<< "${RS_IGNORES}")
     mapfile -t ids < <(jq -r '.[] | select(.used | not) | .id' <<< "${report}")
-    for entry in ${ids[@]+"${ids[@]}"}; do
-        advisory=$(rs_advisory_versions "${RS_DB}" "${entry}")
+    for id in ${ids[@]+"${ids[@]}"}; do
+        advisory=$(rs_advisory_versions "${RS_DB}" "${id}")
         # shellcheck disable=SC2016 # jq program, not shell
-        report=$(jq -c --arg id "${entry}" --argjson advisory "${advisory}" \
-            'map(if .id == $id and (.used | not) then . + {advisory: $advisory} else . end)' <<< "${report}")
+        report=$(jq -c --arg id "${id}" --slurpfile advisory <(printf '%s' "${advisory}") \
+            'map(if .id == $id and (.used | not) then . + {advisory: $advisory[0]} else . end)' <<< "${report}")
     done
     # shellcheck disable=SC2016 # jq program, not shell
-    jq --arg mode "$1" --argjson inputs "$(jq -c '[.[].input]' <<< "${RS_IGNORE_MATCHES}")" '{mode: $mode, inputs: $inputs,
+    jq --arg mode "${mode}" --slurpfile matches <(printf '%s' "${RS_IGNORE_MATCHES}") '{mode: $mode, inputs: [$matches[0][].input],
         ignores: map({id, source, used, matched_in, alias_of, advisory: (.advisory // null)})}' <<< "${report}" > "$2"
     # shellcheck disable=SC2034 # read by the scripts
     RS_UNUSED_IGNORES=$(jq -c '[.ignores[] | select(.used | not) | .id] | unique' "$2")
     while IFS= read -r line; do
-        if [[ "$1" == deny ]]; then
+        if [[ "${mode}" == deny ]]; then
             echo "  unused ignore: ${line}"
         else
             echo "WARN: unused ignore: ${line}" >&2
@@ -1891,7 +1901,7 @@ rs_audit_ignores_report() {
             + (if (.advisory.unaffected | length) > 0 then ", and leaves out \(.advisory.unaffected | join(" or "))" else "" end)
           else "" end)' "$2")
     # shellcheck disable=SC2034,SC2016 # read by the scripts; jq program, not shell
-    RS_IGNORE_CASES=$(jq -c --arg mode "$1" --arg class "$3" '[.ignores[] | select(.used | not) | {
+    RS_IGNORE_CASES=$(jq -c --arg mode "${mode}" --arg class "${class}" '[.ignores[] | select(.used | not) | {
             classname: $class, name: .id, status: (if $mode == "deny" then "failed" else "skipped" end),
             message: ("ignored in \(.source), but no finding matches it"
                 + (if (.alias_of | length) > 0 then " (it is an alias of \(.alias_of | join(", ")))" else "" end)),
@@ -1901,8 +1911,9 @@ rs_audit_ignores_report() {
 # rs_audit_summary JSON PREFIX: prints a cargo audit JSON report's findings,
 # one per line, each line starting with PREFIX.
 rs_audit_summary() {
+    local prefix=$2
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -r --arg prefix "$2" '
+    jq -r --arg prefix "${prefix}" '
         (.vulnerabilities.list[] | "\($prefix)vulnerability  \(.advisory.id)  \(.package.name) \(.package.version)  \(.advisory.title)"),
         (.warnings | to_entries[] | .value[] | "\($prefix)\(.kind)  \(.advisory.id // "-")  \(.package.name) \(.package.version)\(if .advisory then "  " + .advisory.title else "" end)")
     ' "$1"
@@ -1912,8 +1923,9 @@ rs_audit_summary() {
 # as JUnit test cases for rs_junit: vulnerabilities and denied warnings fail,
 # other warnings are skipped.
 rs_audit_cases() {
+    local class=$2 code=$3
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -c --argjson denied "$(rs_denied_json)" --argjson config "$(rs_config_denied_json)" --arg class "$2" --argjson code "$3" \
+    jq -c --argjson denied "$(rs_denied_json)" --argjson config "$(rs_config_denied_json)" --arg class "${class}" --argjson code "${code}" \
         "${RS_AUDIT_DENIED_JQ}"'
         rs_denied_kinds as $kinds
         | [(.vulnerabilities.list[] | {

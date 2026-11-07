@@ -192,14 +192,15 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
                 tree_error
             fi
             # shellcheck disable=SC2016 # jq program, not shell
-            resolved=$(jq -c --argjson roots "${ROOTS}" 'map(if . == "{root}" then $roots[0] else . end) | unique' <<< "${EXPECTED_JSON}")
+            resolved=$(jq -c --slurpfile roots <(printf '%s' "${ROOTS}") 'map(if . == "{root}" then $roots[0][0] else . end) | unique' <<< "${EXPECTED_JSON}")
         fi
         nodes=$(jq -c "${RS_TREE_JQ}"'nodes' "${base}.tree.txt.json")
         rm -f "${base}.tree.txt.json"
         # shellcheck disable=SC2016 # jq program, not shell
-        missing=$(jq -c --argjson expected "${resolved}" '[.[].key] as $actual | [$expected[] | select(. as $e | $actual | index($e) | not)]' <<< "${nodes}")
+        missing=$(jq -c --slurpfile expected <(printf '%s' "${resolved}") \
+            '[.[].key] as $actual | [$expected[0][] | select(. as $e | $actual | index($e) | not)]' <<< "${nodes}")
         # shellcheck disable=SC2016 # jq program, not shell
-        unexpected=$(jq -c --argjson expected "${resolved}" '[.[].key | select(. as $a | $expected | index($a) | not)]' <<< "${nodes}")
+        unexpected=$(jq -c --slurpfile expected <(printf '%s' "${resolved}") '[.[].key | select(. as $a | $expected[0] | index($a) | not)]' <<< "${nodes}")
         verdict=passed
         if [[ "${missing}" != "[]" || "${unexpected}" != "[]" ]]; then
             verdict=failed
@@ -217,18 +218,23 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
     if [[ -f "${RS_TREE_LOCKFILE}" ]]; then
         sha=$(rs_sha256 "${RS_TREE_LOCKFILE}")
     fi
+    # The tree, and what is derived from it, reach jq through files, never as
+    # arguments: Linux refuses to run a program with any one argument over
+    # 128 KiB (exit 126, "Argument list too long"), which a deep tree, or an
+    # inverted one around a widely used crate, can pass.
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -n --arg manifest "${manifest}" --argjson exceptions "${RS_EXCEPTIONS}" --arg cargo "${RS_TOOL_VERSION}" \
-        --arg lockfile "${RS_TREE_LOCKFILE}" --arg sha "${sha}" --argjson runs "${RS_TREE_RUNS}" --arg subject "${SUBJECT}" \
-        --arg invert "${INVERT}" --argjson depth "${DEPTH}" --arg if_absent "${IF_ABSENT}" --argjson present "${present}" \
-        --argjson expected "${resolved}" --arg verdict "${verdict}" --arg reason "${reason}" --argjson nodes "${nodes}" \
-        --argjson missing "${missing}" --argjson unexpected "${unexpected}" '{
-            command: "tree_expect", manifest: (if $manifest == "" then null else $manifest end), exceptions: $exceptions,
-            cargo: $cargo, lockfile: {path: $lockfile, sha256: (if $sha == "" then null else $sha end)}, runs: $runs,
+    jq -n --arg manifest "${manifest}" --arg cargo "${RS_TOOL_VERSION}" --arg lockfile "${RS_TREE_LOCKFILE}" --arg sha "${sha}" \
+        --arg subject "${SUBJECT}" --arg invert "${INVERT}" --argjson depth "${DEPTH}" --arg if_absent "${IF_ABSENT}" \
+        --argjson present "${present}" --arg verdict "${verdict}" --arg reason "${reason}" \
+        --slurpfile exceptions <(printf '%s' "${RS_EXCEPTIONS}") --slurpfile runs <(printf '%s' "${RS_TREE_RUNS}") \
+        --slurpfile expected <(printf '%s' "${resolved}") --slurpfile nodes <(printf '%s' "${nodes}") \
+        --slurpfile missing <(printf '%s' "${missing}") --slurpfile unexpected <(printf '%s' "${unexpected}") '{
+            command: "tree_expect", manifest: (if $manifest == "" then null else $manifest end), exceptions: $exceptions[0],
+            cargo: $cargo, lockfile: {path: $lockfile, sha256: (if $sha == "" then null else $sha end)}, runs: $runs[0],
             subject: (if $subject == "" then null else $subject end), inverted: ($invert != ""), depth: $depth,
-            if_absent: $if_absent, present: $present, expected: $expected,
+            if_absent: $if_absent, present: $present, expected: $expected[0],
             verdict: $verdict, reason: (if $reason == "" then null else $reason end),
-            nodes: $nodes, missing: $missing, unexpected: $unexpected
+            nodes: $nodes[0], missing: $missing[0], unexpected: $unexpected[0]
         }' > "${base}.json"
     RS_REPORTS+=("${base}.json")
     INDEX=$(jq -c --arg manifest "${manifest}" --arg slug "${slug}" --arg report "${base}.json" --arg verdict "${verdict}" \
@@ -242,8 +248,9 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
             name="${INVERT} inverted, depth ${DEPTH}"
         fi
         # shellcheck disable=SC2016 # jq program, not shell
-        cases=$(jq -nc --arg name "${name}" --arg verdict "${verdict}" --arg reason "${reason}" --argjson missing "${missing}" \
-            --argjson unexpected "${unexpected}" '[{classname: "tree-expect", name: $name,
+        cases=$(jq -nc --arg name "${name}" --arg verdict "${verdict}" --arg reason "${reason}" --slurpfile missing <(printf '%s' "${missing}") \
+            --slurpfile unexpected <(printf '%s' "${unexpected}") '$missing[0] as $missing | $unexpected[0] as $unexpected
+            | [{classname: "tree-expect", name: $name,
                 status: (if $verdict == "failed" then "failed" else "passed" end),
                 message: (if $reason != "" then $reason
                     else [(if ($missing | length) > 0 then "missing: " + ($missing | join(", ")) else empty end),
@@ -252,7 +259,7 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
         if [[ "${RS_TREE_MULTI}" == true ]]; then
             suite="${PARAM_REPORT_NAME}-${slug}"
         fi
-        SUITES=$(jq -c --arg name "${suite}" --argjson cases "${cases}" '. + [{name: $name, cases: $cases}]' <<< "${SUITES}")
+        SUITES=$(jq -c --arg name "${suite}" --slurpfile cases <(printf '%s' "${cases}") '. + [{name: $name, cases: $cases[0]}]' <<< "${SUITES}")
     fi
 done
 rm -f "${RS_TREE_LOG}"

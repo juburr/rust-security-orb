@@ -203,12 +203,19 @@ for binary in "${BINARIES[@]}"; do
     echo "  ${binary}: $(jq -r '"\(.vulnerabilities) vulnerabilities, \(.denied_warnings) denied warnings"' <<< "${counts}")"
     rs_audit_summary "${base}.json" "    "
     if [[ "${JUNIT}" == true ]]; then
-        CASES=$(jq -c --argjson more "$(rs_audit_cases "${base}.json" "cargo-audit-bin.${name}" "${rc}")" '. + $more' <<< "${CASES}")
+        # A case per finding, so through a file: enough of them pass the
+        # 128 KiB Linux allows any one argument. Captured first, so a failure
+        # stops the step rather than reach jq as no cases.
+        more=$(rs_audit_cases "${base}.json" "cargo-audit-bin.${name}" "${rc}")
+        # shellcheck disable=SC2016 # jq program, not shell
+        CASES=$(jq -c --slurpfile more <(printf '%s' "${more}") '. + $more[0]' <<< "${CASES}")
     fi
 done
 
-jq --argjson missing "$(printf '%s\n' ${MISSING[@]+"${MISSING[@]}"} | jq -Rsc 'split("\n") | map(select(. != ""))')" \
-    '{binaries: ., without_auditable_data: $missing}' <<< "${INDEX}" > "${RS_BASE}.json"
+MISSING_JSON=$(printf '%s\n' ${MISSING[@]+"${MISSING[@]}"} | jq -Rsc 'split("\n") | map(select(. != ""))')
+# shellcheck disable=SC2016 # jq program, not shell
+jq --slurpfile missing <(printf '%s' "${MISSING_JSON}") \
+    '{binaries: ., without_auditable_data: $missing[0]}' <<< "${INDEX}" > "${RS_BASE}.json"
 RS_REPORTS+=("${RS_BASE}.json")
 # shellcheck disable=SC2034 # read by rs_run_record
 RS_COUNTS=$(jq -c '{binaries: (.binaries | length), vulnerabilities: ([.binaries[].vulnerabilities] | add),
@@ -223,8 +230,10 @@ if [[ -n "${IGNORE_DIR}" ]]; then
     RS_REPORTS+=("${RS_BASE}.ignores.json")
     UNUSED=${RS_UNUSED_IGNORES}
     # shellcheck disable=SC2016 # jq program, not shell
-    RS_COUNTS=$(jq -c --argjson unused "${UNUSED}" '. + {unused_ignores: ($unused | length)}' <<< "${RS_COUNTS}")
-    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}-ignores" --argjson cases "${RS_IGNORE_CASES}" '[{name: $name, cases: $cases}]' <<< "${SUITES}")
+    RS_COUNTS=$(jq -c --argjson unused "$(jq 'length' <<< "${UNUSED}")" '. + {unused_ignores: $unused}' <<< "${RS_COUNTS}")
+    # shellcheck disable=SC2016 # jq program, not shell
+    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}-ignores" --slurpfile cases <(printf '%s' "${RS_IGNORE_CASES}") \
+        '[{name: $name, cases: $cases[0]}]' <<< "${SUITES}")
 fi
 
 if [[ "${JUNIT}" == true ]]; then
@@ -234,7 +243,8 @@ if [[ "${JUNIT}" == true ]]; then
                 message: "no cargo-auditable data: build it with cargo auditable"}]' <<< "${CASES}")
         done
     fi
-    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}" --argjson cases "${CASES}" '[{name: $name, cases: $cases}] + .' <<< "${SUITES}")
+    # shellcheck disable=SC2016 # jq program, not shell
+    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}" --slurpfile cases <(printf '%s' "${CASES}") '[{name: $name, cases: $cases[0]}] + .' <<< "${SUITES}")
     rs_junit_suites "${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml" "${SUITES}"
     RS_REPORTS+=("${RS_OUT}/junit/${PARAM_REPORT_NAME}.xml")
 fi

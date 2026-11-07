@@ -31,6 +31,9 @@ jobs:
       - run:
           name: Run shell conventions test
           command: bash tests/shell_conventions_test.sh
+      - run:
+          name: Run argument size limits test
+          command: bash tests/argv_limits_test.sh
   # Runs the command scripts, with PARAM_* set directly, against stand-ins for the tools: the exact
   # arguments each one builds, findings, report_only, tools that don't complete, the reports, and
   # run records checked against schemas/run-record.v1.json. Then checks that each command's YAML

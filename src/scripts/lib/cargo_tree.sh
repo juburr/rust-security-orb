@@ -223,16 +223,17 @@ rs_tree_metadata() {
 # RS_TREE_LAST_ARGS to ARG.... Returns 1, saying why, when cargo tree fails
 # or prints a line that doesn't parse: either is an error, never a graph.
 rs_tree_run() {
-    local role=$1 output=$2 rc=0 error
+    local role=$1 output=$2 rc=0 error args
     shift 2
     rs_show_command cargo "$@"
     # shellcheck disable=SC2034 # read by the scripts
     RS_TREE_LAST_ARGS=("$@")
     "${RS_CARGO}" "$@" > "${output}" 2> "${RS_TREE_LOG}" || rc=$?
     RS_REPORTS+=("${output}")
+    args=$(rs_public_args "$@")
     RS_TREE_RUNS=$(jq -c --arg role "${role}" --arg output "${output}" --arg sha "$(rs_sha256 "${output}")" \
-        --argjson args "$(rs_public_args "$@")" --argjson code "${rc}" \
-        '. + [{role: $role, arguments: $args, exit_code: $code, output: $output, sha256: $sha}]' <<< "${RS_TREE_RUNS}")
+        --slurpfile args <(printf '%s' "${args}") --argjson code "${rc}" \
+        '. + [{role: $role, arguments: $args[0], exit_code: $code, output: $output, sha256: $sha}]' <<< "${RS_TREE_RUNS}")
     # shellcheck disable=SC2034 # read by the scripts
     RS_TREE_CODE=${rc}
     if [[ "${rc}" -ne 0 ]]; then
@@ -258,18 +259,20 @@ rs_tree_run() {
 # members). A wrong manifest_path or package then fails, rather than check
 # some other graph.
 rs_tree_roots() {
-    local roots
+    local roots spec=$2
     # shellcheck disable=SC2016 # jq program, not shell
-    if [[ -n "$2" ]]; then
-        roots=$(jq -r --arg spec "$2" "${RS_TREE_JQ}"'[.[] | select(.depth == 0) | select(spec_match($spec) | not) | .label] | join(", ")' "$1")
+    if [[ -n "${spec}" ]]; then
+        roots=$(jq -r --arg spec "${spec}" "${RS_TREE_JQ}"'[.[] | select(.depth == 0) | select(spec_match($spec) | not) | .label] | join(", ")' "$1")
         if [[ -n "${roots}" ]]; then
-            echo "ERROR: cargo tree's graph starts at ${roots}, not at $2." >&2
+            echo "ERROR: cargo tree's graph starts at ${roots}, not at ${spec}." >&2
             return 1
         fi
         return 0
     fi
     # shellcheck disable=SC2016 # jq program, not shell
-    roots=$(jq -r --argjson members "${RS_TREE_MEMBERS}" '[.[] | select(.depth == 0)
+    # The members reach jq through a file: a large workspace's list can pass
+    # the 128 KiB Linux allows any one argument.
+    roots=$(jq -r --slurpfile members <(printf '%s' "${RS_TREE_MEMBERS}") '$members[0] as $members | [.[] | select(.depth == 0)
         | select("\(.name)@\(.version)" as $r | .kind != "path" or ($members | index($r) | not)) | .label] | join(", ")' "$1")
     if [[ -n "${roots}" ]]; then
         echo "ERROR: cargo tree's graph starts at ${roots}, which is not a member of the workspace." >&2
@@ -277,7 +280,8 @@ rs_tree_roots() {
     fi
     if [[ "${RS_TREE_WORKSPACE}" == true ]]; then
         # shellcheck disable=SC2016 # jq program, not shell
-        roots=$(jq -r --argjson members "${RS_TREE_MEMBERS}" '[.[] | select(.depth == 0) | "\(.name)@\(.version)"] as $roots
+        roots=$(jq -r --slurpfile members <(printf '%s' "${RS_TREE_MEMBERS}") '$members[0] as $members
+            | [.[] | select(.depth == 0) | "\(.name)@\(.version)"] as $roots
             | [$members[] | select(. as $m | $roots | index($m) | not)] | join(", ")' "$1")
         if [[ -n "${roots}" ]]; then
             echo "ERROR: cargo tree's graph doesn't start at every workspace member: it leaves out ${roots}." >&2
