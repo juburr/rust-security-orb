@@ -332,7 +332,7 @@ for ((i = 0; i < ${#MANIFESTS[@]}; i++)); do
         | .fields | (if .code == "yanked-ignored" then "reason" else "ignore reason" end) as $reason_label
         | select([.labels[]? | select(.message == $reason_label and ((.span // "") | test("[^[:space:]]")))] | length == 0)
         | .labels[0].span' "${JSONL}" | jq -sc '.')
-    counts=$(jq -c --argjson missing "${missing}" '. + {ignores_without_reason: ($missing | length)}' <<< "${SUMMARY}")
+    counts=$(jq -c --argjson missing "$(jq 'length' <<< "${missing}")" '. + {ignores_without_reason: $missing}' <<< "${SUMMARY}")
 
     echo "cargo deny results${manifest:+ for ${manifest}}:"
     jq -r 'to_entries[] | "  \(.key): \(.value.errors) errors, \(.value.warnings) warnings"' <<< "${SUMMARY}"
@@ -351,14 +351,17 @@ for ((i = 0; i < ${#MANIFESTS[@]}; i++)); do
                 status: (if .severity == "error" then "failed" else "skipped" end),
                 message: .message,
                 detail: ((.notes // []) | join("\n"))
-            }' "${JSONL}" | jq -sc --argjson missing "${missing}" --arg require "${REQUIRE_REASONS}" \
-            '. + (if $require == "true" then [$missing[] | {classname: "cargo-deny.ignore-reason", name: ., status: "failed",
+            }' "${JSONL}" | jq -sc --slurpfile missing <(printf '%s' "${missing}") --arg require "${REQUIRE_REASONS}" \
+            '. + (if $require == "true" then [$missing[0][] | {classname: "cargo-deny.ignore-reason", name: ., status: "failed",
                 message: "ignored in deny.toml without a reason"}] else [] end)')
         suite=${PARAM_REPORT_NAME}
         if [[ "${MULTI}" == true ]]; then
             suite="${PARAM_REPORT_NAME}-${SLUG_LIST[i]}"
         fi
-        SUITES=$(jq -c --arg name "${suite}" --argjson cases "${cases}" '. + [{name: $name, cases: $cases}]' <<< "${SUITES}")
+        # A case per diagnostic, so through a file: a lockfile with enough of
+        # them passes the 128 KiB Linux allows any one argument.
+        # shellcheck disable=SC2016 # jq program, not shell
+        SUITES=$(jq -c --arg name "${suite}" --slurpfile cases <(printf '%s' "${cases}") '. + [{name: $name, cases: $cases[0]}]' <<< "${SUITES}")
     fi
 
     outcome=passed

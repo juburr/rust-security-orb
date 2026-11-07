@@ -147,8 +147,9 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
         # Each forbidden package once, and each forbidden feature once per
         # package, with the first path cargo tree printed to it.
         # shellcheck disable=SC2016 # jq program, not shell
-        violations=$(jq -c --argjson packages "${RULES}" --argjson features "${FEATURE_RULES}" "${RS_TREE_JQ}"'
-            . as $lines
+        violations=$(jq -c --slurpfile packages <(printf '%s' "${RULES}") --slurpfile features <(printf '%s' "${FEATURE_RULES}") \
+            "${RS_TREE_JQ}"'$packages[0] as $packages | $features[0] as $features
+            | . as $lines
             | ([$packages[] as $rule | $lines[] | select(.name | glob_match($rule))
                     | {rule: $rule, package: .key, feature: null, path}] | unique_by([.rule, .package]))
             + ([$features[] | (split(":")[0]) as $krate | (split(":")[1:] | join(":")) as $feature | . as $rule
@@ -170,16 +171,21 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
     if [[ -f "${RS_TREE_LOCKFILE}" ]]; then
         sha=$(rs_sha256 "${RS_TREE_LOCKFILE}")
     fi
+    # The graph, and what is derived from it, reach jq through files, never
+    # as arguments: Linux refuses to run a program with any one argument over
+    # 128 KiB (exit 126, "Argument list too long"), which a graph of some 700
+    # packages passes.
     # shellcheck disable=SC2016 # jq program, not shell
-    jq -n --arg manifest "${manifest}" --argjson exceptions "${RS_EXCEPTIONS}" --arg cargo "${RS_TOOL_VERSION}" \
-        --arg lockfile "${RS_TREE_LOCKFILE}" --arg sha "${sha}" --argjson runs "${RS_TREE_RUNS}" --arg verdict "${verdict}" \
-        --arg reason "${reason}" --argjson packages "${RULES}" --argjson features "${FEATURE_RULES}" \
-        --arg reachable "${REACHABLE}" --arg from "${REACHABLE_FROM}" --argjson nodes "${nodes}" --argjson violations "${violations}" '{
-            command: "tree_forbid", manifest: (if $manifest == "" then null else $manifest end), exceptions: $exceptions,
-            cargo: $cargo, lockfile: {path: $lockfile, sha256: (if $sha == "" then null else $sha end)}, runs: $runs,
-            forbidden_packages: $packages, forbidden_features: $features,
+    jq -n --arg manifest "${manifest}" --arg cargo "${RS_TOOL_VERSION}" --arg lockfile "${RS_TREE_LOCKFILE}" --arg sha "${sha}" \
+        --arg verdict "${verdict}" --arg reason "${reason}" --arg reachable "${REACHABLE}" --arg from "${REACHABLE_FROM}" \
+        --slurpfile exceptions <(printf '%s' "${RS_EXCEPTIONS}") --slurpfile runs <(printf '%s' "${RS_TREE_RUNS}") \
+        --slurpfile packages <(printf '%s' "${RULES}") --slurpfile features <(printf '%s' "${FEATURE_RULES}") \
+        --slurpfile nodes <(printf '%s' "${nodes}") --slurpfile violations <(printf '%s' "${violations}") '{
+            command: "tree_forbid", manifest: (if $manifest == "" then null else $manifest end), exceptions: $exceptions[0],
+            cargo: $cargo, lockfile: {path: $lockfile, sha256: (if $sha == "" then null else $sha end)}, runs: $runs[0],
+            forbidden_packages: $packages[0], forbidden_features: $features[0],
             only_if_reachable: (if $reachable == "" then null else {package: $reachable, from: (if $from == "" then null else $from end)} end),
-            verdict: $verdict, reason: (if $reason == "" then null else $reason end), nodes: $nodes, violations: $violations
+            verdict: $verdict, reason: (if $reason == "" then null else $reason end), nodes: $nodes[0], violations: $violations[0]
         }' > "${base}.json"
     RS_REPORTS+=("${base}.json")
     INDEX=$(jq -c --arg manifest "${manifest}" --arg slug "${slug}" --arg report "${base}.json" --arg verdict "${verdict}" \
@@ -188,8 +194,9 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
     if [[ "${JUNIT}" == true ]]; then
         # One test case per forbidden package or feature pattern.
         # shellcheck disable=SC2016 # jq program, not shell
-        cases=$(jq -c --argjson packages "${RULES}" --argjson features "${FEATURE_RULES}" --arg verdict "${verdict}" --arg reason "${reason}" '
-            . as $violations
+        cases=$(jq -c --slurpfile packages <(printf '%s' "${RULES}") --slurpfile features <(printf '%s' "${FEATURE_RULES}") \
+            --arg verdict "${verdict}" --arg reason "${reason}" '$packages[0] as $packages | $features[0] as $features
+            | . as $violations
             | [($packages[] | {classname: "tree-forbid.package", name: .}), ($features[] | {classname: "tree-forbid.feature", name: .})]
             | map(.name as $rule | [$violations[] | select(.rule == $rule)] as $found
                 | if $verdict == "skipped" then . + {status: "skipped", message: $reason}
@@ -201,7 +208,7 @@ for ((i = 0; i < ${#RS_TREE_MANIFESTS[@]}; i++)); do
         if [[ "${RS_TREE_MULTI}" == true ]]; then
             suite="${PARAM_REPORT_NAME}-${slug}"
         fi
-        SUITES=$(jq -c --arg name "${suite}" --argjson cases "${cases}" '. + [{name: $name, cases: $cases}]' <<< "${SUITES}")
+        SUITES=$(jq -c --arg name "${suite}" --slurpfile cases <(printf '%s' "${cases}") '. + [{name: $name, cases: $cases[0]}]' <<< "${SUITES}")
     fi
 done
 rm -f "${RS_TREE_LOG}"

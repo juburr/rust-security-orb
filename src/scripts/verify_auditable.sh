@@ -116,11 +116,11 @@ for binary in "${BINARIES[@]}"; do
     fi
     rm -f "${base}.log"
     RS_REPORTS+=("${base}.audit.json")
-    packages=$(jq '.packages | length' "${base}.audit.json")
+    package_count=$(jq '.packages | length' "${base}.audit.json")
     root=$(jq -r '[.packages[] | select(.root == true) | "\(.name) \(.version)"] | join(", ")' "${base}.audit.json")
-    echo "  ${binary}: ok, ${root}, ${packages} packages"
+    echo "  ${binary}: ok, ${root}, ${package_count} packages"
     entry=$(jq -cn --arg binary "${binary}" --arg sha "$(rs_sha256 "${binary}")" --arg report "${base}.audit.json" \
-        --argjson packages "${packages}" '{binary: $binary, sha256: $sha, auditable: true, packages: $packages, report: $report}')
+        --argjson packages "${package_count}" '{binary: $binary, sha256: $sha, auditable: true, packages: $packages, report: $report}')
     if [[ "${CYCLONEDX}" == true ]]; then
         rc=0
         "${CDX}" "${binary}" > "${base}.cdx.json" 2> "${base}.log" || rc=$?
@@ -137,7 +137,8 @@ for binary in "${BINARIES[@]}"; do
         RS_REPORTS+=("${base}.cdx.json")
         entry=$(jq -c --arg sbom "${base}.cdx.json" '. + {sbom: $sbom}' <<< "${entry}")
     fi
-    INDEX=$(jq -c --argjson entry "${entry}" '. + [$entry]' <<< "${INDEX}")
+    # shellcheck disable=SC2016 # jq program, not shell
+    INDEX=$(jq -c --slurpfile entry <(printf '%s' "${entry}") '. + $entry' <<< "${INDEX}")
     CASES=$(jq -c --arg binary "${binary}" '. + [{classname: "auditable", name: $binary, status: "passed"}]' <<< "${CASES}")
 done
 

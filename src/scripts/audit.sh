@@ -189,8 +189,13 @@ for ((i = 0; i < ${#LOCKFILES[@]}; i++)); do
         if [[ "${MULTI}" == true ]]; then
             suite="${PARAM_REPORT_NAME}-${SLUG_LIST[i]}"
         fi
-        SUITES=$(jq -c --arg name "${suite}" --argjson cases "$(rs_audit_cases "${base}.json" cargo-audit "${rc}")" \
-            '. + [{name: $name, cases: $cases}]' <<< "${SUITES}")
+        # A case per finding, so through a file: a lockfile with enough of them
+        # passes the 128 KiB Linux allows any one argument. Captured first, so
+        # a failure stops the step rather than reach jq as no cases.
+        cases=$(rs_audit_cases "${base}.json" cargo-audit "${rc}")
+        # shellcheck disable=SC2016 # jq program, not shell
+        SUITES=$(jq -c --arg name "${suite}" --slurpfile cases <(printf '%s' "${cases}") \
+            '. + [{name: $name, cases: $cases[0]}]' <<< "${SUITES}")
     fi
 done
 
@@ -215,9 +220,10 @@ if [[ -n "${IGNORE_DIR}" ]]; then
     RS_REPORTS+=("${RS_BASE}.ignores.json")
     UNUSED=${RS_UNUSED_IGNORES}
     # shellcheck disable=SC2016 # jq program, not shell
-    RS_COUNTS=$(jq -c --argjson unused "${UNUSED}" '. + {unused_ignores: ($unused | length)}' <<< "${RS_COUNTS}")
-    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}-ignores" --argjson cases "${RS_IGNORE_CASES}" \
-        '. + [{name: $name, cases: $cases}]' <<< "${SUITES}")
+    RS_COUNTS=$(jq -c --argjson unused "$(jq 'length' <<< "${UNUSED}")" '. + {unused_ignores: $unused}' <<< "${RS_COUNTS}")
+    # shellcheck disable=SC2016 # jq program, not shell
+    SUITES=$(jq -c --arg name "${PARAM_REPORT_NAME}-ignores" --slurpfile cases <(printf '%s' "${RS_IGNORE_CASES}") \
+        '. + [{name: $name, cases: $cases[0]}]' <<< "${SUITES}")
 fi
 
 if [[ "${JUNIT}" == true ]]; then
