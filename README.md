@@ -117,7 +117,7 @@ Add the orb, install the tools, check the project. Copy this into `.circleci/con
 version: 2.1
 
 orbs:
-  rust-security: juburr/rust-security-orb@0.3.2
+  rust-security: juburr/rust-security-orb@0.4.0
 
 jobs:
   security:
@@ -158,12 +158,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # cargo-audit, cargo-deny and cargo-auditable, verified.
-      - uses: juburr/rust-security-orb/actions/install@v0.3.2
-      - uses: juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.2
-      - uses: juburr/rust-security-orb/actions/audit@v0.3.2
+      - uses: juburr/rust-security-orb/actions/install@v0.4.0
+      - uses: juburr/rust-security-orb/actions/fetch_advisory_db@v0.4.0
+      - uses: juburr/rust-security-orb/actions/audit@v0.4.0
         with:
           no_fetch: "true"
-      - uses: juburr/rust-security-orb/actions/deny@v0.3.2
+      - uses: juburr/rust-security-orb/actions/deny@v0.4.0
 ```
 
 Each check fails the job on what it finds and uploads its reports from `/tmp/rust-security-reports` as a workflow artifact, even when it fails. GitHub's runners come with Rust, which `deny` and the tools built from crates use. See [GitHub Actions](#-github-actions) for how the actions map to the orb's commands.
@@ -465,7 +465,7 @@ Installs the tools named in `tools`, each verified against the orb's checksum ta
 | `install_path` | `$HOME/bin` | Absolute path of the directory to install into, writable without root. Created if needed, and added to `PATH` for later steps when it isn't already on it. |
 | `verify_checksums` | `strict` | `strict`, `known_versions` or `false`, for every tool. See [Checksum Verification](#-checksum-verification). |
 | `caching` | `true` | Cache each tool's verified download between jobs, keyed by tool, version, CPU architecture and home directory. A cached file is verified again before it is used. For the tools built from source, the archive is cached and built in each job. |
-| `download_base_url` | *(empty)* | An `https://` mirror of GitHub releases to download the prebuilt tools from, in place of `https://github.com`, serving the same paths. What it serves is still verified. Credentials (`user:password@`), a query and a fragment are refused, since they would show in the log. |
+| `download_base_url` | *(empty)* | An `https://` mirror of GitHub releases to download the prebuilt tools from, in place of `https://github.com`, serving the same paths. What it serves is still verified. Credentials (`user:password@`), a query and a fragment are refused, since they would show in the log. A mirror that needs a login gets the `.netrc` entry for its host; see [Mirrors That Need a Login](#-mirrors-that-need-a-login). |
 
 ### `rust-security/install_<tool>`
 
@@ -666,25 +666,25 @@ Each of the orb's commands has a GitHub Action of the same name. The actions run
 
 | Action | Orb command |
 | --- | --- |
-| `juburr/rust-security-orb/actions/install@v0.3.2` | [`rust-security/install`](#rust-securityinstall) |
-| `juburr/rust-security-orb/actions/install_cargo_audit@v0.3.2`, `install_cargo_deny`, `install_cargo_auditable`, `install_cargo_cyclonedx`, `install_cargo_vet`, `install_rust_audit_info`, `install_auditable2cdx` | [`rust-security/install_<tool>`](#rust-securityinstall_tool) |
-| `juburr/rust-security-orb/actions/fetch_advisory_db@v0.3.2` | [`rust-security/fetch_advisory_db`](#rust-securityfetch_advisory_db) |
-| `juburr/rust-security-orb/actions/audit@v0.3.2` | [`rust-security/audit`](#rust-securityaudit) |
-| `juburr/rust-security-orb/actions/audit_bin@v0.3.2` | [`rust-security/audit_bin`](#rust-securityaudit_bin) |
-| `juburr/rust-security-orb/actions/deny@v0.3.2` | [`rust-security/deny`](#rust-securitydeny) |
-| `juburr/rust-security-orb/actions/licenses@v0.3.2` | [`rust-security/licenses`](#rust-securitylicenses) |
-| `juburr/rust-security-orb/actions/auditable_build@v0.3.2` | [`rust-security/auditable_build`](#rust-securityauditable_build) |
-| `juburr/rust-security-orb/actions/verify_auditable@v0.3.2` | [`rust-security/verify_auditable`](#rust-securityverify_auditable) |
-| `juburr/rust-security-orb/actions/sbom@v0.3.2` | [`rust-security/sbom`](#rust-securitysbom) |
-| `juburr/rust-security-orb/actions/vet@v0.3.2` | [`rust-security/vet`](#rust-securityvet) |
-| `juburr/rust-security-orb/actions/tree_forbid@v0.3.2` | [`rust-security/tree_forbid`](#rust-securitytree_forbid) |
-| `juburr/rust-security-orb/actions/tree_expect@v0.3.2` | [`rust-security/tree_expect`](#rust-securitytree_expect) |
-| `juburr/rust-security-orb/actions/store_reports@v0.3.2` | [`rust-security/store_reports`](#rust-securitystore_reports) |
+| `juburr/rust-security-orb/actions/install@v0.4.0` | [`rust-security/install`](#rust-securityinstall) |
+| `juburr/rust-security-orb/actions/install_cargo_audit@v0.4.0`, `install_cargo_deny`, `install_cargo_auditable`, `install_cargo_cyclonedx`, `install_cargo_vet`, `install_rust_audit_info`, `install_auditable2cdx` | [`rust-security/install_<tool>`](#rust-securityinstall_tool) |
+| `juburr/rust-security-orb/actions/fetch_advisory_db@v0.4.0` | [`rust-security/fetch_advisory_db`](#rust-securityfetch_advisory_db) |
+| `juburr/rust-security-orb/actions/audit@v0.4.0` | [`rust-security/audit`](#rust-securityaudit) |
+| `juburr/rust-security-orb/actions/audit_bin@v0.4.0` | [`rust-security/audit_bin`](#rust-securityaudit_bin) |
+| `juburr/rust-security-orb/actions/deny@v0.4.0` | [`rust-security/deny`](#rust-securitydeny) |
+| `juburr/rust-security-orb/actions/licenses@v0.4.0` | [`rust-security/licenses`](#rust-securitylicenses) |
+| `juburr/rust-security-orb/actions/auditable_build@v0.4.0` | [`rust-security/auditable_build`](#rust-securityauditable_build) |
+| `juburr/rust-security-orb/actions/verify_auditable@v0.4.0` | [`rust-security/verify_auditable`](#rust-securityverify_auditable) |
+| `juburr/rust-security-orb/actions/sbom@v0.4.0` | [`rust-security/sbom`](#rust-securitysbom) |
+| `juburr/rust-security-orb/actions/vet@v0.4.0` | [`rust-security/vet`](#rust-securityvet) |
+| `juburr/rust-security-orb/actions/tree_forbid@v0.4.0` | [`rust-security/tree_forbid`](#rust-securitytree_forbid) |
+| `juburr/rust-security-orb/actions/tree_expect@v0.4.0` | [`rust-security/tree_expect`](#rust-securitytree_expect) |
+| `juburr/rust-security-orb/actions/store_reports@v0.4.0` | [`rust-security/store_reports`](#rust-securitystore_reports) |
 
 To upload the advisories to GitHub code scanning (the job needs `permissions: security-events: write`), point the upload at the SARIF report:
 
 ```yaml
-      - uses: juburr/rust-security-orb/actions/deny@v0.3.2
+      - uses: juburr/rust-security-orb/actions/deny@v0.4.0
         with:
           report_only: "true"
       - uses: github/codeql-action/upload-sarif@v4
@@ -697,7 +697,7 @@ To persist the advisory database for later jobs, as [Fetch the Advisory Database
 
 How they differ from the orb's commands:
 
-- **Versions.** An action is referenced by the repository's release tag, such as `v0.3.2`, the same tag the orb is published from. There is no moving major tag yet. For the strongest pinning, use the tag's commit SHA: `juburr/rust-security-orb/actions/deny@<sha> # v0.3.2`.
+- **Versions.** An action is referenced by the repository's release tag, such as `v0.4.0`, the same tag the orb is published from. There is no moving major tag yet. For the strongest pinning, use the tag's commit SHA: `juburr/rust-security-orb/actions/deny@<sha> # v0.4.0`.
 - **Inputs are strings.** Write booleans and numbers quoted, such as `report_only: "true"` or `depth: "1"`. The scripts check every boolean and enum themselves.
 - **Environment variables.** The orb expands `$NAME` in its parameters with the CircleCI CLI, which GitHub's runners don't have, so the actions take values as they are. Use GitHub's expressions instead, such as `binaries: ${{ runner.temp }}/dist/*`.
 - **Artifacts.** A command that stores artifacts uploads `output_dir` with [`actions/upload-artifact`](https://github.com/actions/upload-artifact), even when the step fails, as an artifact named `rust-security-reports-<report_name>-` and a random suffix, since artifact names must be unique in a workflow run; `store_reports` names it after `output_dir`'s last directory instead. Give `store_reports` `if: always()`, so it uploads after a failed check. There is no Tests tab: JUnit files are in `output_dir/junit/`, for any JUnit report action.
@@ -751,6 +751,30 @@ Linux executors on `x86_64` (amd64) and `aarch64`/`arm64` (arm64), including Cir
 The commands need bash 4 or newer, `jq`, `git` (for `fetch_advisory_db` and to date a database), `awk`, `tar`, `gzip`, `xz` (cargo-auditable and cargo-cyclonedx ship `.tar.xz` archives), `curl` or `wget`, and the standard coreutils, including `mktemp`, `realpath`, `sha256sum` and `sha512sum`. `deny`, `licenses`, `sbom`, `vet`, `tree_forbid`, `tree_expect` and `auditable_build` run cargo (`deny` and `licenses` don't with `metadata_path`), and installing cargo-vet, rust-audit-info or auditable2cdx needs cargo and a C linker. The native `.dep-v0` decoder of `verify_auditable` and `audit_bin` needs `python3` (3.8 or newer, standard library only) instead. `cimg/rust` has all of them.
 
 The cache is keyed by tool, version, executor architecture and home directory, so amd64 and arm64 jobs never share a cached download. On executors whose `PATH` doesn't already include `install_path` (for example, machine executors), `install` adds it for later steps through `BASH_ENV`.
+
+## 🔑 Mirrors That Need a Login
+
+`download_base_url` points the install at an internal mirror, such as an Artifactory remote repository. When the mirror needs a login, the install takes it from the entry for the mirror's host in the `.netrc` file (`NETRC`, or `~/.netrc`), which an earlier step writes, such as from a context's variables. Artifactory takes an access token as the password.
+
+```yaml
+- run:
+    name: Log In to the Mirror
+    command: |
+      umask 077
+      printf 'machine %s login %s password %s\n' artifactory.example.com "${ARTIFACTORY_USER}" "${ARTIFACTORY_TOKEN}" >> ~/.netrc
+```
+
+`printf` is a shell builtin, so the token never reaches a command line.
+
+How the login is kept to the mirror:
+
+- **One entry, in a private file.** The install copies the first complete entry for the mirror's host, alone, into a file only the job's user can read, and gives that file to curl. curl never reads the rest of your `.netrc`: not a `default` entry, not an entry without a password (curl 7.76.0 to 8.11.1 could send a password on to a host the server redirects to, CVE-2024-11053 and CVE-2025-0167, when the `.netrc` held either), and not a token for another host, such as `github.com`.
+- **Only for the mirror.** curl gets the file only for URLs under the mirror. Downloads from anywhere else get no login.
+- **Never past a redirect.** When the mirror redirects a download to another host, such as the cloud storage an Artifactory keeps its files in, that host gets no login, even when a `~/.curlrc` says `location-trusted`.
+- **curl only.** wget reads every entry in `~/.netrc` and can't be limited to one, so an install that would send a mirror login with wget fails and asks for curl.
+- **Out of the log.** The log names the `.netrc` file and the host, never the login. A `.netrc` other users can read is reported.
+
+An entry the install can't use as curl would, one without a login or password or with a quoted value, is reported, and the mirror is then asked without a login. A mirror that refuses a download without one is reported with the entry it needs.
 
 ## 🔐 Checksum Verification
 
